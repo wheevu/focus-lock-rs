@@ -9,6 +9,11 @@
 
 It features a modular Rust core for high-speed video processing, a CLI for batch operations, and a modern Tauri v2 desktop application for easy usage.
 
+<p>
+
+<img src="./src/ui.png">
+</p>
+
 ##  Features
 
 *   **AI Person Detection**: Uses **YOLOv8-Nano** via ONNX Runtime for fast, accurate person detection.
