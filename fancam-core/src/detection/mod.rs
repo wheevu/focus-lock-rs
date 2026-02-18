@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use image::{ImageBuffer, Rgb, RgbImage};
 use imageproc::rect::Rect;
+use ort::execution_providers as ep;
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::Path;
@@ -86,6 +87,10 @@ impl Detector {
     pub fn load<P: AsRef<Path>>(model_path: P) -> Result<Self> {
         let session = Session::builder()
             .context("failed to create ORT session builder")?
+            .with_execution_providers([ep::CoreMLExecutionProvider::default()
+                .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
+                .build()])
+            .context("failed to register execution providers")?
             .commit_from_file(model_path)
             .context("failed to load YOLOv8 ONNX model")?;
         Ok(Self { session })
@@ -176,6 +181,10 @@ impl FaceIdentifier {
     ) -> Result<Self> {
         let mut session = Session::builder()
             .context("failed to create ORT session builder")?
+            .with_execution_providers([ep::CoreMLExecutionProvider::default()
+                .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
+                .build()])
+            .context("failed to register execution providers")?
             .commit_from_file(model_path)
             .context("failed to load ArcFace ONNX model")?;
 
@@ -242,10 +251,14 @@ impl FaceIdentifier {
 fn preprocess_yolo(frame: &RgbFrame) -> Result<ort::value::DynValue> {
     use image::imageops::FilterType;
 
-    let img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
-        .context("failed to create image from frame data")?;
+    let img = ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(
+        frame.width,
+        frame.height,
+        frame.data.as_slice(),
+    )
+    .context("failed to create image view from frame data")?;
 
-    let resized = image::imageops::resize(&img, YOLO_SIZE, YOLO_SIZE, FilterType::Lanczos3);
+    let resized = image::imageops::resize(&img, YOLO_SIZE, YOLO_SIZE, FilterType::Triangle);
 
     // NCHW float tensor: [1, 3, 640, 640]
     let mut tensor_data = vec![0f32; (3 * YOLO_SIZE * YOLO_SIZE) as usize];
@@ -305,6 +318,9 @@ fn extract_first_embedding(outputs: &ort::session::SessionOutputs<'_>) -> Result
 fn crop_face(frame: &RgbFrame, bbox: BBox) -> RgbImage {
     use image::imageops::FilterType;
 
+    // For crop_imm we need an owned RgbImage (the image crate requires 'static
+    // on the container for crop operations). Build it directly — this is a
+    // borrow-then-copy of only the needed region rather than a full frame clone.
     let img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
         .expect("valid frame dimensions");
 
@@ -321,7 +337,7 @@ fn crop_face(frame: &RgbFrame, bbox: BBox) -> RgbImage {
 
     let cropped = image::imageops::crop_imm(&img, face_x1, face_y1, face_w, face_h).to_image();
 
-    image::imageops::resize(&cropped, FACE_SIZE, FACE_SIZE, FilterType::Lanczos3)
+    image::imageops::resize(&cropped, FACE_SIZE, FACE_SIZE, FilterType::Triangle)
 }
 
 // ── Math helpers ─────────────────────────────────────────────────────────────

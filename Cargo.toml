@@ -18,7 +18,7 @@ rust-version = "1.87"
 ffmpeg-next = "8"
 
 # Inference
-ort = { version = "=2.0.0-rc.10", features = ["load-dynamic"] }
+ort = { version = "=2.0.0-rc.10", features = ["load-dynamic", "coreml"] }
 
 # Frame manipulation (pure Rust)
 image      = "0.25"

@@ -120,10 +120,11 @@ fn cmd_gray(input: PathBuf, output: PathBuf) -> Result<()> {
     info!("  output : {}", output.display());
 
     let pb = spinner("Converting to grayscale…");
+    let pb2 = pb.clone();
 
-    transcode(&input, &output, |frame: &mut RgbFrame| {
+    transcode(input, &output, move |frame: &mut RgbFrame| {
         to_grayscale(frame);
-        pb.tick();
+        pb2.tick();
     })
     .context("grayscale transcode failed")?;
 
@@ -140,9 +141,10 @@ fn cmd_detect(input: PathBuf, model: PathBuf, output: PathBuf) -> Result<()> {
         .with_context(|| format!("failed to load model: {}", model.display()))?;
 
     let pb = spinner("Detecting persons…");
+    let pb2 = pb.clone();
 
-    transcode(&input, &output, |frame: &mut RgbFrame| {
-        pb.tick();
+    transcode(input, &output, move |frame: &mut RgbFrame| {
+        pb2.tick();
         match detector.detect(frame) {
             Ok(boxes) => {
                 draw_boxes(frame, &boxes, [0, 255, 0]);
@@ -183,11 +185,10 @@ fn cmd_fancam(
 
     let mut tracker = BiasTracker::new();
     let pb = spinner("Generating fancam…");
+    let pb2 = pb.clone();
 
-    // The transcode callback receives a full-resolution RGB frame and must
-    // *replace* its data with the 1080×1920 crop.
-    transcode(&video, &output, |frame: &mut RgbFrame| {
-        pb.tick();
+    transcode(video, &output, move |frame: &mut RgbFrame| {
+        pb2.tick();
 
         // Throttle recognition when locked on target
         let detection = if tracker.should_run_recognition() {

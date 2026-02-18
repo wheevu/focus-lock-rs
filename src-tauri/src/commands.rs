@@ -129,10 +129,10 @@ fn run_pipeline(
     let mut tracker = BiasTracker::new();
 
     transcode_with_progress(
-        &video_path,
+        video_path,
         &output_path,
         total,
-        |frame| {
+        move |frame| {
             if cancel.lock().map(|g| *g).unwrap_or(false) {
                 return;
             }

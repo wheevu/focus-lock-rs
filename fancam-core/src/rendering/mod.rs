@@ -22,6 +22,8 @@ const UPSCALE_THRESHOLD: f32 = 0.25;
 /// `OUT_WIDTH` pixels in the source frame (clamped to frame boundaries).
 /// Height is set to maintain the 9:16 aspect ratio.
 pub fn crop_fancam(frame: &RgbFrame, state: &CameraState) -> Result<RgbFrame> {
+    // crop_imm requires an owned RgbImage (image crate needs 'static on
+    // the container). Build one from the frame data.
     let img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
         .context("failed to build image from frame data")?;
 
@@ -70,8 +72,12 @@ pub fn crop_fancam(frame: &RgbFrame, state: &CameraState) -> Result<RgbFrame> {
 /// Write a plain full-frame passthrough (no crop) — used when the target is
 /// lost and we want a letterboxed placeholder rather than a blank frame.
 pub fn letterbox_passthrough(frame: &RgbFrame) -> Result<RgbFrame> {
-    let img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
-        .context("failed to build image from frame data")?;
+    let img = ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(
+        frame.width,
+        frame.height,
+        frame.data.as_slice(),
+    )
+    .context("failed to build image from frame data")?;
 
     // Scale uniformly to fit OUT_WIDTH × OUT_HEIGHT, add black bars
     let src_aspect = frame.width as f32 / frame.height as f32;
