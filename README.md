@@ -130,7 +130,3 @@ Contributions are welcome! Please ensure you have `rustfmt` installed and run te
 cargo fmt
 cargo test
 ```
-
-## 📄 License
-
-MIT
