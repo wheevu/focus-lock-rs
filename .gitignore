@@ -1,0 +1,13 @@
+/target
+*.onnx
+*.mp4
+*.mov
+*.avi
+*.pt
+*.zip
+
+# frontend
+ui/node_modules
+ui/dist
+ui/.svelte-kit
+
