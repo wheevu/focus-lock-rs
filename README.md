@@ -19,8 +19,13 @@ It features a modular Rust core for high-speed video processing, a CLI for batch
 *   **Person Detection**: Uses **YOLOv8-Nano** via ONNX Runtime for fast, accurate person detection.
 *   **Identity Locking**: Uses **ArcFace** (cosine similarity) to distinguish the specific target person from others in the frame.
 *   **Cinematic Smoothing**: Implements a **2D Kalman Filter** to smooth camera movements, preventing jittery tracking and simulating a professional camera operator.
+*   **Performance-First Pipeline**:
+    *   3-thread decode/inference/encode pipeline with bounded channels.
+    *   Recognition throttling before and after lock-on to avoid CPU stalls.
+    *   Caps ArcFace identity checks to top-confidence person candidates per frame.
 *   **Smart Rendering**:
     *   Automated 1080x1920 cropping.
+    *   SIMD-accelerated resize path (`fast_image_resize`) for crop and letterbox operations.
     *   Lanczos3 upscaling for distant subjects.
     *   Fallback letterboxing when the target is lost/occluded.
 *   **Cross-Platform**: Runs on Windows, macOS, and Linux.
@@ -37,9 +42,10 @@ The project is organized as a Cargo workspace:
 
 1.  **Decode**: FFmpeg decodes the video stream into RGB frames.
 2.  **Detect**: YOLOv8 runs inference on the frame to find all "Person" bounding boxes.
-3.  **Identify**: The system crops faces from bounding boxes and compares their embeddings against the reference "bias" image using ArcFace.
+3.  **Identify**: The system crops faces from top-confidence person boxes and compares their embeddings against the reference "bias" image using ArcFace.
 4.  **Track**:
     *   If the target is found, the Kalman filter updates position and velocity.
+    *   Recognition runs at a stride (before and after lock-on) to reduce CPU load.
     *   If occluded, the filter predicts the position based on previous momentum.
 5.  **Render**: The frame is cropped to the smoothed coordinates and re-encoded to H.264.
 
@@ -53,6 +59,10 @@ To build and run this project, you need:
     *   **Ubuntu/Debian**: `sudo apt install libavutil-dev libavformat-dev libavcodec-dev libswscale-dev`
     *   **macOS**: `brew install ffmpeg`
     *   **Windows**: Set `FFMPEG_DIR` environment variable to your FFmpeg shared build.
+
+### ONNX Runtime provider note (macOS)
+
+This project requests CoreML execution when available. If your local ONNX Runtime build does not include CoreML support, inference automatically falls back to CPU execution (it still works, but slower).
 
 ##  Installation & Setup
 

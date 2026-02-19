@@ -32,6 +32,9 @@ const IOU_THRESHOLD: f32 = 0.45;
 const FACE_SIZE: u32 = 112;
 /// Cosine similarity threshold for identity match.
 pub const SIMILARITY_THRESHOLD: f32 = 0.6;
+/// Maximum number of person candidates to run ArcFace on per frame.
+/// In concert scenes with 10-20 detections, this caps inference cost.
+const MAX_FACE_CANDIDATES: usize = 5;
 /// Approximate fraction of the person bounding box height occupied by the head.
 const HEAD_FRACTION: f32 = 0.22;
 
@@ -216,10 +219,22 @@ impl FaceIdentifier {
     /// Given a full RGB frame and a list of person bounding boxes, return the
     /// bbox of the target identity (highest similarity above threshold), or
     /// `None` if not found.
+    ///
+    /// To limit per-frame latency in crowded scenes, only the top
+    /// `MAX_FACE_CANDIDATES` persons (by detection confidence) are evaluated.
     pub fn identify(&mut self, frame: &RgbFrame, persons: &[BBox]) -> Result<Option<BBox>> {
         let mut best: Option<(f32, BBox)> = None;
 
-        for &bbox in persons {
+        // Sort candidates by confidence descending and cap at MAX_FACE_CANDIDATES.
+        let mut candidates: Vec<BBox> = persons.to_vec();
+        candidates.sort_unstable_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(MAX_FACE_CANDIDATES);
+
+        for &bbox in &candidates {
             let face_crop = crop_face(frame, bbox);
             let tensor = preprocess_face(&face_crop)?;
 
@@ -249,25 +264,33 @@ impl FaceIdentifier {
 /// Resize the frame to 640×640, convert to NCHW float tensor normalised to
 /// [0, 1], return as an ORT `Tensor`.
 fn preprocess_yolo(frame: &RgbFrame) -> Result<ort::value::DynValue> {
-    use image::imageops::FilterType;
+    use fast_image_resize as fr;
 
-    let img = ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(
-        frame.width,
-        frame.height,
-        frame.data.as_slice(),
-    )
-    .context("failed to create image view from frame data")?;
+    // Use fast_image_resize with NEON SIMD for the large 4K → 640x640 downscale.
+    // ImageRef borrows the frame data immutably — no clone needed.
+    let src =
+        fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
+            .context("failed to create fast_image_resize source")?;
 
-    let resized = image::imageops::resize(&img, YOLO_SIZE, YOLO_SIZE, FilterType::Triangle);
+    let mut dst = fr::images::Image::new(YOLO_SIZE, YOLO_SIZE, fr::PixelType::U8x3);
 
-    // NCHW float tensor: [1, 3, 640, 640]
-    let mut tensor_data = vec![0f32; (3 * YOLO_SIZE * YOLO_SIZE) as usize];
+    let mut resizer = fr::Resizer::new();
+    let options =
+        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+    resizer
+        .resize(&src, &mut dst, Some(&options))
+        .context("fast_image_resize YOLO downscale failed")?;
+
+    let raw = dst.buffer();
+
+    // NCHW float tensor: [1, 3, 640, 640].
     let size = (YOLO_SIZE * YOLO_SIZE) as usize;
+    let mut tensor_data = vec![0f32; 3 * size];
 
-    for (idx, pixel) in resized.pixels().enumerate() {
-        tensor_data[0 * size + idx] = pixel[0] as f32 / 255.0; // R
-        tensor_data[1 * size + idx] = pixel[1] as f32 / 255.0; // G
-        tensor_data[2 * size + idx] = pixel[2] as f32 / 255.0; // B
+    for idx in 0..size {
+        tensor_data[idx] = raw[idx * 3] as f32 / 255.0; // R
+        tensor_data[size + idx] = raw[idx * 3 + 1] as f32 / 255.0; // G
+        tensor_data[2 * size + idx] = raw[idx * 3 + 2] as f32 / 255.0; // B
     }
 
     let shape = [1usize, 3, YOLO_SIZE as usize, YOLO_SIZE as usize];
@@ -283,13 +306,16 @@ fn preprocess_face(img: &RgbImage) -> Result<ort::value::DynValue> {
 
     let resized = image::imageops::resize(img, FACE_SIZE, FACE_SIZE, FilterType::Lanczos3);
 
-    let mut tensor_data = vec![0f32; (3 * FACE_SIZE * FACE_SIZE) as usize];
+    // NCHW float tensor: [1, 3, 112, 112].
+    // Use flat indexed access over raw bytes — avoids per-pixel Pixel overhead.
     let size = (FACE_SIZE * FACE_SIZE) as usize;
+    let mut tensor_data = vec![0f32; 3 * size];
+    let raw = resized.as_raw(); // &[u8], packed RGB
 
-    for (idx, pixel) in resized.pixels().enumerate() {
-        tensor_data[0 * size + idx] = (pixel[0] as f32 - 127.5) / 128.0;
-        tensor_data[1 * size + idx] = (pixel[1] as f32 - 127.5) / 128.0;
-        tensor_data[2 * size + idx] = (pixel[2] as f32 - 127.5) / 128.0;
+    for idx in 0..size {
+        tensor_data[0 * size + idx] = (raw[idx * 3] as f32 - 127.5) / 128.0;
+        tensor_data[1 * size + idx] = (raw[idx * 3 + 1] as f32 - 127.5) / 128.0;
+        tensor_data[2 * size + idx] = (raw[idx * 3 + 2] as f32 - 127.5) / 128.0;
     }
 
     let shape = [1usize, 3, FACE_SIZE as usize, FACE_SIZE as usize];
@@ -318,24 +344,23 @@ fn extract_first_embedding(outputs: &ort::session::SessionOutputs<'_>) -> Result
 fn crop_face(frame: &RgbFrame, bbox: BBox) -> RgbImage {
     use image::imageops::FilterType;
 
-    // For crop_imm we need an owned RgbImage (the image crate requires 'static
-    // on the container for crop operations). Build it directly — this is a
-    // borrow-then-copy of only the needed region rather than a full frame clone.
-    let img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
-        .expect("valid frame dimensions");
-
     let bh = bbox.height();
-    let face_y1 = bbox.y1.max(0.0) as u32;
-    let face_h = (bh * HEAD_FRACTION).max(1.0) as u32;
-    let face_x1 = bbox.x1.max(0.0) as u32;
-    let face_w = bbox.width().max(1.0) as u32;
+    let face_y1 = (bbox.y1.max(0.0) as u32).min(frame.height.saturating_sub(1));
+    let face_h = ((bh * HEAD_FRACTION).max(1.0) as u32).min(frame.height - face_y1);
+    let face_x1 = (bbox.x1.max(0.0) as u32).min(frame.width.saturating_sub(1));
+    let face_w = (bbox.width().max(1.0) as u32).min(frame.width - face_x1);
 
-    let face_y1 = face_y1.min(frame.height.saturating_sub(1));
-    let face_h = face_h.min(frame.height - face_y1);
-    let face_x1 = face_x1.min(frame.width.saturating_sub(1));
-    let face_w = face_w.min(frame.width - face_x1);
-
-    let cropped = image::imageops::crop_imm(&img, face_x1, face_y1, face_w, face_h).to_image();
+    // Copy only the crop rows from the raw slice — O(crop area), no full-frame clone.
+    let src_stride = (frame.width * 3) as usize;
+    let dst_stride = (face_w * 3) as usize;
+    let mut buf = vec![0u8; dst_stride * face_h as usize];
+    for row in 0..face_h as usize {
+        let src_start = (face_y1 as usize + row) * src_stride + face_x1 as usize * 3;
+        let dst_start = row * dst_stride;
+        buf[dst_start..dst_start + dst_stride]
+            .copy_from_slice(&frame.data[src_start..src_start + dst_stride]);
+    }
+    let cropped = RgbImage::from_raw(face_w, face_h, buf).expect("valid crop dimensions");
 
     image::imageops::resize(&cropped, FACE_SIZE, FACE_SIZE, FilterType::Triangle)
 }
@@ -380,8 +405,10 @@ fn nms(mut boxes: Vec<BBox>, iou_thresh: f32) -> Vec<BBox> {
 
 /// Draw bounding boxes onto a frame's RGB data in-place (for debug output).
 pub fn draw_boxes(frame: &mut RgbFrame, boxes: &[BBox], color: [u8; 3]) {
-    let mut img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
-        .expect("valid frame dimensions");
+    // Build the image from the existing buffer — no clone; we write back in-place.
+    let mut img: RgbImage =
+        ImageBuffer::from_raw(frame.width, frame.height, std::mem::take(&mut frame.data))
+            .expect("valid frame dimensions");
 
     for bbox in boxes {
         let rect = Rect::at(bbox.x1 as i32, bbox.y1 as i32)

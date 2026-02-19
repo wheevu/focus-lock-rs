@@ -13,6 +13,7 @@ ffmpeg-next  = { workspace = true }
 ort          = { workspace = true }
 image        = { workspace = true }
 imageproc    = { workspace = true }
+fast_image_resize = { workspace = true }
 nalgebra     = { workspace = true }
 anyhow       = { workspace = true }
 thiserror    = { workspace = true }
