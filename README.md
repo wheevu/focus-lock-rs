@@ -5,7 +5,7 @@
 ![Svelte](https://img.shields.io/badge/Svelte-5-red?logo=svelte)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-**focus-lock-rs** is a high-performance automated fancam generator. It takes a standard landscape video and a reference photo of a person (your "bias"), tracks them using AI, and generates a stabilized, vertical (9:16) cropped video locked onto them.
+High-performance automated fancam generator. It takes a standard landscape video and a reference photo of a person (say, your bias), tracks them, and generates a stabilized, vertical (9:16) cropped video locked onto them. 
 
 It features a modular Rust core for high-speed video processing, a CLI for batch operations, and a modern Tauri v2 desktop application for easy usage.
 
@@ -16,7 +16,7 @@ It features a modular Rust core for high-speed video processing, a CLI for batch
 
 ##  Features
 
-*   **AI Person Detection**: Uses **YOLOv8-Nano** via ONNX Runtime for fast, accurate person detection.
+*   **Person Detection**: Uses **YOLOv8-Nano** via ONNX Runtime for fast, accurate person detection.
 *   **Identity Locking**: Uses **ArcFace** (cosine similarity) to distinguish the specific target person from others in the frame.
 *   **Cinematic Smoothing**: Implements a **2D Kalman Filter** to smooth camera movements, preventing jittery tracking and simulating a professional camera operator.
 *   **Smart Rendering**:
@@ -32,6 +32,16 @@ The project is organized as a Cargo workspace:
 *   **`fancam-core/`**: The engine. Handles FFmpeg transcoding, ONNX inference, Kalman tracking, and image processing.
 *   **`cli/`**: A command-line interface wrapper for the core engine.
 *   **`src-tauri/`** & **`ui/`**: The Desktop application built with Tauri 2 and Svelte 5.
+
+##  Logic Flow
+
+1.  **Decode**: FFmpeg decodes the video stream into RGB frames.
+2.  **Detect**: YOLOv8 runs inference on the frame to find all "Person" bounding boxes.
+3.  **Identify**: The system crops faces from bounding boxes and compares their embeddings against the reference "bias" image using ArcFace.
+4.  **Track**:
+    *   If the target is found, the Kalman filter updates position and velocity.
+    *   If occluded, the filter predicts the position based on previous momentum.
+5.  **Render**: The frame is cropped to the smoothed coordinates and re-encoded to H.264.
 
 ##  Prerequisites
 
@@ -112,19 +122,9 @@ cargo run --release -p cli -- fancam \
     cargo run -p cli -- detect --input video.mp4 --output boxes.mp4
     ```
 
-##  Logic Flow
-
-1.  **Decode**: FFmpeg decodes the video stream into RGB frames.
-2.  **Detect**: YOLOv8 runs inference on the frame to find all "Person" bounding boxes.
-3.  **Identify**: The system crops faces from bounding boxes and compares their embeddings against the reference "bias" image using ArcFace.
-4.  **Track**:
-    *   If the target is found, the Kalman filter updates position and velocity.
-    *   If occluded, the filter predicts the position based on previous momentum.
-5.  **Render**: The frame is cropped to the smoothed coordinates and re-encoded to H.264.
-
 ## Contributing
 
-Contributions are welcome! Please ensure you have `rustfmt` installed and run tests before opening a PR.
+Contributions are welcome! Install `rustfmt` and gimme your PRs.
 
 ```bash
 cargo fmt
