@@ -18,6 +18,7 @@ use ffmpeg_next::{
 };
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::Instant;
 use tracing::{debug, info};
 
 /// Output pixel format for the encoder (YUV420p is universally compatible).
@@ -40,10 +41,14 @@ struct AudioPacket {
     data: Vec<u8>,
     pts: Option<i64>,
     dts: Option<i64>,
+    /// Raw duration from the source packet; 0 when the source reports
+    /// AV_NOPTS_VALUE (i64::MIN) to avoid overflow in rescale_ts.
     duration: i64,
     out_stream_index: usize,
     src_time_base: Rational,
-    dst_time_base: Rational,
+    // dst_time_base is intentionally NOT stored here — the output stream's
+    // time-base is not finalised until write_header() is called, so we look
+    // it up dynamically inside write_audio_packet (after the header is written).
 }
 
 /// Open `input_path`, apply `frame_fn` to every frame (receives a mutable
@@ -119,6 +124,23 @@ where
     let src_height = decoder.height();
     let src_pixel_fmt = decoder.format();
 
+    // Capture stream duration for PTS-based progress when total_frames is 0.
+    // Try stream-level first, then format-level (converted to stream time-base).
+    let stream_duration_pts: i64 = {
+        let sd = ictx.stream(video_stream_index).unwrap().duration();
+        if sd > 0 {
+            sd
+        } else {
+            // Convert format-level duration (AV_TIME_BASE units) to stream tb.
+            let fmt_dur = ictx.duration(); // i64 in AV_TIME_BASE (1/1_000_000)
+            if fmt_dur > 0 && video_time_base.denominator() > 0 {
+                ffmpeg::Rescale::rescale(&fmt_dur, ffmpeg::rescale::TIME_BASE, video_time_base)
+            } else {
+                0
+            }
+        }
+    };
+
     info!(
         src_width,
         src_height,
@@ -154,12 +176,11 @@ where
         None
     };
 
-    // audio_out src/dst time-bases are needed inside Thread A to fill the struct
-    let audio_src_tb: Option<(usize, Rational, Rational)> = if let Some((ai, ao)) = audio_out_index
-    {
+    // audio_out src time-base is needed inside Thread A to fill the struct;
+    // dst_time_base is resolved lazily at write time (post write_header).
+    let audio_src_tb: Option<(usize, Rational)> = if let Some((ai, _ao)) = audio_out_index {
         let src_tb = ictx.stream(ai).unwrap().time_base();
-        let dst_tb = octx.stream(ao).unwrap().time_base();
-        Some((ai, src_tb, dst_tb))
+        Some((ai, src_tb))
     } else {
         None
     };
@@ -213,17 +234,18 @@ where
             let stream_index = stream.index();
 
             // Route audio packets as plain data structs
-            if let Some((ai, src_tb, dst_tb)) = audio_src_tb {
+            if let Some((ai, src_tb)) = audio_src_tb {
                 if stream_index == ai {
                     if let Some(data) = packet.data() {
                         let ap = AudioPacket {
                             data: data.to_vec(),
                             pts: packet.pts(),
                             dts: packet.dts(),
-                            duration: packet.duration(),
+                            // AV_NOPTS_VALUE (i64::MIN) is not a real duration;
+                            // treat it as 0 to avoid overflow inside rescale_ts.
+                            duration: packet.duration().max(0),
                             out_stream_index: audio_out_index.unwrap().1,
                             src_time_base: src_tb,
-                            dst_time_base: dst_tb,
                         };
                         // Ignore send errors — main thread may have exited on
                         // error; we don't want to mask the real error.
@@ -281,6 +303,8 @@ where
     // Audio packets arriving before the header is written are buffered here.
     let mut audio_buffer: Vec<AudioPacket> = Vec::new();
     let mut frame_count = 0u64;
+    // Wall-clock start for throughput / ETA logging.
+    let encode_start = Instant::now();
 
     /// Drain all pending audio from the channel into either the buffer (pre-
     /// header) or directly to the muxer (post-header).
@@ -307,12 +331,16 @@ where
     }
 
     fn write_audio_packet(octx: &mut format::context::Output, ap: &AudioPacket) -> Result<()> {
+        // Resolve the output stream's time-base at write time — it is not
+        // finalised until write_header() has been called, so we must NOT
+        // capture it earlier (it would be 0/1 and break rescale_ts).
+        let dst_time_base = octx.stream(ap.out_stream_index).unwrap().time_base();
         let mut pkt = ffmpeg_next::Packet::copy(&ap.data);
         pkt.set_stream(ap.out_stream_index);
         pkt.set_pts(ap.pts);
         pkt.set_dts(ap.dts);
         pkt.set_duration(ap.duration);
-        pkt.rescale_ts(ap.src_time_base, ap.dst_time_base);
+        pkt.rescale_ts(ap.src_time_base, dst_time_base);
         pkt.write_interleaved(octx)
             .context("failed to write audio packet")?;
         Ok(())
@@ -343,7 +371,7 @@ where
             let video_encoder = video_encoder_builder
                 .open_as_with(
                     encoder_codec,
-                    ffmpeg_next::Dictionary::from_iter([("crf", "18"), ("preset", "fast")]),
+                    ffmpeg_next::Dictionary::from_iter([("crf", "18"), ("preset", "veryfast")]),
                 )
                 .context("failed to open H.264 encoder")?;
 
@@ -418,8 +446,43 @@ where
         )?;
 
         frame_count += 1;
-        progress_fn(frame_count, total);
-        if frame_count % 100 == 0 {
+
+        // Compute progress: prefer frame-count-based, fall back to PTS-based.
+        if total > 0 {
+            progress_fn(frame_count, total);
+        } else if stream_duration_pts > 0 {
+            // Estimate total from duration and report PTS-based fraction.
+            let frac_pts = pts as f64 / stream_duration_pts as f64;
+            let est_total = (frame_count as f64 / frac_pts.max(1e-9)).round() as u64;
+            progress_fn(frame_count, est_total.max(frame_count));
+        } else {
+            // No duration info at all — report 0/0.
+            progress_fn(frame_count, 0);
+        }
+
+        // Log the very first frame so the user knows encoding has started,
+        // then every 100 frames with throughput and ETA.
+        let should_log = frame_count == 1 || frame_count % 100 == 0;
+        if should_log {
+            let elapsed = encode_start.elapsed().as_secs_f64();
+            let fps = if elapsed > 0.0 {
+                frame_count as f64 / elapsed
+            } else {
+                0.0
+            };
+            if total > 0 {
+                let remaining = (total - frame_count) as f64;
+                let eta_secs = if fps > 0.0 { remaining / fps } else { 0.0 };
+                info!(
+                    frame_count,
+                    total,
+                    fps = format!("{fps:.2}"),
+                    eta_secs = format!("{eta_secs:.0}"),
+                    "encoding progress"
+                );
+            } else {
+                info!(frame_count, fps = format!("{fps:.2}"), "encoding progress");
+            }
             debug!(frame_count, "processed frames");
         }
     }
@@ -435,6 +498,11 @@ where
     let state = enc_state
         .as_mut()
         .context("no video frames were processed")?;
+
+    // Drain any audio packets that arrived after the last video frame was
+    // processed (e.g. audio tail at end of file).  Threads are already joined
+    // so audio_rx is disconnected; try_recv drains whatever remains.
+    drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written)?;
 
     // Flush encoder tail
     state.video_encoder.send_eof().ok();
@@ -480,19 +548,35 @@ pub fn total_frames<P: AsRef<Path>>(input_path: P) -> u64 {
     let Some(stream) = ictx.streams().best(media::Type::Video) else {
         return 0;
     };
-    // nb_frames is set by most muxers; fall back to duration × fps estimate.
+    let fps = stream.avg_frame_rate();
+    let fps_f = if fps.numerator() > 0 && fps.denominator() > 0 {
+        fps.numerator() as f64 / fps.denominator() as f64
+    } else {
+        0.0
+    };
+
+    // 1) nb_frames is set by most muxers.
     let nb = stream.frames();
     if nb > 0 {
         return nb as u64;
     }
-    let dur = stream.duration(); // in stream time-base units
+
+    // 2) Stream-level duration (in stream time-base units).
+    let dur = stream.duration();
     let tb = stream.time_base();
-    let fps = stream.avg_frame_rate();
-    if dur > 0 && tb.denominator() > 0 && fps.numerator() > 0 {
+    if dur > 0 && tb.denominator() > 0 && fps_f > 0.0 {
         let seconds = dur as f64 * tb.numerator() as f64 / tb.denominator() as f64;
-        let fps_f = fps.numerator() as f64 / fps.denominator() as f64;
         return (seconds * fps_f).round() as u64;
     }
+
+    // 3) Format-level duration (in AV_TIME_BASE = 1/1_000_000 units).
+    //    Many YouTube-ripped files lack stream-level metadata but have this.
+    let fmt_dur = ictx.duration(); // i64, in AV_TIME_BASE units
+    if fmt_dur > 0 && fps_f > 0.0 {
+        let seconds = fmt_dur as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
+        return (seconds * fps_f).round() as u64;
+    }
+
     0
 }
 

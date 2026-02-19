@@ -5,7 +5,7 @@
 //! upscale with Lanczos resampling.
 
 use anyhow::{Context, Result};
-use image::{imageops::FilterType, ImageBuffer, RgbImage};
+use fast_image_resize as fr;
 
 use crate::{tracking::CameraState, video::RgbFrame};
 
@@ -22,11 +22,6 @@ const UPSCALE_THRESHOLD: f32 = 0.25;
 /// `OUT_WIDTH` pixels in the source frame (clamped to frame boundaries).
 /// Height is set to maintain the 9:16 aspect ratio.
 pub fn crop_fancam(frame: &RgbFrame, state: &CameraState) -> Result<RgbFrame> {
-    // crop_imm requires an owned RgbImage (image crate needs 'static on
-    // the container). Build one from the frame data.
-    let img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
-        .context("failed to build image from frame data")?;
-
     // Determine crop dimensions in source-frame pixels.
     // We want OUT_WIDTH × OUT_HEIGHT aspect, scaled so it fits the frame.
     let aspect = OUT_WIDTH as f32 / OUT_HEIGHT as f32; // 9/16 ≈ 0.5625
@@ -49,20 +44,39 @@ pub fn crop_fancam(frame: &RgbFrame, state: &CameraState) -> Result<RgbFrame> {
     let crop_w_u = (crop_w as u32).min(frame.width - x1);
     let crop_h_u = (crop_h as u32).min(frame.height - y1);
 
-    let cropped = image::imageops::crop_imm(&img, x1, y1, crop_w_u, crop_h_u).to_image();
+    // Copy only the crop rows from the raw slice — O(crop area), no full-frame clone.
+    let src_stride = (frame.width * 3) as usize;
+    let dst_stride = (crop_w_u * 3) as usize;
+    let mut buf = vec![0u8; dst_stride * crop_h_u as usize];
+    for row in 0..crop_h_u as usize {
+        let src_start = (y1 as usize + row) * src_stride + x1 as usize * 3;
+        let dst_start = row * dst_stride;
+        buf[dst_start..dst_start + dst_stride]
+            .copy_from_slice(&frame.data[src_start..src_start + dst_stride]);
+    }
 
     // Decide filter quality based on whether we're upscaling significantly
     let subject_height_fraction = state.half_size * 2.0 / frame.height as f32;
     let filter = if subject_height_fraction < UPSCALE_THRESHOLD {
-        FilterType::Lanczos3 // subject is small — use high-quality upscale
+        fr::FilterType::Lanczos3 // subject is small — use high-quality upscale
     } else {
-        FilterType::CatmullRom // subject is large — fast enough
+        fr::FilterType::CatmullRom // subject is large — fast enough
     };
 
-    let output = image::imageops::resize(&cropped, OUT_WIDTH, OUT_HEIGHT, filter);
+    // SIMD-accelerated resize via fast_image_resize (NEON on M1).
+    let src = fr::images::Image::from_vec_u8(crop_w_u, crop_h_u, buf, fr::PixelType::U8x3)
+        .context("failed to create fast_image_resize source for crop")?;
+
+    let mut dst = fr::images::Image::new(OUT_WIDTH, OUT_HEIGHT, fr::PixelType::U8x3);
+
+    let mut resizer = fr::Resizer::new();
+    let options = fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(filter));
+    resizer
+        .resize(&src, &mut dst, Some(&options))
+        .context("fast_image_resize crop scale failed")?;
 
     Ok(RgbFrame {
-        data: output.into_raw(),
+        data: dst.into_vec(),
         width: OUT_WIDTH,
         height: OUT_HEIGHT,
         pts: frame.pts,
@@ -72,14 +86,7 @@ pub fn crop_fancam(frame: &RgbFrame, state: &CameraState) -> Result<RgbFrame> {
 /// Write a plain full-frame passthrough (no crop) — used when the target is
 /// lost and we want a letterboxed placeholder rather than a blank frame.
 pub fn letterbox_passthrough(frame: &RgbFrame) -> Result<RgbFrame> {
-    let img = ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(
-        frame.width,
-        frame.height,
-        frame.data.as_slice(),
-    )
-    .context("failed to build image from frame data")?;
-
-    // Scale uniformly to fit OUT_WIDTH × OUT_HEIGHT, add black bars
+    // Scale uniformly to fit OUT_WIDTH × OUT_HEIGHT, add black bars.
     let src_aspect = frame.width as f32 / frame.height as f32;
     let dst_aspect = OUT_WIDTH as f32 / OUT_HEIGHT as f32;
 
@@ -93,16 +100,43 @@ pub fn letterbox_passthrough(frame: &RgbFrame) -> Result<RgbFrame> {
         (w, h)
     };
 
-    let scaled = image::imageops::resize(&img, scaled_w, scaled_h, FilterType::CatmullRom);
+    // Ensure dimensions are at least 1 for NonZeroU32.
+    let scaled_w = scaled_w.max(1);
+    let scaled_h = scaled_h.max(1);
 
-    let mut canvas: RgbImage = ImageBuffer::new(OUT_WIDTH, OUT_HEIGHT);
-    let offset_x = (OUT_WIDTH - scaled_w) / 2;
-    let offset_y = (OUT_HEIGHT - scaled_h) / 2;
+    // SIMD-accelerated resize via fast_image_resize (NEON on M1).
+    // ImageRef borrows the frame data immutably — no clone needed.
+    let src =
+        fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
+            .context("failed to create fast_image_resize source for letterbox")?;
 
-    image::imageops::overlay(&mut canvas, &scaled, offset_x as i64, offset_y as i64);
+    let mut dst = fr::images::Image::new(scaled_w, scaled_h, fr::PixelType::U8x3);
+
+    let mut resizer = fr::Resizer::new();
+    let options =
+        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom));
+    resizer
+        .resize(&src, &mut dst, Some(&options))
+        .context("fast_image_resize letterbox scale failed")?;
+
+    let scaled_data = dst.buffer();
+
+    // Composite the scaled image centred on a black canvas.
+    let offset_x = ((OUT_WIDTH - scaled_w) / 2) as usize;
+    let offset_y = ((OUT_HEIGHT - scaled_h) / 2) as usize;
+    let canvas_stride = (OUT_WIDTH * 3) as usize;
+    let scaled_stride = (scaled_w * 3) as usize;
+
+    let mut canvas = vec![0u8; canvas_stride * OUT_HEIGHT as usize];
+    for row in 0..scaled_h as usize {
+        let dst_start = (offset_y + row) * canvas_stride + offset_x * 3;
+        let src_start = row * scaled_stride;
+        canvas[dst_start..dst_start + scaled_stride]
+            .copy_from_slice(&scaled_data[src_start..src_start + scaled_stride]);
+    }
 
     Ok(RgbFrame {
-        data: canvas.into_raw(),
+        data: canvas,
         width: OUT_WIDTH,
         height: OUT_HEIGHT,
         pts: frame.pts,

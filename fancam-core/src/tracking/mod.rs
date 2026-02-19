@@ -113,6 +113,10 @@ pub struct BiasTracker {
 
 /// How many frames to skip recognition when tracking is confident.
 const RECOGNITION_STRIDE: u64 = 5;
+/// How many frames to skip recognition before the target is first found.
+/// Running YOLO + ArcFace every single frame is extremely expensive on CPU;
+/// the target isn't going to appear and vanish between adjacent frames.
+const PRE_LOCK_STRIDE: u64 = 3;
 
 impl BiasTracker {
     pub fn new() -> Self {
@@ -124,10 +128,16 @@ impl BiasTracker {
         }
     }
 
-    /// Whether recognition should run on this frame (always true when not yet
-    /// locked; throttled to every `RECOGNITION_STRIDE` frames otherwise).
+    /// Whether recognition should run on this frame (throttled to every
+    /// `PRE_LOCK_STRIDE` frames before lock-on, every `RECOGNITION_STRIDE`
+    /// frames after lock-on).
     pub fn should_run_recognition(&self) -> bool {
-        self.kalman.is_none() || self.frame_index % RECOGNITION_STRIDE == 0
+        let stride = if self.kalman.is_none() {
+            PRE_LOCK_STRIDE
+        } else {
+            RECOGNITION_STRIDE
+        };
+        self.frame_index % stride == 0
     }
 
     /// Feed in the latest detection result (or `None` if not found this frame).
