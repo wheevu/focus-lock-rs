@@ -6,10 +6,11 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use fancam_core::{
-    detection::{draw_boxes, Detector, FaceIdentifier},
+    detection::{Detector, FaceIdentifier, draw_boxes},
     rendering::{crop_fancam, letterbox_passthrough},
+    runtime::configure_ort_dylib,
     tracking::BiasTracker,
-    video::{to_grayscale, transcode, RgbFrame},
+    video::{RgbFrame, to_grayscale, transcode},
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -92,6 +93,8 @@ fn main() -> Result<()> {
         )
         .init();
 
+    configure_ort_dylib();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -166,7 +169,7 @@ fn cmd_fancam(
     output: PathBuf,
     yolo_model: PathBuf,
     face_model: PathBuf,
-    _threshold: f32,
+    threshold: f32,
 ) -> Result<()> {
     info!("Fancam pipeline");
     info!("  video      : {}", video.display());
@@ -176,12 +179,13 @@ fn cmd_fancam(
     let mut detector = Detector::load(&yolo_model)
         .with_context(|| format!("failed to load YOLO model: {}", yolo_model.display()))?;
 
-    let mut identifier = FaceIdentifier::load(&face_model, &bias).with_context(|| {
-        format!(
-            "failed to load face model or embed reference: {}",
-            bias.display()
-        )
-    })?;
+    let mut identifier = FaceIdentifier::load(&face_model, &bias, threshold.clamp(0.0, 1.0))
+        .with_context(|| {
+            format!(
+                "failed to load face model or embed reference: {}",
+                bias.display()
+            )
+        })?;
 
     let mut tracker = BiasTracker::new();
     let pb = spinner("Generating fancam…");
@@ -193,7 +197,7 @@ fn cmd_fancam(
         // Throttle recognition when locked on target
         let detection = if tracker.should_run_recognition() {
             match detector.detect(frame) {
-                Ok(persons) => match identifier.identify(frame, &persons) {
+                Ok(persons) => match identifier.identify(frame, &persons, tracker.search_hint()) {
                     Ok(found) => found,
                     Err(e) => {
                         tracing::warn!("face ID error: {e}");
@@ -210,7 +214,9 @@ fn cmd_fancam(
             None
         };
 
-        let camera = tracker.update(detection);
+        tracker.note_similarity(detection.as_ref().map(|m| m.similarity));
+
+        let camera = tracker.update(detection.map(|m| m.bbox));
 
         // Render the 9:16 crop (or letterbox fallback if target is lost)
         let cropped = match camera {

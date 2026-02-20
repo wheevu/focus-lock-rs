@@ -19,12 +19,16 @@ use ffmpeg_next::{
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Output pixel format for the encoder (YUV420p is universally compatible).
 const ENCODE_FORMAT: format::Pixel = format::Pixel::YUV420P;
 /// Scaling flags — fast bilinear is sufficient for the decode→encode path.
 const SCALE_FLAGS: scaling::Flags = scaling::Flags::FAST_BILINEAR;
+/// Decode → inference queue depth.
+const VIDEO_RAW_QUEUE: usize = 16;
+/// Inference → encode queue depth.
+const VIDEO_XFM_QUEUE: usize = 8;
 
 /// A single decoded video frame in RGB24 format, along with its presentation
 /// timestamp (in the source stream's time-base units).
@@ -99,7 +103,7 @@ where
     ffmpeg::init().context("failed to initialise FFmpeg")?;
 
     // ── Probe input (on main thread, before spawning) ─────────────────────────
-    let mut ictx = format::input(&input_path).context("could not open input file")?;
+    let mut ictx = open_input_with_hwaccel(&input_path)?;
 
     let video_stream_index = ictx
         .streams()
@@ -152,8 +156,8 @@ where
     // video_raw:  Thread A → Thread B  (decoded RGB frames)
     // video_xfm:  Thread B → Main      (post-transform RGB frames)
     // audio:      Thread A → Main      (plain-data audio packets)
-    let (video_raw_tx, video_raw_rx) = mpsc::sync_channel::<RgbFrame>(4);
-    let (video_xfm_tx, video_xfm_rx) = mpsc::sync_channel::<RgbFrame>(4);
+    let (video_raw_tx, video_raw_rx) = mpsc::sync_channel::<RgbFrame>(VIDEO_RAW_QUEUE);
+    let (video_xfm_tx, video_xfm_rx) = mpsc::sync_channel::<RgbFrame>(VIDEO_XFM_QUEUE);
     let (audio_tx, audio_rx) = mpsc::sync_channel::<AudioPacket>(32);
 
     // ── Output — lazily initialised on first frame ────────────────────────────
@@ -542,7 +546,7 @@ fn flush_encoder(
 /// progress reporting).  Falls back to 0 if the count cannot be determined.
 pub fn total_frames<P: AsRef<Path>>(input_path: P) -> u64 {
     ffmpeg::init().ok();
-    let Ok(ictx) = format::input(&input_path) else {
+    let Ok(ictx) = open_input_with_hwaccel(&input_path) else {
         return 0;
     };
     let Some(stream) = ictx.streams().best(media::Type::Video) else {
@@ -578,6 +582,23 @@ pub fn total_frames<P: AsRef<Path>>(input_path: P) -> u64 {
     }
 
     0
+}
+
+fn open_input_with_hwaccel<P: AsRef<Path>>(input_path: P) -> Result<format::context::Input> {
+    let dict = ffmpeg_next::Dictionary::from_iter([("hwaccel", "videotoolbox")]);
+    match format::input_with_dictionary(&input_path, dict) {
+        Ok(ctx) => {
+            info!("opened input with VideoToolbox decode hint");
+            Ok(ctx)
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "VideoToolbox decode hint unavailable; falling back to default decode"
+            );
+            format::input(&input_path).context("could not open input file")
+        }
+    }
 }
 
 /// Convenience: convert a frame to grayscale in-place (Phase 1 smoke-test).

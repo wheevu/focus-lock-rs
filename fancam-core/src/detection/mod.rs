@@ -12,6 +12,7 @@ use imageproc::rect::Rect;
 use ort::execution_providers as ep;
 use ort::session::Session;
 use ort::value::Tensor;
+use rayon::prelude::*;
 use std::path::Path;
 use tracing::debug;
 
@@ -31,12 +32,22 @@ const IOU_THRESHOLD: f32 = 0.45;
 /// ArcFace input size.
 const FACE_SIZE: u32 = 112;
 /// Cosine similarity threshold for identity match.
-pub const SIMILARITY_THRESHOLD: f32 = 0.6;
+pub const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.6;
 /// Maximum number of person candidates to run ArcFace on per frame.
 /// In concert scenes with 10-20 detections, this caps inference cost.
-const MAX_FACE_CANDIDATES: usize = 5;
-/// Approximate fraction of the person bounding box height occupied by the head.
-const HEAD_FRACTION: f32 = 0.22;
+const MAX_FACE_CANDIDATES: usize = 8;
+/// Approximate fraction range of the person bounding box height occupied by head.
+const MIN_HEAD_FRACTION: f32 = 0.18;
+const MAX_HEAD_FRACTION: f32 = 0.35;
+/// Restrict face crop to the centered width to avoid shoulders/background.
+const FACE_WIDTH_FRACTION: f32 = 0.72;
+/// For very high-resolution inputs, run person detection on a downscaled frame
+/// and map detections back to source coordinates.
+const DETECTION_MAX_DIM: u32 = 1920;
+/// Number of high-confidence matches to fold into the running identity gallery.
+const MAX_GALLERY_SAMPLES: usize = 12;
+/// Similarity margin above threshold required to update gallery prototype.
+const GALLERY_UPDATE_MARGIN: f32 = 0.08;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -85,6 +96,12 @@ pub struct Detector {
     session: Session,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IdentityMatch {
+    pub bbox: BBox,
+    pub similarity: f32,
+}
+
 impl Detector {
     /// Load a YOLOv8n ONNX model from `model_path`.
     pub fn load<P: AsRef<Path>>(model_path: P) -> Result<Self> {
@@ -102,6 +119,28 @@ impl Detector {
     /// Run inference on `frame` and return bounding boxes (in original frame
     /// pixel coordinates) for all persons after NMS.
     pub fn detect(&mut self, frame: &RgbFrame) -> Result<Vec<BBox>> {
+        let max_dim = frame.width.max(frame.height);
+        if max_dim > DETECTION_MAX_DIM {
+            let scale = DETECTION_MAX_DIM as f32 / max_dim as f32;
+            let scaled_w = ((frame.width as f32 * scale).round() as u32).max(1);
+            let scaled_h = ((frame.height as f32 * scale).round() as u32).max(1);
+            let scaled = downscale_frame(frame, scaled_w, scaled_h)?;
+            let mut boxes = self.detect_native(&scaled)?;
+            let sx = scaled_w as f32 / frame.width as f32;
+            let sy = scaled_h as f32 / frame.height as f32;
+            for b in &mut boxes {
+                b.x1 /= sx;
+                b.x2 /= sx;
+                b.y1 /= sy;
+                b.y2 /= sy;
+            }
+            return Ok(boxes);
+        }
+
+        self.detect_native(frame)
+    }
+
+    fn detect_native(&mut self, frame: &RgbFrame) -> Result<Vec<BBox>> {
         let input_tensor = preprocess_yolo(frame)?;
 
         let outputs = self
@@ -173,6 +212,8 @@ impl Detector {
 pub struct FaceIdentifier {
     session: Session,
     reference_embedding: Vec<f32>,
+    similarity_threshold: f32,
+    gallery_samples: usize,
 }
 
 impl FaceIdentifier {
@@ -181,6 +222,7 @@ impl FaceIdentifier {
     pub fn load<P: AsRef<Path>, Q: AsRef<Path>>(
         model_path: P,
         reference_image_path: Q,
+        similarity_threshold: f32,
     ) -> Result<Self> {
         let mut session = Session::builder()
             .context("failed to create ORT session builder")?
@@ -213,6 +255,8 @@ impl FaceIdentifier {
         Ok(Self {
             session,
             reference_embedding,
+            similarity_threshold,
+            gallery_samples: 1,
         })
     }
 
@@ -222,21 +266,36 @@ impl FaceIdentifier {
     ///
     /// To limit per-frame latency in crowded scenes, only the top
     /// `MAX_FACE_CANDIDATES` persons (by detection confidence) are evaluated.
-    pub fn identify(&mut self, frame: &RgbFrame, persons: &[BBox]) -> Result<Option<BBox>> {
-        let mut best: Option<(f32, BBox)> = None;
+    pub fn identify(
+        &mut self,
+        frame: &RgbFrame,
+        persons: &[BBox],
+        search_hint: Option<(f32, f32)>,
+    ) -> Result<Option<IdentityMatch>> {
+        let mut best: Option<(f32, BBox, Vec<f32>)> = None;
 
         // Sort candidates by confidence descending and cap at MAX_FACE_CANDIDATES.
         let mut candidates: Vec<BBox> = persons.to_vec();
         candidates.sort_unstable_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
+            rank_candidate(*b, search_hint)
+                .partial_cmp(&rank_candidate(*a, search_hint))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         candidates.truncate(MAX_FACE_CANDIDATES);
 
-        for &bbox in &candidates {
-            let face_crop = crop_face(frame, bbox);
-            let tensor = preprocess_face(&face_crop)?;
+        let prepared: Vec<(BBox, Result<Vec<f32>>)> = candidates
+            .par_iter()
+            .map(|&bbox| {
+                let face_crop = crop_face(frame, bbox);
+                (bbox, preprocess_face_data(&face_crop))
+            })
+            .collect();
+
+        for (bbox, maybe_tensor_data) in prepared {
+            let Ok(tensor_data) = maybe_tensor_data else {
+                continue;
+            };
+            let tensor = face_tensor_from_data(tensor_data)?;
 
             let outputs = self
                 .session
@@ -248,14 +307,36 @@ impl FaceIdentifier {
 
             debug!(sim, "face similarity");
 
-            if sim >= SIMILARITY_THRESHOLD {
-                if best.is_none() || sim > best.unwrap().0 {
-                    best = Some((sim, bbox));
+            if sim >= self.similarity_threshold {
+                if best.as_ref().is_none_or(|b| sim > b.0) {
+                    best = Some((sim, bbox, embedding));
                 }
             }
         }
 
-        Ok(best.map(|(_, b)| b))
+        if let Some((sim, bbox, embedding)) = best {
+            if sim >= self.similarity_threshold + GALLERY_UPDATE_MARGIN
+                && self.gallery_samples < MAX_GALLERY_SAMPLES
+            {
+                self.update_reference_gallery(&embedding);
+            }
+            return Ok(Some(IdentityMatch {
+                bbox,
+                similarity: sim,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn update_reference_gallery(&mut self, embedding: &[f32]) {
+        let prev_weight = self.gallery_samples as f32;
+        let next_weight = prev_weight + 1.0;
+        for (r, e) in self.reference_embedding.iter_mut().zip(embedding.iter()) {
+            *r = (*r * prev_weight + *e) / next_weight;
+        }
+        self.reference_embedding = l2_normalize(&self.reference_embedding);
+        self.gallery_samples += 1;
     }
 }
 
@@ -287,11 +368,32 @@ fn preprocess_yolo(frame: &RgbFrame) -> Result<ort::value::DynValue> {
     let size = (YOLO_SIZE * YOLO_SIZE) as usize;
     let mut tensor_data = vec![0f32; 3 * size];
 
-    for idx in 0..size {
-        tensor_data[idx] = raw[idx * 3] as f32 / 255.0; // R
-        tensor_data[size + idx] = raw[idx * 3 + 1] as f32 / 255.0; // G
-        tensor_data[2 * size + idx] = raw[idx * 3 + 2] as f32 / 255.0; // B
-    }
+    let (r_plane, gb_plane) = tensor_data.split_at_mut(size);
+    let (g_plane, b_plane) = gb_plane.split_at_mut(size);
+    rayon::join(
+        || {
+            r_plane
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(idx, out)| *out = raw[idx * 3] as f32 / 255.0)
+        },
+        || {
+            rayon::join(
+                || {
+                    g_plane
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(idx, out)| *out = raw[idx * 3 + 1] as f32 / 255.0)
+                },
+                || {
+                    b_plane
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(idx, out)| *out = raw[idx * 3 + 2] as f32 / 255.0)
+                },
+            )
+        },
+    );
 
     let shape = [1usize, 3, YOLO_SIZE as usize, YOLO_SIZE as usize];
     Ok(Tensor::from_array((shape, tensor_data.into_boxed_slice()))
@@ -302,15 +404,29 @@ fn preprocess_yolo(frame: &RgbFrame) -> Result<ort::value::DynValue> {
 /// Crop the approximate head region from a person BBox, resize to 112×112,
 /// normalise to [-1, 1], return as an ORT `Tensor`.
 fn preprocess_face(img: &RgbImage) -> Result<ort::value::DynValue> {
-    use image::imageops::FilterType;
+    let tensor_data = preprocess_face_data(img)?;
+    face_tensor_from_data(tensor_data)
+}
 
-    let resized = image::imageops::resize(img, FACE_SIZE, FACE_SIZE, FilterType::Lanczos3);
+fn preprocess_face_data(img: &RgbImage) -> Result<Vec<f32>> {
+    use fast_image_resize as fr;
+
+    let src =
+        fr::images::ImageRef::new(img.width(), img.height(), img.as_raw(), fr::PixelType::U8x3)
+            .context("failed to create face resize source")?;
+    let mut dst = fr::images::Image::new(FACE_SIZE, FACE_SIZE, fr::PixelType::U8x3);
+    let mut resizer = fr::Resizer::new();
+    let options =
+        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+    resizer
+        .resize(&src, &mut dst, Some(&options))
+        .context("fast_image_resize face resize failed")?;
 
     // NCHW float tensor: [1, 3, 112, 112].
     // Use flat indexed access over raw bytes — avoids per-pixel Pixel overhead.
     let size = (FACE_SIZE * FACE_SIZE) as usize;
     let mut tensor_data = vec![0f32; 3 * size];
-    let raw = resized.as_raw(); // &[u8], packed RGB
+    let raw = dst.buffer(); // &[u8], packed RGB
 
     for idx in 0..size {
         tensor_data[0 * size + idx] = (raw[idx * 3] as f32 - 127.5) / 128.0;
@@ -318,6 +434,10 @@ fn preprocess_face(img: &RgbImage) -> Result<ort::value::DynValue> {
         tensor_data[2 * size + idx] = (raw[idx * 3 + 2] as f32 - 127.5) / 128.0;
     }
 
+    Ok(tensor_data)
+}
+
+fn face_tensor_from_data(tensor_data: Vec<f32>) -> Result<ort::value::DynValue> {
     let shape = [1usize, 3, FACE_SIZE as usize, FACE_SIZE as usize];
     Ok(Tensor::from_array((shape, tensor_data.into_boxed_slice()))
         .context("failed to create face input tensor")?
@@ -342,13 +462,31 @@ fn extract_first_embedding(outputs: &ort::session::SessionOutputs<'_>) -> Result
 
 /// Crop the estimated face region from a full RGB frame given a person BBox.
 fn crop_face(frame: &RgbFrame, bbox: BBox) -> RgbImage {
-    use image::imageops::FilterType;
+    let bw = bbox.width().max(1.0);
+    let bh = bbox.height().max(1.0);
+    let aspect = (bw / bh).clamp(0.2, 2.5);
 
-    let bh = bbox.height();
-    let face_y1 = (bbox.y1.max(0.0) as u32).min(frame.height.saturating_sub(1));
-    let face_h = ((bh * HEAD_FRACTION).max(1.0) as u32).min(frame.height - face_y1);
-    let face_x1 = (bbox.x1.max(0.0) as u32).min(frame.width.saturating_sub(1));
-    let face_w = (bbox.width().max(1.0) as u32).min(frame.width - face_x1);
+    // Wider boxes likely include shoulders/background; reduce head fraction.
+    let mut head_fraction =
+        (0.30 - (aspect - 0.5) * 0.06).clamp(MIN_HEAD_FRACTION, MAX_HEAD_FRACTION);
+    if bh < 170.0 {
+        // Distant subjects need a taller crop to preserve enough face pixels.
+        head_fraction = (head_fraction + 0.04).clamp(MIN_HEAD_FRACTION, MAX_HEAD_FRACTION);
+    }
+
+    let face_w_f = (bw * FACE_WIDTH_FRACTION).max(1.0);
+    let face_h_f = (bh * head_fraction).max(1.0);
+    let face_x1_f = bbox.center_x() - face_w_f / 2.0;
+    let face_y1_f = bbox.y1 + bh * 0.02;
+
+    let face_x1 = face_x1_f.max(0.0) as u32;
+    let face_y1 = face_y1_f.max(0.0) as u32;
+    let face_w = (face_w_f as u32)
+        .min(frame.width.saturating_sub(face_x1))
+        .max(1);
+    let face_h = (face_h_f as u32)
+        .min(frame.height.saturating_sub(face_y1))
+        .max(1);
 
     // Copy only the crop rows from the raw slice — O(crop area), no full-frame clone.
     let src_stride = (frame.width * 3) as usize;
@@ -360,9 +498,42 @@ fn crop_face(frame: &RgbFrame, bbox: BBox) -> RgbImage {
         buf[dst_start..dst_start + dst_stride]
             .copy_from_slice(&frame.data[src_start..src_start + dst_stride]);
     }
-    let cropped = RgbImage::from_raw(face_w, face_h, buf).expect("valid crop dimensions");
+    RgbImage::from_raw(face_w, face_h, buf).expect("valid crop dimensions")
+}
 
-    image::imageops::resize(&cropped, FACE_SIZE, FACE_SIZE, FilterType::Triangle)
+fn rank_candidate(bbox: BBox, search_hint: Option<(f32, f32)>) -> f32 {
+    let mut score = bbox.confidence;
+    if let Some((hx, hy)) = search_hint {
+        let dx = bbox.center_x() - hx;
+        let dy = bbox.center_y() - hy;
+        let distance = (dx * dx + dy * dy).sqrt();
+        let norm = (bbox.width().max(bbox.height()) * 4.0).max(1.0);
+        let proximity = 1.0 - (distance / norm).clamp(0.0, 1.0);
+        score += proximity * 0.35;
+    }
+    score
+}
+
+fn downscale_frame(frame: &RgbFrame, out_w: u32, out_h: u32) -> Result<RgbFrame> {
+    use fast_image_resize as fr;
+
+    let src =
+        fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
+            .context("failed to create detection downscale source")?;
+    let mut dst = fr::images::Image::new(out_w, out_h, fr::PixelType::U8x3);
+    let mut resizer = fr::Resizer::new();
+    let options =
+        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+    resizer
+        .resize(&src, &mut dst, Some(&options))
+        .context("failed to downscale frame for detection")?;
+
+    Ok(RgbFrame {
+        data: dst.buffer().to_vec(),
+        width: out_w,
+        height: out_h,
+        pts: frame.pts,
+    })
 }
 
 // ── Math helpers ─────────────────────────────────────────────────────────────

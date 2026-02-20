@@ -6,6 +6,7 @@ use std::{
 use fancam_core::{
     detection::{Detector, FaceIdentifier},
     rendering::{crop_fancam, letterbox_passthrough},
+    runtime::configure_ort_dylib,
     tracking::BiasTracker,
     video::{total_frames, transcode_with_progress},
 };
@@ -123,9 +124,12 @@ fn run_pipeline(
     let video_path = PathBuf::from(&args.video);
     let output_path = PathBuf::from(&args.output);
     let total = total_frames(&video_path);
+    let threshold = args.threshold.clamp(0.0, 1.0);
+
+    configure_ort_dylib();
 
     let mut detector = Detector::load(&args.yolo_model)?;
-    let mut identifier = FaceIdentifier::load(&args.face_model, &args.bias)?;
+    let mut identifier = FaceIdentifier::load(&args.face_model, &args.bias, threshold)?;
     let mut tracker = BiasTracker::new();
 
     transcode_with_progress(
@@ -139,13 +143,15 @@ fn run_pipeline(
 
             let detection = if tracker.should_run_recognition() {
                 match detector.detect(frame) {
-                    Ok(persons) => match identifier.identify(frame, &persons) {
-                        Ok(found) => found,
-                        Err(e) => {
-                            tracing::warn!("face ID error: {e}");
-                            None
+                    Ok(persons) => {
+                        match identifier.identify(frame, &persons, tracker.search_hint()) {
+                            Ok(found) => found,
+                            Err(e) => {
+                                tracing::warn!("face ID error: {e}");
+                                None
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         tracing::warn!("detection error: {e}");
                         None
@@ -155,7 +161,9 @@ fn run_pipeline(
                 None
             };
 
-            let camera = tracker.update(detection);
+            tracker.note_similarity(detection.as_ref().map(|m| m.similarity));
+
+            let camera = tracker.update(detection.map(|m| m.bbox));
 
             let cropped = match camera {
                 Some(ref state) => crop_fancam(frame, state),
