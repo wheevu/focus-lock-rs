@@ -15,11 +15,14 @@ It features a modular Rust core for high-speed video processing, a CLI for batch
 
 *   **Person Detection**: Uses **YOLOv8-Nano** via ONNX Runtime for fast, accurate person detection.
 *   **Identity Locking**: Uses **ArcFace** (cosine similarity) to distinguish the specific target person from others in the frame.
+    *   Uses your configured `--threshold` value end-to-end (CLI + GUI).
+    *   Adds relock bias from last known position and adaptive recognition stride for better stability under occlusion.
 *   **Cinematic Smoothing**: Implements a **2D Kalman Filter** to smooth camera movements, preventing jittery tracking and simulating a professional camera operator.
 *   **Performance-First Pipeline**:
     *   3-thread decode/inference/encode pipeline with bounded channels.
-    *   Recognition throttling before and after lock-on to avoid CPU stalls.
+    *   Recognition throttling before and after lock-on to avoid CPU stalls (adaptive while locked).
     *   Caps ArcFace identity checks to top-confidence person candidates per frame.
+    *   Speeds up large-video processing with detection downscale, parallel tensor prep, and fast SIMD face preprocessing.
 *   **Smart Rendering**:
     *   Automated 1080x1920 cropping.
     *   SIMD-accelerated resize path (`fast_image_resize`) for crop and letterbox operations.
@@ -61,7 +64,11 @@ To build and run this project, you need:
 
 ### ONNX Runtime provider note (macOS)
 
-This project requests CoreML execution when available. If your local ONNX Runtime build does not include CoreML support, inference automatically falls back to CPU execution (it still works, but slower).
+This project requests CoreML execution when available.
+
+- Default lookup path is `models/onnxruntime/lib/libonnxruntime.dylib`.
+- If CoreML is unavailable in your local ONNX Runtime build, inference falls back to CPU (works, but much slower on 4K inputs).
+- For best Apple Silicon performance, use an official ONNX Runtime macOS build that includes CoreML support.
 
 ##  Installation & Setup
 
