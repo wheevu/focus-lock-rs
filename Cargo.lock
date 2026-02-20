@@ -1105,6 +1105,7 @@ dependencies = [
  "imageproc",
  "nalgebra 0.33.2",
  "ort",
+ "rayon",
  "serde",
  "thiserror 2.0.18",
  "tracing",

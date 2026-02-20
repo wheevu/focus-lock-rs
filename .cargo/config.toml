@@ -1,2 +1,2 @@
 [env]
-ORT_DYLIB_PATH = "/opt/homebrew/lib/libonnxruntime.dylib"
+ORT_DYLIB_PATH = { value = "models/onnxruntime/lib/libonnxruntime.dylib", relative = true }

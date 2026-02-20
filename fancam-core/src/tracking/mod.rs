@@ -22,7 +22,7 @@ const PROCESS_NOISE: f32 = 4.0;
 const MEASUREMENT_NOISE: f32 = 16.0;
 /// Number of frames to keep the camera locked on last known position before
 /// declaring the target permanently lost.
-const MAX_LOST_FRAMES: u32 = 30;
+const MAX_LOST_FRAMES: u32 = 90;
 
 // ── Kalman filter ─────────────────────────────────────────────────────────────
 
@@ -71,7 +71,10 @@ impl Kalman2D {
         let z = Vector2::new(cx, cy);
         let y = z - self.h * self.x; // innovation
         let s = self.h * self.p * self.h.transpose() + self.r;
-        let k: Matrix4x2<f32> = self.p * self.h.transpose() * s.try_inverse().unwrap();
+        let Some(s_inv) = s.try_inverse() else {
+            return;
+        };
+        let k: Matrix4x2<f32> = self.p * self.h.transpose() * s_inv;
         self.x = self.x + k * y;
         self.p = (Matrix4::identity() - k * self.h) * self.p;
     }
@@ -109,10 +112,16 @@ pub struct BiasTracker {
     lost_frames: u32,
     /// Frame index — used to decide when to throttle recognition.
     pub frame_index: u64,
+    /// Smoothed identity-match confidence to adapt recognition cadence.
+    similarity_ema: f32,
 }
 
-/// How many frames to skip recognition when tracking is confident.
-const RECOGNITION_STRIDE: u64 = 5;
+/// Baseline frame skip when tracking is stable.
+const DEFAULT_RECOGNITION_STRIDE: u64 = 5;
+/// Maximum frame skip when identity confidence is very high.
+const MAX_RECOGNITION_STRIDE: u64 = 12;
+/// Minimum frame skip while trying to recover lock.
+const MIN_RECOGNITION_STRIDE: u64 = 2;
 /// How many frames to skip recognition before the target is first found.
 /// Running YOLO + ArcFace every single frame is extremely expensive on CPU;
 /// the target isn't going to appear and vanish between adjacent frames.
@@ -125,6 +134,7 @@ impl BiasTracker {
             half_size: 0.0,
             lost_frames: 0,
             frame_index: 0,
+            similarity_ema: 0.6,
         }
     }
 
@@ -134,10 +144,31 @@ impl BiasTracker {
     pub fn should_run_recognition(&self) -> bool {
         let stride = if self.kalman.is_none() {
             PRE_LOCK_STRIDE
+        } else if self.lost_frames > 0 || self.similarity_ema < 0.62 {
+            MIN_RECOGNITION_STRIDE
+        } else if self.similarity_ema > 0.82 {
+            MAX_RECOGNITION_STRIDE
+        } else if self.similarity_ema > 0.72 {
+            8
         } else {
-            RECOGNITION_STRIDE
+            DEFAULT_RECOGNITION_STRIDE
         };
         self.frame_index % stride == 0
+    }
+
+    /// Provide the latest identity similarity so cadence can adapt dynamically.
+    pub fn note_similarity(&mut self, similarity: Option<f32>) {
+        if let Some(sim) = similarity {
+            let sim = sim.clamp(0.0, 1.0);
+            self.similarity_ema = 0.85 * self.similarity_ema + 0.15 * sim;
+        } else if self.kalman.is_none() {
+            self.similarity_ema = 0.6;
+        }
+    }
+
+    /// Predicted center to bias re-identification search while relocking.
+    pub fn search_hint(&self) -> Option<(f32, f32)> {
+        self.kalman.as_ref().map(|k| (k.cx(), k.cy()))
     }
 
     /// Feed in the latest detection result (or `None` if not found this frame).
@@ -198,6 +229,7 @@ impl BiasTracker {
     pub fn reset(&mut self) {
         self.kalman = None;
         self.lost_frames = 0;
+        self.similarity_ema = 0.6;
     }
 }
 

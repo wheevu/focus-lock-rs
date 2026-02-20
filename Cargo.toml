@@ -24,6 +24,7 @@ ort = { version = "=2.0.0-rc.10", features = ["load-dynamic", "coreml"] }
 image      = "0.25"
 imageproc  = "0.26"
 fast_image_resize = "6.0"
+rayon = "1.10"
 
 # Linear algebra (Kalman filter)
 nalgebra = "0.33"
