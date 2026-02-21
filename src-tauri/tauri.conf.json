@@ -13,7 +13,6 @@
     "windows": [
       {
         "title": "focus-lock",
-        "icon": "icons/icon.png",
         "width": 1100,
         "height": 760,
         "minWidth": 860,

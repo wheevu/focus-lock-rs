@@ -7,13 +7,16 @@
 //!          cosine similarity.
 
 use anyhow::{Context, Result};
+use fast_image_resize as fr;
 use image::{ImageBuffer, Rgb, RgbImage};
 use imageproc::rect::Rect;
 use ort::execution_providers as ep;
 use ort::session::Session;
 use ort::value::Tensor;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::path::Path;
+use std::sync::Mutex;
 use tracing::debug;
 
 use crate::video::RgbFrame;
@@ -94,6 +97,10 @@ impl BBox {
 /// Wraps the YOLOv8-Nano ONNX session.
 pub struct Detector {
     session: Session,
+    yolo_resizer: fr::Resizer,
+    yolo_resize_buf: Vec<u8>,
+    downscale_resizer: fr::Resizer,
+    downscale_buf: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,15 +112,14 @@ pub struct IdentityMatch {
 impl Detector {
     /// Load a YOLOv8n ONNX model from `model_path`.
     pub fn load<P: AsRef<Path>>(model_path: P) -> Result<Self> {
-        let session = Session::builder()
-            .context("failed to create ORT session builder")?
-            .with_execution_providers([ep::CoreMLExecutionProvider::default()
-                .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
-                .build()])
-            .context("failed to register execution providers")?
-            .commit_from_file(model_path)
-            .context("failed to load YOLOv8 ONNX model")?;
-        Ok(Self { session })
+        let session = build_ort_session(model_path.as_ref(), "failed to load YOLOv8 ONNX model")?;
+        Ok(Self {
+            session,
+            yolo_resizer: fr::Resizer::new(),
+            yolo_resize_buf: vec![0u8; (YOLO_SIZE * YOLO_SIZE * 3) as usize],
+            downscale_resizer: fr::Resizer::new(),
+            downscale_buf: Vec::new(),
+        })
     }
 
     /// Run inference on `frame` and return bounding boxes (in original frame
@@ -124,8 +130,9 @@ impl Detector {
             let scale = DETECTION_MAX_DIM as f32 / max_dim as f32;
             let scaled_w = ((frame.width as f32 * scale).round() as u32).max(1);
             let scaled_h = ((frame.height as f32 * scale).round() as u32).max(1);
-            let scaled = downscale_frame(frame, scaled_w, scaled_h)?;
+            let mut scaled = self.downscale_frame(frame, scaled_w, scaled_h)?;
             let mut boxes = self.detect_native(&scaled)?;
+            self.downscale_buf = std::mem::take(&mut scaled.data);
             let sx = scaled_w as f32 / frame.width as f32;
             let sy = scaled_h as f32 / frame.height as f32;
             for b in &mut boxes {
@@ -141,7 +148,7 @@ impl Detector {
     }
 
     fn detect_native(&mut self, frame: &RgbFrame) -> Result<Vec<BBox>> {
-        let input_tensor = preprocess_yolo(frame)?;
+        let input_tensor = self.preprocess_yolo(frame)?;
 
         let outputs = self
             .session
@@ -161,48 +168,142 @@ impl Detector {
         let scale_x = frame.width as f32 / YOLO_SIZE as f32;
         let scale_y = frame.height as f32 / YOLO_SIZE as f32;
 
-        let mut candidates: Vec<BBox> = Vec::new();
+        let candidates: Vec<BBox> = (0..num_proposals)
+            .into_par_iter()
+            .filter_map(|i| {
+                // Data layout: [cx, cy, w, h, cls0_score, cls1_score, ...]
+                // Stored column-major across the 84 rows.
+                let cx = data[i];
+                let cy = data[num_proposals + i];
+                let w = data[2 * num_proposals + i];
+                let h = data[3 * num_proposals + i];
 
-        for i in 0..num_proposals {
-            // Data layout: [cx, cy, w, h, cls0_score, cls1_score, ...]
-            // Stored column-major across the 84 rows.
-            let cx = data[0 * num_proposals + i];
-            let cy = data[1 * num_proposals + i];
-            let w = data[2 * num_proposals + i];
-            let h = data[3 * num_proposals + i];
+                // Person score (class 0)
+                let person_score = data[(4 + PERSON_CLASS) * num_proposals + i];
 
-            // Person score (class 0)
-            let person_score = data[(4 + PERSON_CLASS) * num_proposals + i];
-
-            // Best class score across all 80 classes
-            let mut max_score = 0f32;
-            for c in 0..num_classes {
-                let s = data[(4 + c) * num_proposals + i];
-                if s > max_score {
-                    max_score = s;
+                // Best class score across all 80 classes
+                let mut max_score = 0f32;
+                for c in 0..num_classes {
+                    let s = data[(4 + c) * num_proposals + i];
+                    if s > max_score {
+                        max_score = s;
+                    }
                 }
-            }
 
-            if person_score < CONF_THRESHOLD || person_score < max_score {
-                continue;
-            }
+                if person_score < CONF_THRESHOLD || person_score < max_score {
+                    return None;
+                }
 
-            // Convert YOLO (cx,cy,w,h) in 640-space → (x1,y1,x2,y2) in original frame
-            let x1 = (cx - w / 2.0) * scale_x;
-            let y1 = (cy - h / 2.0) * scale_y;
-            let x2 = (cx + w / 2.0) * scale_x;
-            let y2 = (cy + h / 2.0) * scale_y;
+                // Convert YOLO (cx,cy,w,h) in 640-space → (x1,y1,x2,y2) in original frame
+                let x1 = (cx - w / 2.0) * scale_x;
+                let y1 = (cy - h / 2.0) * scale_y;
+                let x2 = (cx + w / 2.0) * scale_x;
+                let y2 = (cy + h / 2.0) * scale_y;
 
-            candidates.push(BBox {
-                x1: x1.max(0.0),
-                y1: y1.max(0.0),
-                x2: x2.min(frame.width as f32),
-                y2: y2.min(frame.height as f32),
-                confidence: person_score,
-            });
-        }
+                Some(BBox {
+                    x1: x1.max(0.0),
+                    y1: y1.max(0.0),
+                    x2: x2.min(frame.width as f32),
+                    y2: y2.min(frame.height as f32),
+                    confidence: person_score,
+                })
+            })
+            .collect();
 
         Ok(nms(candidates, IOU_THRESHOLD))
+    }
+
+    fn preprocess_yolo(&mut self, frame: &RgbFrame) -> Result<ort::value::DynValue> {
+        // Use fast_image_resize with NEON SIMD for the large 4K → 640x640 downscale.
+        let src =
+            fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
+                .context("failed to create fast_image_resize source")?;
+
+        let mut dst = fr::images::Image::from_vec_u8(
+            YOLO_SIZE,
+            YOLO_SIZE,
+            std::mem::take(&mut self.yolo_resize_buf),
+            fr::PixelType::U8x3,
+        )
+        .context("failed to create fast_image_resize destination")?;
+
+        let options = fr::ResizeOptions::new()
+            .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+        self.yolo_resizer
+            .resize(&src, &mut dst, Some(&options))
+            .context("fast_image_resize YOLO downscale failed")?;
+
+        self.yolo_resize_buf = dst.into_vec();
+        let raw = &self.yolo_resize_buf;
+
+        // NCHW float tensor: [1, 3, 640, 640].
+        let size = (YOLO_SIZE * YOLO_SIZE) as usize;
+        let mut tensor_data = vec![0f32; 3 * size];
+
+        let (r_plane, gb_plane) = tensor_data.split_at_mut(size);
+        let (g_plane, b_plane) = gb_plane.split_at_mut(size);
+        rayon::join(
+            || {
+                r_plane
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(idx, out)| *out = raw[idx * 3] as f32 / 255.0)
+            },
+            || {
+                rayon::join(
+                    || {
+                        g_plane
+                            .par_iter_mut()
+                            .enumerate()
+                            .for_each(|(idx, out)| *out = raw[idx * 3 + 1] as f32 / 255.0)
+                    },
+                    || {
+                        b_plane
+                            .par_iter_mut()
+                            .enumerate()
+                            .for_each(|(idx, out)| *out = raw[idx * 3 + 2] as f32 / 255.0)
+                    },
+                )
+            },
+        );
+
+        let shape = [1usize, 3, YOLO_SIZE as usize, YOLO_SIZE as usize];
+        Ok(Tensor::from_array((shape, tensor_data.into_boxed_slice()))
+            .context("failed to create YOLO input tensor")?
+            .into_dyn())
+    }
+
+    fn downscale_frame(&mut self, frame: &RgbFrame, out_w: u32, out_h: u32) -> Result<RgbFrame> {
+        let src =
+            fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
+                .context("failed to create detection downscale source")?;
+
+        let out_len = (out_w * out_h * 3) as usize;
+        if self.downscale_buf.len() != out_len {
+            self.downscale_buf.resize(out_len, 0);
+        }
+
+        let mut dst = fr::images::Image::from_vec_u8(
+            out_w,
+            out_h,
+            std::mem::take(&mut self.downscale_buf),
+            fr::PixelType::U8x3,
+        )
+        .context("failed to create detection downscale destination")?;
+
+        let options = fr::ResizeOptions::new()
+            .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+        self.downscale_resizer
+            .resize(&src, &mut dst, Some(&options))
+            .context("failed to downscale frame for detection")?;
+
+        let scaled_data = dst.into_vec();
+        Ok(RgbFrame {
+            data: scaled_data,
+            width: out_w,
+            height: out_h,
+            pts: frame.pts,
+        })
     }
 }
 
@@ -210,7 +311,7 @@ impl Detector {
 
 /// Wraps the ArcFace ONNX session and the reference embedding.
 pub struct FaceIdentifier {
-    session: Session,
+    sessions: Vec<Mutex<Session>>,
     reference_embedding: Vec<f32>,
     similarity_threshold: f32,
     gallery_samples: usize,
@@ -224,14 +325,13 @@ impl FaceIdentifier {
         reference_image_path: Q,
         similarity_threshold: f32,
     ) -> Result<Self> {
-        let mut session = Session::builder()
-            .context("failed to create ORT session builder")?
-            .with_execution_providers([ep::CoreMLExecutionProvider::default()
-                .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
-                .build()])
-            .context("failed to register execution providers")?
-            .commit_from_file(model_path)
-            .context("failed to load ArcFace ONNX model")?;
+        let model_path = model_path.as_ref().to_path_buf();
+        let session_count = MAX_FACE_CANDIDATES;
+        let mut sessions = Vec::with_capacity(session_count);
+        for _ in 0..session_count {
+            let session = build_ort_session(&model_path, "failed to load ArcFace ONNX model")?;
+            sessions.push(Mutex::new(session));
+        }
 
         // Load and embed the reference image (assumed to be a face crop)
         let ref_img = image::open(reference_image_path)
@@ -240,6 +340,11 @@ impl FaceIdentifier {
 
         let tensor = preprocess_face(&ref_img)?;
         let reference_embedding = {
+            let mut session = sessions
+                .first()
+                .context("ArcFace session pool is empty")?
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ArcFace session lock poisoned"))?;
             let outputs = session
                 .run(ort::inputs!["input.1" => tensor])
                 .context("ArcFace reference inference failed")?;
@@ -253,7 +358,7 @@ impl FaceIdentifier {
         );
 
         Ok(Self {
-            session,
+            sessions,
             reference_embedding,
             similarity_threshold,
             gallery_samples: 1,
@@ -283,34 +388,43 @@ impl FaceIdentifier {
         });
         candidates.truncate(MAX_FACE_CANDIDATES);
 
-        let prepared: Vec<(BBox, Result<Vec<f32>>)> = candidates
+        let prepared: Vec<(BBox, Vec<f32>)> = candidates
             .par_iter()
-            .map(|&bbox| {
-                let face_crop = crop_face(frame, bbox);
-                (bbox, preprocess_face_data(&face_crop))
+            .filter_map(|&bbox| {
+                preprocess_face_from_bbox(frame, bbox)
+                    .ok()
+                    .map(|data| (bbox, data))
             })
             .collect();
 
-        for (bbox, maybe_tensor_data) in prepared {
-            let Ok(tensor_data) = maybe_tensor_data else {
-                continue;
-            };
-            let tensor = face_tensor_from_data(tensor_data)?;
+        let sessions = &self.sessions;
+        let reference_embedding = &self.reference_embedding;
+        let similarity_threshold = self.similarity_threshold;
 
-            let outputs = self
-                .session
-                .run(ort::inputs!["input.1" => tensor])
-                .context("ArcFace inference failed")?;
-
-            let embedding = l2_normalize(&extract_first_embedding(&outputs)?);
-            let sim = cosine_similarity(&embedding, &self.reference_embedding);
-
-            debug!(sim, "face similarity");
-
-            if sim >= self.similarity_threshold {
-                if best.as_ref().is_none_or(|b| sim > b.0) {
-                    best = Some((sim, bbox, embedding));
+        let matches: Vec<(f32, BBox, Vec<f32>)> = prepared
+            .into_par_iter()
+            .enumerate()
+            .filter_map(|(i, (bbox, tensor_data))| {
+                let tensor = face_tensor_from_data(tensor_data).ok()?;
+                let idx = i % sessions.len();
+                let embedding = {
+                    let mut session = sessions.get(idx)?.lock().ok()?;
+                    let outputs = session.run(ort::inputs!["input.1" => tensor]).ok()?;
+                    l2_normalize(&extract_first_embedding(&outputs).ok()?)
+                };
+                let sim = cosine_similarity(&embedding, reference_embedding);
+                debug!(sim, "face similarity");
+                if sim >= similarity_threshold {
+                    Some((sim, bbox, embedding))
+                } else {
+                    None
                 }
+            })
+            .collect();
+
+        for (sim, bbox, embedding) in matches {
+            if best.as_ref().is_none_or(|b| sim > b.0) {
+                best = Some((sim, bbox, embedding));
             }
         }
 
@@ -342,65 +456,6 @@ impl FaceIdentifier {
 
 // ── Pre/post-processing helpers ──────────────────────────────────────────────
 
-/// Resize the frame to 640×640, convert to NCHW float tensor normalised to
-/// [0, 1], return as an ORT `Tensor`.
-fn preprocess_yolo(frame: &RgbFrame) -> Result<ort::value::DynValue> {
-    use fast_image_resize as fr;
-
-    // Use fast_image_resize with NEON SIMD for the large 4K → 640x640 downscale.
-    // ImageRef borrows the frame data immutably — no clone needed.
-    let src =
-        fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
-            .context("failed to create fast_image_resize source")?;
-
-    let mut dst = fr::images::Image::new(YOLO_SIZE, YOLO_SIZE, fr::PixelType::U8x3);
-
-    let mut resizer = fr::Resizer::new();
-    let options =
-        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
-    resizer
-        .resize(&src, &mut dst, Some(&options))
-        .context("fast_image_resize YOLO downscale failed")?;
-
-    let raw = dst.buffer();
-
-    // NCHW float tensor: [1, 3, 640, 640].
-    let size = (YOLO_SIZE * YOLO_SIZE) as usize;
-    let mut tensor_data = vec![0f32; 3 * size];
-
-    let (r_plane, gb_plane) = tensor_data.split_at_mut(size);
-    let (g_plane, b_plane) = gb_plane.split_at_mut(size);
-    rayon::join(
-        || {
-            r_plane
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(idx, out)| *out = raw[idx * 3] as f32 / 255.0)
-        },
-        || {
-            rayon::join(
-                || {
-                    g_plane
-                        .par_iter_mut()
-                        .enumerate()
-                        .for_each(|(idx, out)| *out = raw[idx * 3 + 1] as f32 / 255.0)
-                },
-                || {
-                    b_plane
-                        .par_iter_mut()
-                        .enumerate()
-                        .for_each(|(idx, out)| *out = raw[idx * 3 + 2] as f32 / 255.0)
-                },
-            )
-        },
-    );
-
-    let shape = [1usize, 3, YOLO_SIZE as usize, YOLO_SIZE as usize];
-    Ok(Tensor::from_array((shape, tensor_data.into_boxed_slice()))
-        .context("failed to create YOLO input tensor")?
-        .into_dyn())
-}
-
 /// Crop the approximate head region from a person BBox, resize to 112×112,
 /// normalise to [-1, 1], return as an ORT `Tensor`.
 fn preprocess_face(img: &RgbImage) -> Result<ort::value::DynValue> {
@@ -408,33 +463,77 @@ fn preprocess_face(img: &RgbImage) -> Result<ort::value::DynValue> {
     face_tensor_from_data(tensor_data)
 }
 
-fn preprocess_face_data(img: &RgbImage) -> Result<Vec<f32>> {
-    use fast_image_resize as fr;
+thread_local! {
+    static FACE_RESIZER: RefCell<fr::Resizer> = RefCell::new(fr::Resizer::new());
+    static FACE_RESIZE_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; (FACE_SIZE * FACE_SIZE * 3) as usize]);
+    static FACE_CROP_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
-    let src =
-        fr::images::ImageRef::new(img.width(), img.height(), img.as_raw(), fr::PixelType::U8x3)
-            .context("failed to create face resize source")?;
-    let mut dst = fr::images::Image::new(FACE_SIZE, FACE_SIZE, fr::PixelType::U8x3);
-    let mut resizer = fr::Resizer::new();
-    let options =
-        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
-    resizer
-        .resize(&src, &mut dst, Some(&options))
-        .context("fast_image_resize face resize failed")?;
+fn preprocess_face_data(img: &RgbImage) -> Result<Vec<f32>> {
+    preprocess_face_data_from_raw(img.width(), img.height(), img.as_raw())
+}
+
+fn preprocess_face_data_from_raw(width: u32, height: u32, raw_rgb: &[u8]) -> Result<Vec<f32>> {
+    let src = fr::images::ImageRef::new(width, height, raw_rgb, fr::PixelType::U8x3)
+        .context("failed to create face resize source")?;
 
     // NCHW float tensor: [1, 3, 112, 112].
     // Use flat indexed access over raw bytes — avoids per-pixel Pixel overhead.
     let size = (FACE_SIZE * FACE_SIZE) as usize;
     let mut tensor_data = vec![0f32; 3 * size];
-    let raw = dst.buffer(); // &[u8], packed RGB
 
-    for idx in 0..size {
-        tensor_data[0 * size + idx] = (raw[idx * 3] as f32 - 127.5) / 128.0;
-        tensor_data[1 * size + idx] = (raw[idx * 3 + 1] as f32 - 127.5) / 128.0;
-        tensor_data[2 * size + idx] = (raw[idx * 3 + 2] as f32 - 127.5) / 128.0;
-    }
+    FACE_RESIZER.with(|resizer_cell| {
+        FACE_RESIZE_BUF.with(|buf_cell| -> Result<()> {
+            let mut resize_buf = buf_cell.borrow_mut();
+            let mut dst = fr::images::Image::from_vec_u8(
+                FACE_SIZE,
+                FACE_SIZE,
+                std::mem::take(&mut *resize_buf),
+                fr::PixelType::U8x3,
+            )
+            .context("failed to create face resize destination")?;
+
+            let options = fr::ResizeOptions::new()
+                .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+            resizer_cell
+                .borrow_mut()
+                .resize(&src, &mut dst, Some(&options))
+                .context("fast_image_resize face resize failed")?;
+
+            *resize_buf = dst.into_vec();
+            for idx in 0..size {
+                tensor_data[idx] = (resize_buf[idx * 3] as f32 - 127.5) / 128.0;
+                tensor_data[size + idx] = (resize_buf[idx * 3 + 1] as f32 - 127.5) / 128.0;
+                tensor_data[2 * size + idx] = (resize_buf[idx * 3 + 2] as f32 - 127.5) / 128.0;
+            }
+            Ok(())
+        })
+    })?;
 
     Ok(tensor_data)
+}
+
+fn preprocess_face_from_bbox(frame: &RgbFrame, bbox: BBox) -> Result<Vec<f32>> {
+    let (face_x1, face_y1, face_w, face_h) = face_crop_region(frame, bbox);
+    let src_stride = (frame.width * 3) as usize;
+    let dst_stride = (face_w * 3) as usize;
+    let crop_len = dst_stride * face_h as usize;
+
+    FACE_CROP_BUF.with(|crop_cell| {
+        let mut crop_buf = crop_cell.borrow_mut();
+        if crop_buf.len() != crop_len {
+            crop_buf.resize(crop_len, 0);
+        }
+
+        for row in 0..face_h as usize {
+            let src_start = (face_y1 as usize + row) * src_stride + face_x1 as usize * 3;
+            let dst_start = row * dst_stride;
+            crop_buf[dst_start..dst_start + dst_stride]
+                .copy_from_slice(&frame.data[src_start..src_start + dst_stride]);
+        }
+
+        preprocess_face_data_from_raw(face_w, face_h, &crop_buf)
+    })
 }
 
 fn face_tensor_from_data(tensor_data: Vec<f32>) -> Result<ort::value::DynValue> {
@@ -442,6 +541,25 @@ fn face_tensor_from_data(tensor_data: Vec<f32>) -> Result<ort::value::DynValue> 
     Ok(Tensor::from_array((shape, tensor_data.into_boxed_slice()))
         .context("failed to create face input tensor")?
         .into_dyn())
+}
+
+fn build_ort_session(model_path: &Path, load_error: &'static str) -> Result<Session> {
+    let mut builder = Session::builder().context("failed to create ORT session builder")?;
+    builder = builder
+        .with_intra_threads(1)
+        .context("failed to set ORT intra threads")?;
+    builder = builder
+        .with_inter_threads(1)
+        .context("failed to set ORT inter threads")?;
+    builder = builder
+        .with_parallel_execution(false)
+        .context("failed to set ORT parallel execution")?;
+    builder = builder
+        .with_execution_providers([ep::CoreMLExecutionProvider::default()
+            .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
+            .build()])
+        .context("failed to register execution providers")?;
+    builder.commit_from_file(model_path).context(load_error)
 }
 
 /// Extract the first output tensor's data as a flat `Vec<f32>`.
@@ -460,8 +578,7 @@ fn extract_first_embedding(outputs: &ort::session::SessionOutputs<'_>) -> Result
     Ok(data.to_vec())
 }
 
-/// Crop the estimated face region from a full RGB frame given a person BBox.
-fn crop_face(frame: &RgbFrame, bbox: BBox) -> RgbImage {
+fn face_crop_region(frame: &RgbFrame, bbox: BBox) -> (u32, u32, u32, u32) {
     let bw = bbox.width().max(1.0);
     let bh = bbox.height().max(1.0);
     let aspect = (bw / bh).clamp(0.2, 2.5);
@@ -488,17 +605,7 @@ fn crop_face(frame: &RgbFrame, bbox: BBox) -> RgbImage {
         .min(frame.height.saturating_sub(face_y1))
         .max(1);
 
-    // Copy only the crop rows from the raw slice — O(crop area), no full-frame clone.
-    let src_stride = (frame.width * 3) as usize;
-    let dst_stride = (face_w * 3) as usize;
-    let mut buf = vec![0u8; dst_stride * face_h as usize];
-    for row in 0..face_h as usize {
-        let src_start = (face_y1 as usize + row) * src_stride + face_x1 as usize * 3;
-        let dst_start = row * dst_stride;
-        buf[dst_start..dst_start + dst_stride]
-            .copy_from_slice(&frame.data[src_start..src_start + dst_stride]);
-    }
-    RgbImage::from_raw(face_w, face_h, buf).expect("valid crop dimensions")
+    (face_x1, face_y1, face_w, face_h)
 }
 
 fn rank_candidate(bbox: BBox, search_hint: Option<(f32, f32)>) -> f32 {
@@ -512,28 +619,6 @@ fn rank_candidate(bbox: BBox, search_hint: Option<(f32, f32)>) -> f32 {
         score += proximity * 0.35;
     }
     score
-}
-
-fn downscale_frame(frame: &RgbFrame, out_w: u32, out_h: u32) -> Result<RgbFrame> {
-    use fast_image_resize as fr;
-
-    let src =
-        fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
-            .context("failed to create detection downscale source")?;
-    let mut dst = fr::images::Image::new(out_w, out_h, fr::PixelType::U8x3);
-    let mut resizer = fr::Resizer::new();
-    let options =
-        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
-    resizer
-        .resize(&src, &mut dst, Some(&options))
-        .context("failed to downscale frame for detection")?;
-
-    Ok(RgbFrame {
-        data: dst.buffer().to_vec(),
-        width: out_w,
-        height: out_h,
-        pts: frame.pts,
-    })
 }
 
 // ── Math helpers ─────────────────────────────────────────────────────────────

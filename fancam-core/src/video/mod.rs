@@ -8,7 +8,8 @@
 //!
 //! Performance: uses a 3-thread pipeline —
 //!   Thread A  decode:     demux → YUV decode → RGB convert → video_raw channel
-//!   Thread B  inference:  apply frame_fn closure → video_xfm channel
+//!   Thread B1 analysis:   detect/identify/tracking → analyzed channel
+//!   Thread B2 rendering:  apply render closure → video_xfm channel
 //!   Main      encode:     receive xfm frames, lazy-init encoder, RGB→YUV, write
 
 use anyhow::{Context, Result};
@@ -21,6 +22,8 @@ use std::sync::mpsc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::tracking::CameraState;
+
 /// Output pixel format for the encoder (YUV420p is universally compatible).
 const ENCODE_FORMAT: format::Pixel = format::Pixel::YUV420P;
 /// Scaling flags — fast bilinear is sufficient for the decode→encode path.
@@ -29,6 +32,10 @@ const SCALE_FLAGS: scaling::Flags = scaling::Flags::FAST_BILINEAR;
 const VIDEO_RAW_QUEUE: usize = 16;
 /// Inference → encode queue depth.
 const VIDEO_XFM_QUEUE: usize = 8;
+/// Analysis → render queue depth.
+const VIDEO_ANALYZED_QUEUE: usize = 8;
+/// Reusable RGB buffer pool size.
+const VIDEO_BUFFER_POOL: usize = 24;
 
 /// A single decoded video frame in RGB24 format, along with its presentation
 /// timestamp (in the source stream's time-base units).
@@ -66,7 +73,15 @@ where
     Q: AsRef<Path>,
     F: FnMut(&mut RgbFrame) + Send + 'static,
 {
-    transcode_inner(input_path, output_path, 0, frame_fn, |_, _| {})
+    let mut frame_fn = frame_fn;
+    transcode_inner(
+        input_path,
+        output_path,
+        0,
+        |_frame| None,
+        move |frame, _camera| frame_fn(frame),
+        |_, _| {},
+    )
 }
 
 /// Same as [`transcode`] but calls `progress_fn(current_frame, total_frames)`
@@ -84,20 +99,56 @@ where
     F: FnMut(&mut RgbFrame) + Send + 'static,
     G: FnMut(u64, u64),
 {
-    transcode_inner(input_path, output_path, total, frame_fn, progress_fn)
+    let mut frame_fn = frame_fn;
+    transcode_inner(
+        input_path,
+        output_path,
+        total,
+        |_frame| None,
+        move |frame, _camera| frame_fn(frame),
+        progress_fn,
+    )
 }
 
-fn transcode_inner<P, Q, F, G>(
+/// Staged variant: analysis and rendering run on separate worker threads.
+pub fn transcode_with_progress_staged<P, Q, A, R, G>(
     input_path: P,
     output_path: Q,
     total: u64,
-    frame_fn: F,
+    analyze_fn: A,
+    render_fn: R,
+    progress_fn: G,
+) -> Result<()>
+where
+    P: AsRef<Path> + Send + 'static,
+    Q: AsRef<Path>,
+    A: FnMut(&RgbFrame) -> Option<CameraState> + Send + 'static,
+    R: FnMut(&mut RgbFrame, Option<CameraState>) + Send + 'static,
+    G: FnMut(u64, u64),
+{
+    transcode_inner(
+        input_path,
+        output_path,
+        total,
+        analyze_fn,
+        render_fn,
+        progress_fn,
+    )
+}
+
+fn transcode_inner<P, Q, A, R, G>(
+    input_path: P,
+    output_path: Q,
+    total: u64,
+    analyze_fn: A,
+    render_fn: R,
     mut progress_fn: G,
 ) -> Result<()>
 where
     P: AsRef<Path> + Send + 'static,
     Q: AsRef<Path>,
-    F: FnMut(&mut RgbFrame) + Send + 'static,
+    A: FnMut(&RgbFrame) -> Option<CameraState> + Send + 'static,
+    R: FnMut(&mut RgbFrame, Option<CameraState>) + Send + 'static,
     G: FnMut(u64, u64),
 {
     ffmpeg::init().context("failed to initialise FFmpeg")?;
@@ -153,12 +204,16 @@ where
     );
 
     // ── Channels ─────────────────────────────────────────────────────────────
-    // video_raw:  Thread A → Thread B  (decoded RGB frames)
-    // video_xfm:  Thread B → Main      (post-transform RGB frames)
+    // video_raw:      Thread A  → Thread B1 (decoded RGB frames)
+    // video_analyzed: Thread B1 → Thread B2 (camera state + frame)
+    // video_xfm:      Thread B2 → Main      (post-transform RGB frames)
     // audio:      Thread A → Main      (plain-data audio packets)
     let (video_raw_tx, video_raw_rx) = mpsc::sync_channel::<RgbFrame>(VIDEO_RAW_QUEUE);
+    let (video_analyzed_tx, video_analyzed_rx) =
+        mpsc::sync_channel::<(RgbFrame, Option<CameraState>)>(VIDEO_ANALYZED_QUEUE);
     let (video_xfm_tx, video_xfm_rx) = mpsc::sync_channel::<RgbFrame>(VIDEO_XFM_QUEUE);
     let (audio_tx, audio_rx) = mpsc::sync_channel::<AudioPacket>(32);
+    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(VIDEO_BUFFER_POOL);
 
     // ── Output — lazily initialised on first frame ────────────────────────────
     let mut octx = format::output(&output_path).context("could not create output context")?;
@@ -214,10 +269,20 @@ where
                 // De-stride: copy only actual pixel rows (no padding)
                 let stride = rgb_frame.stride(0);
                 let raw = rgb_frame.data(0);
-                let mut rgb_data = Vec::with_capacity((src_width * src_height * 3) as usize);
+                let row_bytes = src_width as usize * 3;
+                let frame_len = (src_width * src_height * 3) as usize;
+                let mut rgb_data = match recycle_rx.try_recv() {
+                    Ok(mut buf) => {
+                        buf.resize(frame_len, 0);
+                        buf
+                    }
+                    Err(_) => vec![0u8; frame_len],
+                };
                 for row in 0..src_height as usize {
-                    let start = row * stride;
-                    rgb_data.extend_from_slice(&raw[start..start + src_width as usize * 3]);
+                    let src_start = row * stride;
+                    let dst_start = row * row_bytes;
+                    rgb_data[dst_start..dst_start + row_bytes]
+                        .copy_from_slice(&raw[src_start..src_start + row_bytes]);
                 }
 
                 let pts = decoded_frame.pts().unwrap_or(0);
@@ -277,16 +342,27 @@ where
         Ok(())
     });
 
-    // ── Thread B: inference / transform ──────────────────────────────────────
-    let thread_b = std::thread::spawn(move || -> Result<()> {
-        let mut frame_fn = frame_fn;
-        for mut frame in video_raw_rx {
-            frame_fn(&mut frame);
+    // ── Thread B1: analysis ───────────────────────────────────────────────────
+    let thread_b1 = std::thread::spawn(move || -> Result<()> {
+        let mut analyze_fn = analyze_fn;
+        for frame in video_raw_rx {
+            let camera = analyze_fn(&frame);
+            video_analyzed_tx
+                .send((frame, camera))
+                .map_err(|_| anyhow::anyhow!("video_analyzed channel closed"))?;
+        }
+        Ok(())
+    });
+
+    // ── Thread B2: rendering ──────────────────────────────────────────────────
+    let thread_b2 = std::thread::spawn(move || -> Result<()> {
+        let mut render_fn = render_fn;
+        for (mut frame, camera) in video_analyzed_rx {
+            render_fn(&mut frame, camera);
             video_xfm_tx
                 .send(frame)
                 .map_err(|_| anyhow::anyhow!("video_xfm channel closed"))?;
         }
-        // Dropping video_xfm_tx signals EOF to main thread
         Ok(())
     });
 
@@ -350,7 +426,7 @@ where
         Ok(())
     }
 
-    for frame in video_xfm_rx {
+    for mut frame in video_xfm_rx {
         drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written)?;
 
         let out_w = frame.width;
@@ -421,12 +497,18 @@ where
 
         // Copy transformed RGB data into the output AVFrame (handling stride)
         let out_stride = state.out_rgb_frame.stride(0);
+        let row_bytes = state.out_width as usize * 3;
         let plane_data = state.out_rgb_frame.data_mut(0);
-        for row in 0..state.out_height as usize {
-            let dst_start = row * out_stride;
-            let src_start = row * state.out_width as usize * 3;
-            plane_data[dst_start..dst_start + state.out_width as usize * 3]
-                .copy_from_slice(&frame.data[src_start..src_start + state.out_width as usize * 3]);
+        if out_stride == row_bytes {
+            plane_data[..row_bytes * state.out_height as usize]
+                .copy_from_slice(&frame.data[..row_bytes * state.out_height as usize]);
+        } else {
+            for row in 0..state.out_height as usize {
+                let dst_start = row * out_stride;
+                let src_start = row * row_bytes;
+                plane_data[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(&frame.data[src_start..src_start + row_bytes]);
+            }
         }
 
         // RGB24 → YUV420P
@@ -489,15 +571,22 @@ where
             }
             debug!(frame_count, "processed frames");
         }
+
+        let mut recycled = std::mem::take(&mut frame.data);
+        recycled.clear();
+        let _ = recycle_tx.try_send(recycled);
     }
 
     // Join threads and propagate any errors
     thread_a
         .join()
         .map_err(|_| anyhow::anyhow!("decode thread panicked"))??;
-    thread_b
+    thread_b1
         .join()
-        .map_err(|_| anyhow::anyhow!("inference thread panicked"))??;
+        .map_err(|_| anyhow::anyhow!("analysis thread panicked"))??;
+    thread_b2
+        .join()
+        .map_err(|_| anyhow::anyhow!("render thread panicked"))??;
 
     let state = enc_state
         .as_mut()

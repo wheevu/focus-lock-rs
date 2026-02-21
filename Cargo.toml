@@ -52,3 +52,12 @@ tauri-build = { version = "2.5", features = [] }
 tauri-plugin-dialog  = "2"
 tauri-plugin-shell   = "2"
 tauri-plugin-fs      = "2"
+
+[profile.dev.package.fancam-core]
+opt-level = 3
+
+[profile.dev.package.ort]
+opt-level = 3
+
+[profile.dev.package."ffmpeg-next"]
+opt-level = 3

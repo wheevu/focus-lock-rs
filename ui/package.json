@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "cd .. && npx --prefix ui tauri --config src-tauri/tauri.conf.json",
     "tauri:dev": "cd .. && npx --prefix ui tauri dev --config src-tauri/tauri.conf.json",
+    "tauri:dev:release": "cd .. && npx --prefix ui tauri dev --release --config src-tauri/tauri.conf.json",
     "tauri:build": "cd .. && npx --prefix ui tauri build --config src-tauri/tauri.conf.json"
   },
   "dependencies": {

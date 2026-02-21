@@ -23,6 +23,8 @@ It features a modular Rust core for high-speed video processing, a CLI for batch
     *   Recognition throttling before and after lock-on to avoid CPU stalls (adaptive while locked).
     *   Caps ArcFace identity checks to top-confidence person candidates per frame.
     *   Speeds up large-video processing with detection downscale, parallel tensor prep, and fast SIMD face preprocessing.
+    *   Reuses rendering buffers/resizer state to reduce per-frame allocations.
+    *   Emits periodic per-stage timing logs (`detect`, `identify`, `render`) for targeted profiling.
 *   **Smart Rendering**:
     *   Automated 1080x1920 cropping.
     *   SIMD-accelerated resize path (`fast_image_resize`) for crop and letterbox operations.
@@ -101,6 +103,11 @@ The GUI allows you to select files via drag-and-drop and visualize progress.
 2.  **Run in Development Mode:**
     ```bash
     npm run tauri:dev
+    ```
+
+    For near-production processing speed while iterating UI, use:
+    ```bash
+    npm run tauri:dev:release
     ```
 
 3.  **Build for Production:**
