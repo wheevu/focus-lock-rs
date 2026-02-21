@@ -1,4 +1,5 @@
 pub mod detection;
+pub mod pipeline;
 pub mod rendering;
 pub mod runtime;
 pub mod tracking;

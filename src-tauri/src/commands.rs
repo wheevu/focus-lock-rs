@@ -4,11 +4,9 @@ use std::{
 };
 
 use fancam_core::{
-    detection::{Detector, FaceIdentifier},
-    rendering::{crop_fancam, letterbox_passthrough},
+    pipeline::Pipeline,
     runtime::configure_ort_dylib,
-    tracking::BiasTracker,
-    video::{total_frames, transcode_with_progress},
+    video::{total_frames, transcode_with_progress_staged},
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -128,56 +126,28 @@ fn run_pipeline(
 
     configure_ort_dylib();
 
-    let mut detector = Detector::load(&args.yolo_model)?;
-    let mut identifier = FaceIdentifier::load(&args.face_model, &args.bias, threshold)?;
-    let mut tracker = BiasTracker::new();
+    let pipeline = Pipeline::load(&args.yolo_model, &args.face_model, &args.bias, threshold)?;
+    let (mut analyzer, mut renderer) = pipeline.into_parts();
 
-    transcode_with_progress(
+    let cancel_analyze = Arc::clone(&cancel);
+    let cancel_render = Arc::clone(&cancel);
+
+    transcode_with_progress_staged(
         video_path,
         &output_path,
         total,
         move |frame| {
-            if cancel.lock().map(|g| *g).unwrap_or(false) {
+            if cancel_analyze.lock().map(|g| *g).unwrap_or(false) {
+                None
+            } else {
+                analyzer.analyze(frame)
+            }
+        },
+        move |frame, camera| {
+            if cancel_render.lock().map(|g| *g).unwrap_or(false) {
                 return;
             }
-
-            let detection = if tracker.should_run_recognition() {
-                match detector.detect(frame) {
-                    Ok(persons) => {
-                        match identifier.identify(frame, &persons, tracker.search_hint()) {
-                            Ok(found) => found,
-                            Err(e) => {
-                                tracing::warn!("face ID error: {e}");
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("detection error: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            tracker.note_similarity(detection.as_ref().map(|m| m.similarity));
-
-            let camera = tracker.update(detection.map(|m| m.bbox));
-
-            let cropped = match camera {
-                Some(ref state) => crop_fancam(frame, state),
-                None => letterbox_passthrough(frame),
-            };
-
-            match cropped {
-                Ok(out) => {
-                    frame.data = out.data;
-                    frame.width = out.width;
-                    frame.height = out.height;
-                }
-                Err(e) => tracing::warn!("render error: {e}"),
-            }
+            renderer.render(frame, camera);
         },
         |current, total| {
             let fraction = if total > 0 {

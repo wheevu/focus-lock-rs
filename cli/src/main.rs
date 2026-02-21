@@ -6,11 +6,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use fancam_core::{
-    detection::{Detector, FaceIdentifier, draw_boxes},
-    rendering::{crop_fancam, letterbox_passthrough},
+    detection::{Detector, draw_boxes},
+    pipeline::Pipeline,
     runtime::configure_ort_dylib,
-    tracking::BiasTracker,
-    video::{RgbFrame, to_grayscale, transcode},
+    video::{RgbFrame, to_grayscale, transcode, transcode_with_progress_staged},
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -176,63 +175,29 @@ fn cmd_fancam(
     info!("  bias image : {}", bias.display());
     info!("  output     : {}", output.display());
 
-    let mut detector = Detector::load(&yolo_model)
-        .with_context(|| format!("failed to load YOLO model: {}", yolo_model.display()))?;
-
-    let mut identifier = FaceIdentifier::load(&face_model, &bias, threshold.clamp(0.0, 1.0))
+    let pipeline = Pipeline::load(&yolo_model, &face_model, &bias, threshold.clamp(0.0, 1.0))
         .with_context(|| {
             format!(
-                "failed to load face model or embed reference: {}",
+                "failed to load models or embed reference: {}",
                 bias.display()
             )
         })?;
+    let (mut analyzer, mut renderer) = pipeline.into_parts();
 
-    let mut tracker = BiasTracker::new();
     let pb = spinner("Generating fancam…");
     let pb2 = pb.clone();
 
-    transcode(video, &output, move |frame: &mut RgbFrame| {
-        pb2.tick();
-
-        // Throttle recognition when locked on target
-        let detection = if tracker.should_run_recognition() {
-            match detector.detect(frame) {
-                Ok(persons) => match identifier.identify(frame, &persons, tracker.search_hint()) {
-                    Ok(found) => found,
-                    Err(e) => {
-                        tracing::warn!("face ID error: {e}");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!("detection error: {e}");
-                    None
-                }
-            }
-        } else {
-            // Predict-only frame — pass None so tracker runs Kalman predict
-            None
-        };
-
-        tracker.note_similarity(detection.as_ref().map(|m| m.similarity));
-
-        let camera = tracker.update(detection.map(|m| m.bbox));
-
-        // Render the 9:16 crop (or letterbox fallback if target is lost)
-        let cropped = match camera {
-            Some(ref state) => crop_fancam(frame, state),
-            None => letterbox_passthrough(frame),
-        };
-
-        match cropped {
-            Ok(out) => {
-                frame.data = out.data;
-                frame.width = out.width;
-                frame.height = out.height;
-            }
-            Err(e) => tracing::warn!("render error: {e}"),
-        }
-    })
+    transcode_with_progress_staged(
+        video,
+        &output,
+        0,
+        move |frame| analyzer.analyze(frame),
+        move |frame: &mut RgbFrame, camera| {
+            renderer.render(frame, camera);
+            pb2.tick();
+        },
+        |_, _| {},
+    )
     .context("fancam transcode failed")?;
 
     pb.finish_with_message("Fancam saved.");
