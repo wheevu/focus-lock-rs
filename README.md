@@ -17,6 +17,11 @@ It features a modular Rust core for high-speed video processing, a CLI for batch
 *   **Identity Locking**: Uses **ArcFace** (cosine similarity) to distinguish the specific target person from others in the frame.
     *   Uses your configured `--threshold` value end-to-end (CLI + GUI).
     *   Adds relock bias from last known position and adaptive recognition stride for better stability under occlusion.
+*   **Identity Discovery Pass (GUI)**:
+    *   Scans sampled frames first and proposes member thumbnails before tracking begins.
+    *   Supports expected-member-count input and automatic informed rescan when duplicates/count mismatch are detected.
+    *   Adds manual validation controls (`exclude`, duplicate resolve, low-confidence confirm) before enabling render.
+    *   Lets you choose a target member card; the selected anchor is used as an extra tracking prior alongside the bias image.
 *   **Cinematic Smoothing**: Implements a **2D Kalman Filter** to smooth camera movements, preventing jittery tracking and simulating a professional camera operator.
 *   **Performance-First Pipeline**:
     *   3-thread decode/inference/encode pipeline with bounded channels.
@@ -51,6 +56,7 @@ The project is organized as a Cargo workspace:
     *   If occluded, the filter predicts the position based on previous momentum.
 5.  **Render**: The frame is cropped to the smoothed coordinates and re-encoded to H.264.
 
+<img src="./src/process.png">
 <img src="./src/output.png">
 
 ##  Prerequisites
@@ -93,6 +99,13 @@ This project requests CoreML execution when available.
 ## Desktop Application (GUI)
 
 The GUI allows you to select files via drag-and-drop and visualize progress.
+
+The recommended GUI flow is now:
+
+1. Select video + bias reference + output.
+2. Run **Identity Discovery** and optionally set the expected member count.
+3. Select the proposed member thumbnail to track.
+4. Render fancam (blocked until identity review has no unresolved warnings).
 
 1.  **Install frontend dependencies:**
     ```bash
