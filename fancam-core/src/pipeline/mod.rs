@@ -138,13 +138,29 @@ impl Pipeline {
         reference_image_path: R,
         similarity_threshold: f32,
     ) -> Result<Self> {
+        Self::load_with_hint(
+            yolo_model_path,
+            face_model_path,
+            reference_image_path,
+            similarity_threshold,
+            None,
+        )
+    }
+
+    pub fn load_with_hint<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
+        yolo_model_path: P,
+        face_model_path: Q,
+        reference_image_path: R,
+        similarity_threshold: f32,
+        initial_search_hint: Option<(f32, f32)>,
+    ) -> Result<Self> {
         let detector = Detector::load(yolo_model_path)?;
         let identifier = FaceIdentifier::load(
             face_model_path,
             reference_image_path,
             similarity_threshold.clamp(0.0, 1.0),
         )?;
-        let tracker = BiasTracker::new();
+        let tracker = BiasTracker::new_with_hint(initial_search_hint);
         let renderer = FrameRenderer::new();
 
         Ok(Self {

@@ -114,6 +114,8 @@ pub struct BiasTracker {
     pub frame_index: u64,
     /// Smoothed identity-match confidence to adapt recognition cadence.
     similarity_ema: f32,
+    /// Optional user-selected anchor from discovery pass, used before lock-on.
+    bootstrap_hint: Option<(f32, f32)>,
 }
 
 /// Baseline frame skip when tracking is stable.
@@ -129,12 +131,17 @@ const PRE_LOCK_STRIDE: u64 = 3;
 
 impl BiasTracker {
     pub fn new() -> Self {
+        Self::new_with_hint(None)
+    }
+
+    pub fn new_with_hint(bootstrap_hint: Option<(f32, f32)>) -> Self {
         Self {
             kalman: None,
             half_size: 0.0,
             lost_frames: 0,
             frame_index: 0,
             similarity_ema: 0.6,
+            bootstrap_hint,
         }
     }
 
@@ -168,7 +175,10 @@ impl BiasTracker {
 
     /// Predicted center to bias re-identification search while relocking.
     pub fn search_hint(&self) -> Option<(f32, f32)> {
-        self.kalman.as_ref().map(|k| (k.cx(), k.cy()))
+        self.kalman
+            .as_ref()
+            .map(|k| (k.cx(), k.cy()))
+            .or(self.bootstrap_hint)
     }
 
     /// Feed in the latest detection result (or `None` if not found this frame).
@@ -192,6 +202,7 @@ impl BiasTracker {
                         // First detection — initialise filter
                         self.kalman = Some(Kalman2D::new(cx, cy));
                         self.half_size = hs;
+                        self.bootstrap_hint = None;
                     }
                 }
 

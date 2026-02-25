@@ -1,0 +1,390 @@
+use std::cmp::Ordering;
+use std::io::Cursor;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use ffmpeg_next as ffmpeg;
+use ffmpeg_next::{format, frame, media, software::scaling};
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{ImageBuffer, RgbImage};
+
+use crate::detection::{BBox, Detector, FaceEmbedder, embedding_cosine_similarity};
+use crate::video::RgbFrame;
+
+const DEFAULT_SAMPLE_STRIDE: u64 = 12;
+const DEFAULT_MAX_SAMPLED_FRAMES: usize = 900;
+const DEFAULT_MAX_FACES_PER_FRAME: usize = 6;
+const DEFAULT_CLUSTER_SIMILARITY: f32 = 0.76;
+const DEFAULT_DUPLICATE_SIMILARITY: f32 = 0.86;
+
+#[derive(Debug, Clone)]
+pub struct DiscoveryConfig {
+    pub sample_stride: u64,
+    pub max_sampled_frames: usize,
+    pub max_faces_per_frame: usize,
+    pub cluster_similarity: f32,
+    pub duplicate_similarity: f32,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            sample_stride: DEFAULT_SAMPLE_STRIDE,
+            max_sampled_frames: DEFAULT_MAX_SAMPLED_FRAMES,
+            max_faces_per_frame: DEFAULT_MAX_FACES_PER_FRAME,
+            cluster_similarity: DEFAULT_CLUSTER_SIMILARITY,
+            duplicate_similarity: DEFAULT_DUPLICATE_SIMILARITY,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DuplicatePair {
+    pub a: usize,
+    pub b: usize,
+    pub similarity: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityCandidate {
+    pub id: usize,
+    pub confidence: f32,
+    pub observations: u32,
+    pub first_frame: u64,
+    pub last_frame: u64,
+    pub anchor_x: f32,
+    pub anchor_y: f32,
+    pub thumbnail_jpeg: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveryReport {
+    pub sampled_frames: u64,
+    pub total_decoded_frames: u64,
+    pub candidates: Vec<IdentityCandidate>,
+    pub duplicates: Vec<DuplicatePair>,
+}
+
+pub struct DiscoveryEngine {
+    detector: Detector,
+    embedder: FaceEmbedder,
+}
+
+impl DiscoveryEngine {
+    pub fn load<P: AsRef<Path>, Q: AsRef<Path>>(
+        yolo_model_path: P,
+        face_model_path: Q,
+    ) -> Result<Self> {
+        Ok(Self {
+            detector: Detector::load(yolo_model_path)?,
+            embedder: FaceEmbedder::load(face_model_path)?,
+        })
+    }
+
+    pub fn scan_video<P: AsRef<Path>>(
+        &mut self,
+        video_path: P,
+        config: &DiscoveryConfig,
+    ) -> Result<DiscoveryReport> {
+        ffmpeg::init().context("failed to initialize ffmpeg for identity discovery")?;
+
+        let mut ictx = format::input(&video_path).context("failed to open input video")?;
+        let (stream_index, codecpar) = {
+            let stream = ictx
+                .streams()
+                .best(media::Type::Video)
+                .context("no video stream found")?;
+            (stream.index(), stream.parameters())
+        };
+        let mut decoder = ffmpeg::codec::Context::from_parameters(codecpar)
+            .context("failed to create decoder context")?
+            .decoder()
+            .video()
+            .context("failed to open decoder")?;
+
+        let mut to_rgb = scaling::Context::get(
+            decoder.format(),
+            decoder.width(),
+            decoder.height(),
+            ffmpeg::format::Pixel::RGB24,
+            decoder.width(),
+            decoder.height(),
+            scaling::Flags::BILINEAR,
+        )
+        .context("failed to create rgb scaler")?;
+
+        let mut decoded = frame::Video::empty();
+        let mut rgb_frame = frame::Video::empty();
+
+        let mut frame_index = 0u64;
+        let mut sampled_frames = 0u64;
+        let mut clusters: Vec<Cluster> = Vec::new();
+
+        let mut process = |src: &frame::Video| -> Result<bool> {
+            frame_index += 1;
+            if config.sample_stride > 1 && frame_index % config.sample_stride != 0 {
+                return Ok(false);
+            }
+            if sampled_frames as usize >= config.max_sampled_frames {
+                return Ok(true);
+            }
+
+            to_rgb
+                .run(src, &mut rgb_frame)
+                .context("failed to convert frame to rgb")?;
+            let rgb = copy_rgb_frame(&rgb_frame, frame_index);
+            sampled_frames += 1;
+
+            let mut persons = self.detector.detect(&rgb).unwrap_or_default();
+            persons.sort_unstable_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(Ordering::Equal)
+            });
+            persons.truncate(config.max_faces_per_frame.max(1));
+
+            for bbox in persons {
+                let Some(embedding) = self.embedder.embed_from_bbox(&rgb, bbox)? else {
+                    continue;
+                };
+                let (anchor_x, anchor_y) = (bbox.center_x(), bbox.center_y());
+                let thumb = thumbnail_from_bbox(&rgb, bbox)?;
+                update_clusters(
+                    &mut clusters,
+                    ClusterObservation {
+                        frame_index,
+                        bbox,
+                        anchor_x,
+                        anchor_y,
+                        embedding,
+                        thumbnail: thumb,
+                    },
+                    config.cluster_similarity,
+                );
+            }
+            Ok(sampled_frames as usize >= config.max_sampled_frames)
+        };
+
+        let mut limit_reached = false;
+        for (stream, packet) in ictx.packets() {
+            if stream.index() != stream_index {
+                continue;
+            }
+            decoder
+                .send_packet(&packet)
+                .context("failed to send packet to decoder")?;
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                if process(&decoded)? {
+                    limit_reached = true;
+                    break;
+                }
+            }
+            if limit_reached {
+                break;
+            }
+        }
+
+        if !limit_reached {
+            decoder.send_eof().ok();
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                if process(&decoded)? {
+                    break;
+                }
+            }
+        }
+
+        let mut duplicates = Vec::new();
+        for i in 0..clusters.len() {
+            for j in (i + 1)..clusters.len() {
+                let sim = embedding_cosine_similarity(&clusters[i].centroid, &clusters[j].centroid);
+                if sim >= config.duplicate_similarity {
+                    duplicates.push(DuplicatePair {
+                        a: i,
+                        b: j,
+                        similarity: sim,
+                    });
+                }
+            }
+        }
+
+        let mut candidates: Vec<IdentityCandidate> = clusters
+            .into_iter()
+            .enumerate()
+            .filter_map(|(id, cluster)| cluster.into_candidate(id))
+            .collect();
+
+        candidates.sort_unstable_by(|a, b| {
+            b.observations.cmp(&a.observations).then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(Ordering::Equal)
+            })
+        });
+
+        Ok(DiscoveryReport {
+            sampled_frames,
+            total_decoded_frames: frame_index,
+            candidates,
+            duplicates,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ClusterObservation {
+    frame_index: u64,
+    bbox: BBox,
+    anchor_x: f32,
+    anchor_y: f32,
+    embedding: Vec<f32>,
+    thumbnail: Vec<u8>,
+}
+
+struct Cluster {
+    centroid: Vec<f32>,
+    confidence_sum: f32,
+    observations: u32,
+    first_frame: u64,
+    last_frame: u64,
+    anchor_x_acc: f32,
+    anchor_y_acc: f32,
+    thumbnail_score: f32,
+    thumbnail_jpeg: Vec<u8>,
+}
+
+impl Cluster {
+    fn new(obs: &ClusterObservation) -> Self {
+        Self {
+            centroid: obs.embedding.clone(),
+            confidence_sum: obs.bbox.confidence,
+            observations: 1,
+            first_frame: obs.frame_index,
+            last_frame: obs.frame_index,
+            anchor_x_acc: obs.anchor_x,
+            anchor_y_acc: obs.anchor_y,
+            thumbnail_score: obs.bbox.confidence,
+            thumbnail_jpeg: obs.thumbnail.clone(),
+        }
+    }
+
+    fn absorb(&mut self, obs: &ClusterObservation, similarity: f32) {
+        let n = self.observations as f32;
+        for (c, e) in self.centroid.iter_mut().zip(obs.embedding.iter()) {
+            *c = (*c * n + *e) / (n + 1.0);
+        }
+        self.centroid = l2_normalize(&self.centroid);
+        self.confidence_sum += obs.bbox.confidence * similarity.max(0.1);
+        self.observations += 1;
+        self.last_frame = obs.frame_index;
+        self.anchor_x_acc += obs.anchor_x;
+        self.anchor_y_acc += obs.anchor_y;
+
+        let quality = obs.bbox.confidence * (0.5 + 0.5 * similarity.clamp(0.0, 1.0));
+        if quality > self.thumbnail_score {
+            self.thumbnail_score = quality;
+            self.thumbnail_jpeg = obs.thumbnail.clone();
+        }
+    }
+
+    fn into_candidate(self, id: usize) -> Option<IdentityCandidate> {
+        if self.observations == 0 || self.thumbnail_jpeg.is_empty() {
+            return None;
+        }
+        let avg_score = self.confidence_sum / self.observations as f32;
+        let confidence =
+            (0.42 + (self.observations as f32 * 0.06).min(0.4) + avg_score * 0.18).clamp(0.0, 0.99);
+        Some(IdentityCandidate {
+            id,
+            confidence,
+            observations: self.observations,
+            first_frame: self.first_frame,
+            last_frame: self.last_frame,
+            anchor_x: self.anchor_x_acc / self.observations as f32,
+            anchor_y: self.anchor_y_acc / self.observations as f32,
+            thumbnail_jpeg: self.thumbnail_jpeg,
+        })
+    }
+}
+
+fn update_clusters(clusters: &mut Vec<Cluster>, obs: ClusterObservation, similarity_gate: f32) {
+    let mut best_idx = None;
+    let mut best_sim = -1.0f32;
+    for (idx, c) in clusters.iter().enumerate() {
+        let sim = embedding_cosine_similarity(&c.centroid, &obs.embedding);
+        if sim > best_sim {
+            best_sim = sim;
+            best_idx = Some(idx);
+        }
+    }
+
+    if let Some(idx) = best_idx
+        && best_sim >= similarity_gate
+    {
+        clusters[idx].absorb(&obs, best_sim);
+    } else {
+        clusters.push(Cluster::new(&obs));
+    }
+}
+
+fn copy_rgb_frame(frame: &frame::Video, pts: u64) -> RgbFrame {
+    let w = frame.width();
+    let h = frame.height();
+    let stride = frame.stride(0);
+    let data = frame.data(0);
+    let row_len = (w as usize) * 3;
+
+    let mut rgb = vec![0u8; row_len * h as usize];
+    for row in 0..h as usize {
+        let src_start = row * stride;
+        let dst_start = row * row_len;
+        rgb[dst_start..dst_start + row_len].copy_from_slice(&data[src_start..src_start + row_len]);
+    }
+
+    RgbFrame {
+        data: rgb,
+        width: w,
+        height: h,
+        pts: pts as i64,
+    }
+}
+
+fn thumbnail_from_bbox(frame: &RgbFrame, bbox: BBox) -> Result<Vec<u8>> {
+    let x1 = bbox.x1.max(0.0).floor() as u32;
+    let y1 = bbox.y1.max(0.0).floor() as u32;
+    let mut w = bbox.width().max(1.0).round() as u32;
+    let mut h = bbox.height().max(1.0).round() as u32;
+    if x1 >= frame.width || y1 >= frame.height {
+        return Ok(Vec::new());
+    }
+    w = w.min(frame.width.saturating_sub(x1));
+    h = h.min(frame.height.saturating_sub(y1));
+    if w == 0 || h == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut crop = vec![0u8; (w * h * 3) as usize];
+    let src_stride = (frame.width * 3) as usize;
+    let dst_stride = (w * 3) as usize;
+    for row in 0..h as usize {
+        let src_start = (y1 as usize + row) * src_stride + x1 as usize * 3;
+        let dst_start = row * dst_stride;
+        crop[dst_start..dst_start + dst_stride]
+            .copy_from_slice(&frame.data[src_start..src_start + dst_stride]);
+    }
+
+    let image: RgbImage = ImageBuffer::from_raw(w, h, crop).context("invalid thumbnail crop")?;
+    let resized = image::imageops::resize(&image, 132, 198, FilterType::Triangle);
+
+    let mut out = Cursor::new(Vec::new());
+    let mut encoder = JpegEncoder::new_with_quality(&mut out, 88);
+    encoder
+        .encode_image(&image::DynamicImage::ImageRgb8(resized))
+        .context("failed to encode thumbnail")?;
+    Ok(out.into_inner())
+}
+
+fn l2_normalize(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+    v.iter().map(|x| x / norm).collect()
+}

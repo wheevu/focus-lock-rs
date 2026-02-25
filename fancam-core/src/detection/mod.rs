@@ -317,6 +317,49 @@ pub struct FaceIdentifier {
     gallery_samples: usize,
 }
 
+/// ArcFace embedding helper that does not require a reference image.
+///
+/// Used by identity discovery passes to build candidate clusters before the user
+/// chooses which member to track.
+pub struct FaceEmbedder {
+    session: Mutex<Session>,
+}
+
+impl FaceEmbedder {
+    pub fn load<P: AsRef<Path>>(model_path: P) -> Result<Self> {
+        let session = build_ort_session(
+            model_path.as_ref(),
+            "failed to load ArcFace ONNX model for discovery",
+        )?;
+        Ok(Self {
+            session: Mutex::new(session),
+        })
+    }
+
+    pub fn embed_from_bbox(&self, frame: &RgbFrame, bbox: BBox) -> Result<Option<Vec<f32>>> {
+        let tensor_data = match preprocess_face_from_bbox(frame, bbox) {
+            Ok(data) => data,
+            Err(_) => return Ok(None),
+        };
+        let tensor = face_tensor_from_data(tensor_data)?;
+        let embedding = {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ArcFace discovery session lock poisoned"))?;
+            let outputs = session
+                .run(ort::inputs!["input.1" => tensor])
+                .context("ArcFace discovery inference failed")?;
+            l2_normalize(&extract_first_embedding(&outputs)?)
+        };
+        Ok(Some(embedding))
+    }
+}
+
+pub fn embedding_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    cosine_similarity(a, b)
+}
+
 impl FaceIdentifier {
     /// Load an ArcFace ONNX model and embed `reference_image_path` as the
     /// target identity.
