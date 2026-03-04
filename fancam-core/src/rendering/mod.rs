@@ -24,13 +24,16 @@ pub struct FrameRenderer {
     scaled_buf: Vec<u8>,
 }
 
+/// Typical maximum crop dimensions for 4K source to avoid repeated reallocations.
+const TYPICAL_MAX_CROP_BYTES: usize = 1920 * 1080 * 3;
+
 impl FrameRenderer {
     pub fn new() -> Self {
         Self {
             resizer: fr::Resizer::new(),
-            crop_buf: Vec::new(),
+            crop_buf: Vec::with_capacity(TYPICAL_MAX_CROP_BYTES),
             out_buf: vec![0u8; (OUT_WIDTH * OUT_HEIGHT * 3) as usize],
-            scaled_buf: Vec::new(),
+            scaled_buf: Vec::with_capacity(TYPICAL_MAX_CROP_BYTES),
         }
     }
 

@@ -1464,10 +1464,7 @@ pub fn prune_diagnostics_bundles(
         }
     }
     let kept = list.bundles.len().saturating_sub(deleted);
-    Ok(PruneDiagnosticsBundlesResult {
-        deleted,
-        kept,
-    })
+    Ok(PruneDiagnosticsBundlesResult { deleted, kept })
 }
 
 #[tauri::command]
@@ -2764,9 +2761,9 @@ mod tests {
         DeleteDiagnosticsBundleArgs, ListDiagnosticsBundlesArgs, PruneDiagnosticsBundlesArgs,
         QueryIdentityScansArgs, QueryScanEventsArgs, ReadDiagnosticsBundleArgs, ScanSessionStatus,
         VerifyDiagnosticsBundleArgs, can_transition_status, delete_diagnostics_bundle,
-        diagnostics_hash_hex, diagnostics_manifest_path, list_diagnostics_bundles, manifest_sha_for,
-        prune_diagnostics_bundles, query_identity_scans, query_scan_events, read_diagnostics_bundle,
-        verify_diagnostics_bundle,
+        diagnostics_hash_hex, diagnostics_manifest_path, list_diagnostics_bundles,
+        manifest_sha_for, prune_diagnostics_bundles, query_identity_scans, query_scan_events,
+        read_diagnostics_bundle, verify_diagnostics_bundle,
     };
     use crate::storage;
 
@@ -2776,7 +2773,9 @@ mod tests {
     }
 
     fn with_diagnostics_test_dir<T>(f: impl FnOnce(PathBuf) -> T) -> T {
-        let _guard = diagnostics_test_mutex().lock().expect("test mutex poisoned");
+        let _guard = diagnostics_test_mutex()
+            .lock()
+            .expect("test mutex poisoned");
         let mut dir = std::env::temp_dir();
         dir.push(format!("focus-lock-diag-test-{}", super::epoch_ms()));
         let _ = std::fs::create_dir_all(&dir);
@@ -2793,7 +2792,9 @@ mod tests {
     }
 
     fn with_temp_workspace<T>(f: impl FnOnce(PathBuf) -> T) -> T {
-        let _guard = diagnostics_test_mutex().lock().expect("test mutex poisoned");
+        let _guard = diagnostics_test_mutex()
+            .lock()
+            .expect("test mutex poisoned");
         let previous = std::env::current_dir().expect("cwd");
         let mut dir = std::env::temp_dir();
         dir.push(format!("focus-lock-workspace-test-{}", super::epoch_ms()));
@@ -2859,8 +2860,9 @@ mod tests {
             super::upsert_manifest_entry(&path_str, bytes.len() as u64, sha.clone())
                 .expect("upsert manifest");
 
-            let list = list_diagnostics_bundles(Some(ListDiagnosticsBundlesArgs { limit: Some(5) }))
-                .expect("list bundles");
+            let list =
+                list_diagnostics_bundles(Some(ListDiagnosticsBundlesArgs { limit: Some(5) }))
+                    .expect("list bundles");
             assert_eq!(list.bundles.len(), 1);
             assert_eq!(list.bundles[0].path, path_str);
             assert_eq!(list.bundles[0].sha256.as_deref(), Some(sha.as_str()));

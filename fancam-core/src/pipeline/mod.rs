@@ -1,3 +1,28 @@
+//! pipeline — high-level video processing pipeline
+//!
+//! This module provides the main processing pipeline that coordinates detection,
+//! identification, tracking, and rendering into a cohesive video processing flow.
+//!
+//! The pipeline consists of two main components:
+//! - [`Analyzer`]: Runs detection and identification to find the target person
+//! - [`Renderer`]: Crops and renders the output frames
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use fancam_core::pipeline::Pipeline;
+//!
+//! let pipeline = Pipeline::load(
+//!     "yolov8n.onnx",
+//!     "arcface.onnx",
+//!     "reference_face.jpg",
+//!     0.6, // similarity threshold
+//! ).expect("Failed to load pipeline");
+//!
+//! let (mut analyzer, mut renderer) = pipeline.into_parts();
+//! // Use analyzer and renderer in your processing loop...
+//! ```
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -8,6 +33,12 @@ use crate::rendering::FrameRenderer;
 use crate::tracking::{BiasTracker, CameraState};
 use crate::video::RgbFrame;
 
+/// Analyzes video frames to detect and identify the target person.
+///
+/// The analyzer runs YOLO detection and ArcFace identification on each frame,
+/// then feeds the results to the tracker for smooth camera movement.
+///
+/// Profiling metrics are logged every 300 frames to help diagnose performance.
 pub struct Analyzer {
     detector: Detector,
     identifier: FaceIdentifier,
@@ -18,6 +49,7 @@ pub struct Analyzer {
 }
 
 impl Analyzer {
+    /// Creates a new analyzer with the given detector, identifier, and tracker.
     pub fn new(detector: Detector, identifier: FaceIdentifier, tracker: BiasTracker) -> Self {
         Self {
             detector,
@@ -29,6 +61,12 @@ impl Analyzer {
         }
     }
 
+    /// Analyzes a single frame and returns the camera state if the target is found.
+    ///
+    /// This method runs detection and identification (throttled based on tracker state),
+    /// updates the tracker with the results, and returns the smoothed camera position.
+    ///
+    /// Profiling metrics are logged every 300 frames.
     pub fn analyze(&mut self, frame: &RgbFrame) -> Option<CameraState> {
         let detection = if self.tracker.should_run_recognition() {
             let detect_start = Instant::now();
@@ -66,7 +104,7 @@ impl Analyzer {
         let camera = self.tracker.update(detection.map(|m| m.bbox));
 
         self.prof_frames += 1;
-        if self.prof_frames > 0 && self.prof_frames % 300 == 0 {
+        if self.prof_frames.is_multiple_of(300) {
             tracing::info!(
                 frames = self.prof_frames,
                 detect_ms_per_frame = format!(
@@ -85,6 +123,13 @@ impl Analyzer {
     }
 }
 
+/// Renders output frames by cropping and scaling to the target resolution.
+///
+/// The renderer applies the camera state from the tracker to produce the final
+/// 9:16 vertical output. When the target is lost, it renders a letterboxed
+/// passthrough instead.
+///
+/// Profiling metrics are logged every 300 frames.
 pub struct Renderer {
     renderer: FrameRenderer,
     prof_frames: u64,
@@ -92,6 +137,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Creates a new renderer wrapping the given frame renderer.
     pub fn new(renderer: FrameRenderer) -> Self {
         Self {
             renderer,
@@ -100,6 +146,15 @@ impl Renderer {
         }
     }
 
+    /// Renders a frame based on the camera state.
+    ///
+    /// If `camera` is `Some`, crops to the target position. If `None`, renders
+    /// a letterboxed passthrough.
+    ///
+    /// # Arguments
+    ///
+    /// * `frame` - The input frame to modify in-place
+    /// * `camera` - The camera state from the tracker, or `None` if target lost
     pub fn render(&mut self, frame: &mut RgbFrame, camera: Option<CameraState>) {
         let render_start = Instant::now();
         let result = match camera {
@@ -113,7 +168,7 @@ impl Renderer {
             tracing::warn!("render error: {e}");
         }
 
-        if self.prof_frames > 0 && self.prof_frames % 300 == 0 {
+        if self.prof_frames.is_multiple_of(300) {
             tracing::info!(
                 frames = self.prof_frames,
                 render_ms_per_frame = format!(
@@ -126,12 +181,32 @@ impl Renderer {
     }
 }
 
+/// Complete processing pipeline combining analysis and rendering.
+///
+/// The pipeline loads the ML models and reference image, then provides
+/// an [`Analyzer`] and [`Renderer`] that work together to process video frames.
+///
+/// Use [`Pipeline::load`] or [`Pipeline::load_with_hint`] to create a pipeline,
+/// then call [`into_parts`](Self::into_parts) to get the analyzer and renderer.
 pub struct Pipeline {
     analyzer: Analyzer,
     renderer: Renderer,
 }
 
 impl Pipeline {
+    /// Loads the pipeline with the given model paths and reference image.
+    ///
+    /// # Arguments
+    ///
+    /// * `yolo_model_path` - Path to the YOLOv8 ONNX model for person detection
+    /// * `face_model_path` - Path to the ArcFace ONNX model for face identification
+    /// * `reference_image_path` - Path to the reference face image of the target person
+    /// * `similarity_threshold` - Cosine similarity threshold (0.0-1.0) for matching
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the models cannot be loaded or the reference image
+    /// cannot be processed.
     pub fn load<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
         yolo_model_path: P,
         face_model_path: Q,

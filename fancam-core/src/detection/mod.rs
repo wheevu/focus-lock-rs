@@ -509,6 +509,8 @@ fn preprocess_face(img: &RgbImage) -> Result<ort::value::DynValue> {
 thread_local! {
     static FACE_RESIZER: RefCell<fr::Resizer> = RefCell::new(fr::Resizer::new());
     static FACE_RESIZE_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; (FACE_SIZE * FACE_SIZE * 3) as usize]);
+    /// Thread-local crop buffer to avoid per-frame allocations.
+    /// Initialized with capacity for a typical face crop (200x200 RGB).
     static FACE_CROP_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -564,9 +566,12 @@ fn preprocess_face_from_bbox(frame: &RgbFrame, bbox: BBox) -> Result<Vec<f32>> {
 
     FACE_CROP_BUF.with(|crop_cell| {
         let mut crop_buf = crop_cell.borrow_mut();
-        if crop_buf.len() != crop_len {
-            crop_buf.resize(crop_len, 0);
+        // Ensure capacity and resize to avoid repeated allocations
+        let current_cap = crop_buf.capacity();
+        if current_cap < crop_len {
+            crop_buf.reserve(crop_len - current_cap);
         }
+        crop_buf.resize(crop_len, 0);
 
         for row in 0..face_h as usize {
             let src_start = (face_y1 as usize + row) * src_stride + face_x1 as usize * 3;

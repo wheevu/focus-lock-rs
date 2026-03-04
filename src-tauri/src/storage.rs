@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 pub const SCHEMA_VERSION: i64 = 3;
 
@@ -76,15 +76,25 @@ pub struct StorageMaintenanceResult {
     pub vacuum_ran: bool,
 }
 
+/// Returns the path to the SQLite database for scan sessions.
+/// Uses `.focus-lock/scan_sessions.db` in the current working directory.
 pub fn scan_store_db_path() -> PathBuf {
-    let mut base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut base = std::env::current_dir().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "Failed to get current dir, using fallback");
+        PathBuf::from(".")
+    });
     base.push(".focus-lock");
     base.push("scan_sessions.db");
     base
 }
 
+/// Returns the path to the legacy JSON storage file.
+/// Uses `.focus-lock/scan_sessions.json` in the current working directory.
 pub fn scan_store_json_path() -> PathBuf {
-    let mut base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut base = std::env::current_dir().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "Failed to get current dir, using fallback");
+        PathBuf::from(".")
+    });
     base.push(".focus-lock");
     base.push("scan_sessions.json");
     base

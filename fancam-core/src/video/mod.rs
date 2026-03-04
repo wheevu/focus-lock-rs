@@ -381,7 +381,8 @@ where
     let mut enc_state: Option<EncoderState> = None;
     let mut header_written = false;
     // Audio packets arriving before the header is written are buffered here.
-    let mut audio_buffer: Vec<AudioPacket> = Vec::new();
+    // Pre-allocate with reasonable capacity to avoid reallocations.
+    let mut audio_buffer: Vec<AudioPacket> = Vec::with_capacity(64);
     let mut frame_count = 0u64;
     // Wall-clock start for throughput / ETA logging.
     let encode_start = Instant::now();
@@ -548,7 +549,7 @@ where
 
         // Log the very first frame so the user knows encoding has started,
         // then every 100 frames with throughput and ETA.
-        let should_log = frame_count == 1 || frame_count % 100 == 0;
+        let should_log = frame_count == 1 || frame_count.is_multiple_of(100);
         if should_log {
             let elapsed = encode_start.elapsed().as_secs_f64();
             let fps = if elapsed > 0.0 {

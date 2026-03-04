@@ -75,7 +75,7 @@ impl Kalman2D {
             return;
         };
         let k: Matrix4x2<f32> = self.p * self.h.transpose() * s_inv;
-        self.x = self.x + k * y;
+        self.x += k * y;
         self.p = (Matrix4::identity() - k * self.h) * self.p;
     }
 
@@ -160,7 +160,7 @@ impl BiasTracker {
         } else {
             DEFAULT_RECOGNITION_STRIDE
         };
-        self.frame_index % stride == 0
+        self.frame_index.is_multiple_of(stride)
     }
 
     /// Provide the latest identity similarity so cadence can adapt dynamically.
