@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use fancam_core::{
     discovery::{DiscoveryConfig, DiscoveryEngine},
     pipeline::Pipeline,
-    runtime::configure_ort_dylib,
+    runtime::OrtConfig,
     video::{total_frames, transcode_with_progress_staged},
 };
 use image::ImageReader;
@@ -845,7 +845,8 @@ fn extract_video_frame(path: &str) -> Result<image::RgbImage, String> {
 }
 
 fn run_identity_scan(args: IdentityScanArgs) -> Result<IdentityScanResult, String> {
-    configure_ort_dylib();
+    // Configure ORT - ignore errors, will fail later if truly unavailable
+    let _ = OrtConfig::discover();
 
     let mut engine = DiscoveryEngine::load(&args.yolo_model, &args.face_model)
         .map_err(|e| format!("failed to initialize discovery engine: {e}"))?;
@@ -2686,7 +2687,8 @@ fn run_pipeline(
     let total = total_frames(&video_path);
     let threshold = args.threshold.clamp(0.0, 1.0);
 
-    configure_ort_dylib();
+    // Configure ORT - ignore errors, will fail later if truly unavailable
+    let _ = OrtConfig::discover();
 
     let initial_hint = match (args.target_anchor_x, args.target_anchor_y) {
         (Some(x), Some(y)) => Some((x.max(0.0), y.max(0.0))),

@@ -1,3 +1,15 @@
+//! CLI for focus-lock-rs
+//!
+//! Command-line interface for the high-performance automated fancam generator.
+
+#![warn(
+    clippy::all,
+    clippy::pedantic,
+    missing_docs,
+    rust_2018_idioms,
+    unused_qualifications
+)]
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -8,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 use fancam_core::{
     detection::{Detector, draw_boxes},
     pipeline::Pipeline,
-    runtime::configure_ort_dylib,
+    runtime::OrtConfig,
     video::{RgbFrame, to_grayscale, transcode, transcode_with_progress_staged},
 };
 
@@ -92,7 +104,8 @@ fn main() -> Result<()> {
         )
         .init();
 
-    configure_ort_dylib();
+    // Configure ORT - ignore errors, will fail later if truly unavailable
+    let _ = OrtConfig::discover();
 
     let cli = Cli::parse();
 
@@ -149,7 +162,9 @@ fn cmd_detect(input: PathBuf, model: PathBuf, output: PathBuf) -> Result<()> {
         pb2.tick();
         match detector.detect(frame) {
             Ok(boxes) => {
-                draw_boxes(frame, &boxes, [0, 255, 0]);
+                if let Err(e) = draw_boxes(frame, &boxes, [0, 255, 0]) {
+                    tracing::warn!("draw boxes error: {e}");
+                }
             }
             Err(e) => tracing::warn!("detection error: {e}"),
         }

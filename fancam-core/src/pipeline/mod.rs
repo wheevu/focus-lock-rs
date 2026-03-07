@@ -39,6 +39,7 @@ use crate::video::RgbFrame;
 /// then feeds the results to the tracker for smooth camera movement.
 ///
 /// Profiling metrics are logged every 300 frames to help diagnose performance.
+#[derive(Debug)]
 pub struct Analyzer {
     detector: Detector,
     identifier: FaceIdentifier,
@@ -130,6 +131,7 @@ impl Analyzer {
 /// passthrough instead.
 ///
 /// Profiling metrics are logged every 300 frames.
+#[derive(Debug)]
 pub struct Renderer {
     renderer: FrameRenderer,
     prof_frames: u64,
@@ -188,6 +190,7 @@ impl Renderer {
 ///
 /// Use [`Pipeline::load`] or [`Pipeline::load_with_hint`] to create a pipeline,
 /// then call [`into_parts`](Self::into_parts) to get the analyzer and renderer.
+#[derive(Debug)]
 pub struct Pipeline {
     analyzer: Analyzer,
     renderer: Renderer,
@@ -222,6 +225,22 @@ impl Pipeline {
         )
     }
 
+    /// Loads the pipeline with an optional initial search hint.
+    ///
+    /// The search hint provides a starting position (x, y) for the tracker
+    /// before the first detection, which can improve initial lock-on speed.
+    ///
+    /// # Arguments
+    ///
+    /// * `yolo_model_path` - Path to the YOLOv8 ONNX model
+    /// * `face_model_path` - Path to the ArcFace ONNX model
+    /// * `reference_image_path` - Path to the reference face image
+    /// * `similarity_threshold` - Cosine similarity threshold (0.0-1.0)
+    /// * `initial_search_hint` - Optional (x, y) starting position hint
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if models cannot be loaded.
     pub fn load_with_hint<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
         yolo_model_path: P,
         face_model_path: Q,
@@ -244,6 +263,11 @@ impl Pipeline {
         })
     }
 
+    /// Consumes the pipeline and returns its analyzer and renderer components.
+    ///
+    /// This allows direct access to the components for advanced use cases
+    /// where the standard pipeline flow needs to be customized.
+    #[must_use]
     pub fn into_parts(self) -> (Analyzer, Renderer) {
         (self.analyzer, self.renderer)
     }

@@ -27,6 +27,7 @@ const MAX_LOST_FRAMES: u32 = 90;
 // ── Kalman filter ─────────────────────────────────────────────────────────────
 
 /// A minimal 2D constant-velocity Kalman filter.
+#[derive(Debug)]
 struct Kalman2D {
     /// State: [cx, cy, vx, vy]
     x: Vector4<f32>,
@@ -94,7 +95,9 @@ impl Kalman2D {
 /// half the side length of the (square before aspect conversion) window.
 #[derive(Debug, Clone, Copy)]
 pub struct CameraState {
+    /// Center X coordinate of the crop window.
     pub cx: f32,
+    /// Center Y coordinate of the crop window.
     pub cy: f32,
     /// Smoothed half-size of the bounding box (used to set crop zoom).
     pub half_size: f32,
@@ -104,6 +107,7 @@ pub struct CameraState {
 
 /// High-level tracker: wraps the Kalman filter and manages the occlusion /
 /// re-ID state machine.
+#[derive(Debug)]
 pub struct BiasTracker {
     kalman: Option<Kalman2D>,
     /// Smoothed half-size (exponential moving average).
@@ -130,10 +134,17 @@ const MIN_RECOGNITION_STRIDE: u64 = 2;
 const PRE_LOCK_STRIDE: u64 = 3;
 
 impl BiasTracker {
+    /// Create a new tracker with default settings.
+    #[must_use]
     pub fn new() -> Self {
         Self::new_with_hint(None)
     }
 
+    /// Create a new tracker with an optional bootstrap hint.
+    ///
+    /// The bootstrap hint provides an initial search position (x, y)
+    /// to bias detection before the first successful lock.
+    #[must_use]
     pub fn new_with_hint(bootstrap_hint: Option<(f32, f32)>) -> Self {
         Self {
             kalman: None,

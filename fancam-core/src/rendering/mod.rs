@@ -9,14 +9,16 @@ use fast_image_resize as fr;
 
 use crate::{tracking::CameraState, video::RgbFrame};
 
-/// Output fancam resolution.
+/// Output fancam width in pixels.
 pub const OUT_WIDTH: u32 = 1080;
+/// Output fancam height in pixels.
 pub const OUT_HEIGHT: u32 = 1920;
 
 /// If the subject occupies less than this fraction of frame height, upscale.
 const UPSCALE_THRESHOLD: f32 = 0.25;
 
 /// Reusable rendering context to avoid per-frame allocations.
+#[derive(Debug)]
 pub struct FrameRenderer {
     resizer: fr::Resizer,
     crop_buf: Vec<u8>,
@@ -28,6 +30,8 @@ pub struct FrameRenderer {
 const TYPICAL_MAX_CROP_BYTES: usize = 1920 * 1080 * 3;
 
 impl FrameRenderer {
+    /// Create a new frame renderer with pre-allocated buffers.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             resizer: fr::Resizer::new(),

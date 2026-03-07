@@ -6,7 +6,6 @@
 //! Phase 3: load arcface.onnx, embed a reference face, filter detections by
 //!          cosine similarity.
 
-use anyhow::{Context, Result};
 use fast_image_resize as fr;
 use image::{ImageBuffer, Rgb, RgbImage};
 use imageproc::rect::Rect;
@@ -20,6 +19,7 @@ use std::sync::Mutex;
 use tracing::debug;
 
 use crate::video::RgbFrame;
+use crate::{PoisonExt, Result};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -57,27 +57,41 @@ const GALLERY_UPDATE_MARGIN: f32 = 0.08;
 /// Axis-aligned bounding box in pixel coordinates of the original frame.
 #[derive(Debug, Clone, Copy)]
 pub struct BBox {
+    /// Left edge X coordinate (inclusive).
     pub x1: f32,
+    /// Top edge Y coordinate (inclusive).
     pub y1: f32,
+    /// Right edge X coordinate (exclusive).
     pub x2: f32,
+    /// Bottom edge Y coordinate (exclusive).
     pub y2: f32,
+    /// Detection confidence score (0.0-1.0).
     pub confidence: f32,
 }
 
 impl BBox {
+    /// Returns the width of the bounding box.
+    #[must_use]
     pub fn width(&self) -> f32 {
         self.x2 - self.x1
     }
+    /// Returns the height of the bounding box.
+    #[must_use]
     pub fn height(&self) -> f32 {
         self.y2 - self.y1
     }
+    /// Returns the center X coordinate.
+    #[must_use]
     pub fn center_x(&self) -> f32 {
         (self.x1 + self.x2) / 2.0
     }
+    /// Returns the center Y coordinate.
+    #[must_use]
     pub fn center_y(&self) -> f32 {
         (self.y1 + self.y2) / 2.0
     }
     /// IoU (intersection over union) with another box.
+    #[must_use]
     pub fn iou(&self, other: &BBox) -> f32 {
         let ix1 = self.x1.max(other.x1);
         let iy1 = self.y1.max(other.y1);
@@ -95,6 +109,7 @@ impl BBox {
 // ── Detector ─────────────────────────────────────────────────────────────────
 
 /// Wraps the YOLOv8-Nano ONNX session.
+#[derive(Debug)]
 pub struct Detector {
     session: Session,
     yolo_resizer: fr::Resizer,
@@ -103,16 +118,25 @@ pub struct Detector {
     downscale_buf: Vec<u8>,
 }
 
+/// A matched identity with bounding box and similarity score.
 #[derive(Debug, Clone, Copy)]
 pub struct IdentityMatch {
+    /// The bounding box of the matched identity.
     pub bbox: BBox,
+    /// The cosine similarity score (0.0-1.0).
     pub similarity: f32,
 }
 
 impl Detector {
     /// Load a YOLOv8n ONNX model from `model_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model file cannot be loaded or the ORT session
+    /// cannot be created.
     pub fn load<P: AsRef<Path>>(model_path: P) -> Result<Self> {
-        let session = build_ort_session(model_path.as_ref(), "failed to load YOLOv8 ONNX model")?;
+        let session = build_ort_session(model_path.as_ref())
+            .map_err(|e| crate::FancamError::model_load(model_path.as_ref(), e))?;
         Ok(Self {
             session,
             yolo_resizer: fr::Resizer::new(),
@@ -124,6 +148,10 @@ impl Detector {
 
     /// Run inference on `frame` and return bounding boxes (in original frame
     /// pixel coordinates) for all persons after NMS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if inference fails or frame preprocessing fails.
     pub fn detect(&mut self, frame: &RgbFrame) -> Result<Vec<BBox>> {
         let max_dim = frame.width.max(frame.height);
         if max_dim > DETECTION_MAX_DIM {
@@ -153,38 +181,40 @@ impl Detector {
         let outputs = self
             .session
             .run(ort::inputs!["images" => input_tensor])
-            .context("YOLOv8 inference failed")?;
+            .map_err(|e| crate::FancamError::inference(format!("YOLOv8 inference failed: {e}")))?;
 
         // YOLOv8 output: [1, 84, 8400]  (84 = 4 box coords + 80 class scores)
         let (_shape, data) = outputs["output0"]
             .try_extract_tensor::<f32>()
-            .context("failed to extract YOLOv8 output tensor")?;
+            .map_err(|e| crate::FancamError::inference(format!(
+                "Failed to extract YOLOv8 output tensor: {e}"
+            )))?;
 
         // shape = [1, 84, 8400]
         // num_proposals = 8400, num_classes = 80
-        let num_proposals = 8400usize;
-        let num_classes = 80usize;
+        const NUM_PROPOSALS: usize = 8400;
+        const NUM_CLASSES: usize = 80;
 
         let scale_x = frame.width as f32 / YOLO_SIZE as f32;
         let scale_y = frame.height as f32 / YOLO_SIZE as f32;
 
-        let candidates: Vec<BBox> = (0..num_proposals)
+        let candidates: Vec<BBox> = (0..NUM_PROPOSALS)
             .into_par_iter()
             .filter_map(|i| {
                 // Data layout: [cx, cy, w, h, cls0_score, cls1_score, ...]
                 // Stored column-major across the 84 rows.
                 let cx = data[i];
-                let cy = data[num_proposals + i];
-                let w = data[2 * num_proposals + i];
-                let h = data[3 * num_proposals + i];
+                let cy = data[NUM_PROPOSALS + i];
+                let w = data[2 * NUM_PROPOSALS + i];
+                let h = data[3 * NUM_PROPOSALS + i];
 
                 // Person score (class 0)
-                let person_score = data[(4 + PERSON_CLASS) * num_proposals + i];
+                let person_score = data[(4 + PERSON_CLASS) * NUM_PROPOSALS + i];
 
                 // Best class score across all 80 classes
                 let mut max_score = 0f32;
-                for c in 0..num_classes {
-                    let s = data[(4 + c) * num_proposals + i];
+                for c in 0..NUM_CLASSES {
+                    let s = data[(4 + c) * NUM_PROPOSALS + i];
                     if s > max_score {
                         max_score = s;
                     }
@@ -215,9 +245,17 @@ impl Detector {
 
     fn preprocess_yolo(&mut self, frame: &RgbFrame) -> Result<ort::value::DynValue> {
         // Use fast_image_resize with NEON SIMD for the large 4K → 640x640 downscale.
-        let src =
-            fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
-                .context("failed to create fast_image_resize source")?;
+        let src = fr::images::ImageRef::new(
+            frame.width,
+            frame.height,
+            &frame.data,
+            fr::PixelType::U8x3,
+        )
+        .map_err(|e| {
+            crate::FancamError::image_processing(format!(
+                "Failed to create fast_image_resize source: {e}"
+            ))
+        })?;
 
         let mut dst = fr::images::Image::from_vec_u8(
             YOLO_SIZE,
@@ -225,13 +263,21 @@ impl Detector {
             std::mem::take(&mut self.yolo_resize_buf),
             fr::PixelType::U8x3,
         )
-        .context("failed to create fast_image_resize destination")?;
+        .map_err(|e| {
+            crate::FancamError::image_processing(format!(
+                "Failed to create fast_image_resize destination: {e}"
+            ))
+        })?;
 
         let options = fr::ResizeOptions::new()
             .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
         self.yolo_resizer
             .resize(&src, &mut dst, Some(&options))
-            .context("fast_image_resize YOLO downscale failed")?;
+            .map_err(|e| {
+                crate::FancamError::image_processing(format!(
+                    "fast_image_resize YOLO downscale failed: {e}"
+                ))
+            })?;
 
         self.yolo_resize_buf = dst.into_vec();
         let raw = &self.yolo_resize_buf;
@@ -268,15 +314,25 @@ impl Detector {
         );
 
         let shape = [1usize, 3, YOLO_SIZE as usize, YOLO_SIZE as usize];
-        Ok(Tensor::from_array((shape, tensor_data.into_boxed_slice()))
-            .context("failed to create YOLO input tensor")?
-            .into_dyn())
+        Tensor::from_array((shape, tensor_data.into_boxed_slice()))
+            .map(|t| t.into_dyn())
+            .map_err(|e| {
+                crate::FancamError::inference(format!("Failed to create YOLO input tensor: {e}"))
+            })
     }
 
     fn downscale_frame(&mut self, frame: &RgbFrame, out_w: u32, out_h: u32) -> Result<RgbFrame> {
-        let src =
-            fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
-                .context("failed to create detection downscale source")?;
+        let src = fr::images::ImageRef::new(
+            frame.width,
+            frame.height,
+            &frame.data,
+            fr::PixelType::U8x3,
+        )
+        .map_err(|e| {
+            crate::FancamError::image_processing(format!(
+                "Failed to create detection downscale source: {e}"
+            ))
+        })?;
 
         let out_len = (out_w * out_h * 3) as usize;
         if self.downscale_buf.len() != out_len {
@@ -289,13 +345,21 @@ impl Detector {
             std::mem::take(&mut self.downscale_buf),
             fr::PixelType::U8x3,
         )
-        .context("failed to create detection downscale destination")?;
+        .map_err(|e| {
+            crate::FancamError::image_processing(format!(
+                "Failed to create detection downscale destination: {e}"
+            ))
+        })?;
 
         let options = fr::ResizeOptions::new()
             .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
         self.downscale_resizer
             .resize(&src, &mut dst, Some(&options))
-            .context("failed to downscale frame for detection")?;
+            .map_err(|e| {
+                crate::FancamError::image_processing(format!(
+                    "Failed to downscale frame for detection: {e}"
+                ))
+            })?;
 
         let scaled_data = dst.into_vec();
         Ok(RgbFrame {
@@ -310,6 +374,7 @@ impl Detector {
 // ── Face identifier ──────────────────────────────────────────────────────────
 
 /// Wraps the ArcFace ONNX session and the reference embedding.
+#[derive(Debug)]
 pub struct FaceIdentifier {
     sessions: Vec<Mutex<Session>>,
     reference_embedding: Vec<f32>,
@@ -321,21 +386,30 @@ pub struct FaceIdentifier {
 ///
 /// Used by identity discovery passes to build candidate clusters before the user
 /// chooses which member to track.
+#[derive(Debug)]
 pub struct FaceEmbedder {
     session: Mutex<Session>,
 }
 
 impl FaceEmbedder {
+    /// Load an ArcFace model for embedding extraction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model cannot be loaded.
     pub fn load<P: AsRef<Path>>(model_path: P) -> Result<Self> {
-        let session = build_ort_session(
-            model_path.as_ref(),
-            "failed to load ArcFace ONNX model for discovery",
-        )?;
+        let session = build_ort_session(model_path.as_ref())
+            .map_err(|e| crate::FancamError::model_load(model_path.as_ref(), e))?;
         Ok(Self {
             session: Mutex::new(session),
         })
     }
 
+    /// Extract a face embedding from a bounding box.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the face cannot be preprocessed or inference fails.
     pub fn embed_from_bbox(&self, frame: &RgbFrame, bbox: BBox) -> Result<Option<Vec<f32>>> {
         let tensor_data = match preprocess_face_from_bbox(frame, bbox) {
             Ok(data) => data,
@@ -346,16 +420,20 @@ impl FaceEmbedder {
             let mut session = self
                 .session
                 .lock()
-                .map_err(|_| anyhow::anyhow!("ArcFace discovery session lock poisoned"))?;
+                .to_fancam_err("ArcFace discovery session lock poisoned")?;
             let outputs = session
                 .run(ort::inputs!["input.1" => tensor])
-                .context("ArcFace discovery inference failed")?;
+                .map_err(|e| crate::FancamError::inference(format!(
+                    "ArcFace discovery inference failed: {e}"
+                )))?;
             l2_normalize(&extract_first_embedding(&outputs)?)
         };
         Ok(Some(embedding))
     }
 }
 
+/// Compute cosine similarity between two embeddings.
+#[must_use]
 pub fn embedding_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     cosine_similarity(a, b)
 }
@@ -363,6 +441,10 @@ pub fn embedding_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 impl FaceIdentifier {
     /// Load an ArcFace ONNX model and embed `reference_image_path` as the
     /// target identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if models cannot be loaded or reference image cannot be processed.
     pub fn load<P: AsRef<Path>, Q: AsRef<Path>>(
         model_path: P,
         reference_image_path: Q,
@@ -372,25 +454,30 @@ impl FaceIdentifier {
         let session_count = MAX_FACE_CANDIDATES;
         let mut sessions = Vec::with_capacity(session_count);
         for _ in 0..session_count {
-            let session = build_ort_session(&model_path, "failed to load ArcFace ONNX model")?;
+            let session = build_ort_session(&model_path)
+                .map_err(|e| crate::FancamError::model_load(&model_path, e))?;
             sessions.push(Mutex::new(session));
         }
 
         // Load and embed the reference image (assumed to be a face crop)
-        let ref_img = image::open(reference_image_path)
-            .context("failed to open reference image")?
+        let ref_img = image::open(&reference_image_path)
+            .map_err(|e| crate::FancamError::image_processing(format!(
+                "Failed to open reference image: {e}"
+            )))?
             .into_rgb8();
 
         let tensor = preprocess_face(&ref_img)?;
         let reference_embedding = {
             let mut session = sessions
                 .first()
-                .context("ArcFace session pool is empty")?
+                .ok_or_else(|| crate::FancamError::invalid_config("ArcFace session pool is empty"))?
                 .lock()
-                .map_err(|_| anyhow::anyhow!("ArcFace session lock poisoned"))?;
+                .to_fancam_err("ArcFace session lock poisoned")?;
             let outputs = session
                 .run(ort::inputs!["input.1" => tensor])
-                .context("ArcFace reference inference failed")?;
+                .map_err(|e| crate::FancamError::inference(format!(
+                    "ArcFace reference inference failed: {e}"
+                )))?;
             let embedding = extract_first_embedding(&outputs)?;
             l2_normalize(&embedding)
         };
@@ -414,6 +501,10 @@ impl FaceIdentifier {
     ///
     /// To limit per-frame latency in crowded scenes, only the top
     /// `MAX_FACE_CANDIDATES` persons (by detection confidence) are evaluated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if face processing or inference fails.
     pub fn identify(
         &mut self,
         frame: &RgbFrame,
@@ -519,8 +610,11 @@ fn preprocess_face_data(img: &RgbImage) -> Result<Vec<f32>> {
 }
 
 fn preprocess_face_data_from_raw(width: u32, height: u32, raw_rgb: &[u8]) -> Result<Vec<f32>> {
-    let src = fr::images::ImageRef::new(width, height, raw_rgb, fr::PixelType::U8x3)
-        .context("failed to create face resize source")?;
+    let src = fr::images::ImageRef::new(width, height, raw_rgb, fr::PixelType::U8x3).map_err(|e| {
+        crate::FancamError::image_processing(format!(
+            "Failed to create face resize source: {e}"
+        ))
+    })?;
 
     // NCHW float tensor: [1, 3, 112, 112].
     // Use flat indexed access over raw bytes — avoids per-pixel Pixel overhead.
@@ -536,14 +630,22 @@ fn preprocess_face_data_from_raw(width: u32, height: u32, raw_rgb: &[u8]) -> Res
                 std::mem::take(&mut *resize_buf),
                 fr::PixelType::U8x3,
             )
-            .context("failed to create face resize destination")?;
+            .map_err(|e| {
+                crate::FancamError::image_processing(format!(
+                    "Failed to create face resize destination: {e}"
+                ))
+            })?;
 
             let options = fr::ResizeOptions::new()
                 .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
             resizer_cell
                 .borrow_mut()
                 .resize(&src, &mut dst, Some(&options))
-                .context("fast_image_resize face resize failed")?;
+                .map_err(|e| {
+                    crate::FancamError::image_processing(format!(
+                        "fast_image_resize face resize failed: {e}"
+                    ))
+                })?;
 
             *resize_buf = dst.into_vec();
             for idx in 0..size {
@@ -586,28 +688,22 @@ fn preprocess_face_from_bbox(frame: &RgbFrame, bbox: BBox) -> Result<Vec<f32>> {
 
 fn face_tensor_from_data(tensor_data: Vec<f32>) -> Result<ort::value::DynValue> {
     let shape = [1usize, 3, FACE_SIZE as usize, FACE_SIZE as usize];
-    Ok(Tensor::from_array((shape, tensor_data.into_boxed_slice()))
-        .context("failed to create face input tensor")?
-        .into_dyn())
+    Tensor::from_array((shape, tensor_data.into_boxed_slice()))
+        .map(|t| t.into_dyn())
+        .map_err(|e| {
+            crate::FancamError::inference(format!("Failed to create face input tensor: {e}"))
+        })
 }
 
-fn build_ort_session(model_path: &Path, load_error: &'static str) -> Result<Session> {
-    let mut builder = Session::builder().context("failed to create ORT session builder")?;
-    builder = builder
-        .with_intra_threads(1)
-        .context("failed to set ORT intra threads")?;
-    builder = builder
-        .with_inter_threads(1)
-        .context("failed to set ORT inter threads")?;
-    builder = builder
-        .with_parallel_execution(false)
-        .context("failed to set ORT parallel execution")?;
-    builder = builder
-        .with_execution_providers([ep::CoreMLExecutionProvider::default()
-            .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
-            .build()])
-        .context("failed to register execution providers")?;
-    builder.commit_from_file(model_path).context(load_error)
+fn build_ort_session(model_path: &Path) -> std::result::Result<Session, ort::Error> {
+    let mut builder = Session::builder()?;
+    builder = builder.with_intra_threads(1)?;
+    builder = builder.with_inter_threads(1)?;
+    builder = builder.with_parallel_execution(false)?;
+    builder = builder.with_execution_providers([ep::CoreMLExecutionProvider::default()
+        .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
+        .build()])?;
+    builder.commit_from_file(model_path)
 }
 
 /// Extract the first output tensor's data as a flat `Vec<f32>`.
@@ -616,12 +712,14 @@ fn extract_first_embedding(outputs: &ort::session::SessionOutputs<'_>) -> Result
     let first_value = outputs
         .iter()
         .next()
-        .context("ArcFace produced no outputs")?
+        .ok_or_else(|| crate::FancamError::inference("ArcFace produced no outputs"))?
         .1;
 
     let (_shape, data) = first_value
         .try_extract_tensor::<f32>()
-        .context("failed to extract ArcFace embedding tensor")?;
+        .map_err(|e| crate::FancamError::inference(format!(
+            "Failed to extract ArcFace embedding tensor: {e}"
+        )))?;
 
     Ok(data.to_vec())
 }
@@ -708,11 +806,18 @@ fn nms(mut boxes: Vec<BBox>, iou_thresh: f32) -> Vec<BBox> {
 // ── Debug rendering ──────────────────────────────────────────────────────────
 
 /// Draw bounding boxes onto a frame's RGB data in-place (for debug output).
-pub fn draw_boxes(frame: &mut RgbFrame, boxes: &[BBox], color: [u8; 3]) {
+///
+/// # Errors
+///
+/// Returns an error if the frame dimensions are invalid.
+pub fn draw_boxes(frame: &mut RgbFrame, boxes: &[BBox], color: [u8; 3]) -> Result<()> {
     // Build the image from the existing buffer — no clone; we write back in-place.
-    let mut img: RgbImage =
-        ImageBuffer::from_raw(frame.width, frame.height, std::mem::take(&mut frame.data))
-            .expect("valid frame dimensions");
+    let mut img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, std::mem::take(&mut frame.data))
+        .ok_or_else(|| crate::FancamError::invalid_frame(format!(
+            "Invalid frame dimensions: {}x{}",
+            frame.width,
+            frame.height
+        )))?;
 
     for bbox in boxes {
         let rect = Rect::at(bbox.x1 as i32, bbox.y1 as i32)
@@ -721,4 +826,5 @@ pub fn draw_boxes(frame: &mut RgbFrame, boxes: &[BBox], color: [u8; 3]) {
     }
 
     frame.data = img.into_raw();
+    Ok(())
 }

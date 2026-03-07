@@ -116,6 +116,7 @@ pub struct DiscoveryReport {
 ///
 /// Loads the required ML models and provides methods to scan videos
 /// and build a list of distinct identities present.
+#[derive(Debug)]
 pub struct DiscoveryEngine {
     detector: Detector,
     embedder: FaceEmbedder,
@@ -180,7 +181,7 @@ impl DiscoveryEngine {
             decoder.format(),
             decoder.width(),
             decoder.height(),
-            ffmpeg::format::Pixel::RGB24,
+            format::Pixel::RGB24,
             decoder.width(),
             decoder.height(),
             scaling::Flags::BILINEAR,

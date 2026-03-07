@@ -39,10 +39,15 @@ const VIDEO_BUFFER_POOL: usize = 24;
 
 /// A single decoded video frame in RGB24 format, along with its presentation
 /// timestamp (in the source stream's time-base units).
+#[derive(Debug, Clone)]
 pub struct RgbFrame {
-    pub data: Vec<u8>, // packed RGB24, row-major
+    /// Packed RGB24 pixel data, row-major order.
+    pub data: Vec<u8>,
+    /// Frame width in pixels.
     pub width: u32,
+    /// Frame height in pixels.
     pub height: u32,
+    /// Presentation timestamp in source stream time-base units.
     pub pts: i64,
 }
 
@@ -228,7 +233,7 @@ where
     // stable before write_header.
     let audio_out_index: Option<(usize, usize)> = if let Some(ai) = audio_stream_index {
         let in_stream = ictx.stream(ai).unwrap();
-        let mut audio_out = octx.add_stream(ffmpeg_next::codec::Id::None)?;
+        let mut audio_out = octx.add_stream(codec::Id::None)?;
         audio_out.set_parameters(in_stream.parameters());
         Some((ai, audio_out.index()))
     } else {
