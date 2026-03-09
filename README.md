@@ -9,7 +9,9 @@ Automated fancam generator. It takes a standard landscape video and a reference 
 
 It features a modular Rust core for high-speed video processing, a CLI for batch operations, and a modern Tauri v2 desktop application for easy usage.
 
-<img src="./src/ui.png">
+<p align=center>
+<img src="./src/ui.png" width=70%>
+</p>
 
 ##  Features
 
@@ -60,9 +62,10 @@ The project is organized as a Cargo workspace:
     *   If occluded, the filter predicts the position based on previous momentum.
 5.  **Render**: The frame is cropped to the smoothed coordinates and re-encoded to H.264.
 
-<img src="./src/process.png">
-<img src="./src/output.png">
-
+<p align=center>
+<img src="./src/process.png" width=70%>
+<img src="./src/output.png" width=70%>
+</p>
 ##  Prerequisites
 
 To build and run this project, you need:
