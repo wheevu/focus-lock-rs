@@ -89,7 +89,7 @@ impl OrtConfig {
 
         Err(crate::FancamError::ort_config(
             "Could not locate libonnxruntime.dylib. \
-             Set ORT_DYLIB_PATH to an official ONNX Runtime build with CoreML support"
+             Set ORT_DYLIB_PATH to an official ONNX Runtime build with CoreML support",
         ))
     }
 

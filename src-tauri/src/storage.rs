@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct ScanSessionRow {
@@ -16,6 +16,7 @@ pub struct ScanSessionRow {
     pub selected_identity_id: Option<i64>,
     pub selected_anchor_x: Option<f32>,
     pub selected_anchor_y: Option<f32>,
+    pub validated_threshold: Option<f32>,
     pub updated_at_ms: u64,
     pub candidates_json: String,
     pub duplicates_json: String,
@@ -122,7 +123,7 @@ pub fn load_scan_rows(db_path: &Path) -> Result<Option<ScanStoreRows>, String> {
             "SELECT
                scan_id, video, yolo_model, face_model, status, expected_count,
                review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
-               updated_at_ms, candidates_json, duplicates_json,
+               validated_threshold, updated_at_ms, candidates_json, duplicates_json,
                excluded_identity_ids_json, accepted_low_confidence_ids_json,
                resolved_duplicate_keys_json, pending_split_ids_json,
                pending_split_count, last_blockers_json
@@ -143,15 +144,16 @@ pub fn load_scan_rows(db_path: &Path) -> Result<Option<ScanStoreRows>, String> {
                 selected_identity_id: row.get(7)?,
                 selected_anchor_x: row.get(8)?,
                 selected_anchor_y: row.get(9)?,
-                updated_at_ms: row.get(10)?,
-                candidates_json: row.get(11)?,
-                duplicates_json: row.get(12)?,
-                excluded_identity_ids_json: row.get(13)?,
-                accepted_low_confidence_ids_json: row.get(14)?,
-                resolved_duplicate_keys_json: row.get(15)?,
-                pending_split_ids_json: row.get(16)?,
-                pending_split_count: row.get(17)?,
-                last_blockers_json: row.get(18)?,
+                validated_threshold: row.get(10)?,
+                updated_at_ms: row.get(11)?,
+                candidates_json: row.get(12)?,
+                duplicates_json: row.get(13)?,
+                excluded_identity_ids_json: row.get(14)?,
+                accepted_low_confidence_ids_json: row.get(15)?,
+                resolved_duplicate_keys_json: row.get(16)?,
+                pending_split_ids_json: row.get(17)?,
+                pending_split_count: row.get(18)?,
+                last_blockers_json: row.get(19)?,
             })
         })
         .map_err(|e| format!("failed to map sessions rows: {e}"))?
@@ -205,11 +207,11 @@ pub fn save_scan_rows(db_path: &Path, rows: &ScanStoreRows) -> Result<(), String
             "INSERT INTO scan_sessions (
                scan_id, video, yolo_model, face_model, status, expected_count,
                review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
-               updated_at_ms, candidates_json, duplicates_json,
+               validated_threshold, updated_at_ms, candidates_json, duplicates_json,
                excluded_identity_ids_json, accepted_low_confidence_ids_json,
                resolved_duplicate_keys_json, pending_split_ids_json,
                pending_split_count, last_blockers_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 session.scan_id,
                 session.video,
@@ -221,6 +223,7 @@ pub fn save_scan_rows(db_path: &Path, rows: &ScanStoreRows) -> Result<(), String
                 session.selected_identity_id,
                 session.selected_anchor_x,
                 session.selected_anchor_y,
+                session.validated_threshold,
                 session.updated_at_ms,
                 session.candidates_json,
                 session.duplicates_json,
@@ -244,6 +247,111 @@ pub fn save_scan_rows(db_path: &Path, rows: &ScanStoreRows) -> Result<(), String
         .map_err(|e| format!("failed to insert event row: {e}"))?;
     }
 
+    tx.commit()
+        .map_err(|e| format!("failed to commit sqlite transaction: {e}"))
+}
+
+pub fn save_scan_row(
+    db_path: &Path,
+    next_id: u64,
+    session: &ScanSessionRow,
+    events: &[ScanSessionEventRow],
+) -> Result<(), String> {
+    let mut conn = open_db(db_path)?;
+    migrate(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to start sqlite transaction: {e}"))?;
+    upsert_next_id(&tx, next_id)?;
+
+    tx.execute(
+        "INSERT INTO scan_sessions (
+           scan_id, video, yolo_model, face_model, status, expected_count,
+           review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
+           validated_threshold, updated_at_ms, candidates_json, duplicates_json,
+           excluded_identity_ids_json, accepted_low_confidence_ids_json,
+           resolved_duplicate_keys_json, pending_split_ids_json,
+           pending_split_count, last_blockers_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+         ON CONFLICT(scan_id) DO UPDATE SET
+           video = excluded.video,
+           yolo_model = excluded.yolo_model,
+           face_model = excluded.face_model,
+           status = excluded.status,
+           expected_count = excluded.expected_count,
+           review_ready = excluded.review_ready,
+           selected_identity_id = excluded.selected_identity_id,
+           selected_anchor_x = excluded.selected_anchor_x,
+           selected_anchor_y = excluded.selected_anchor_y,
+           validated_threshold = excluded.validated_threshold,
+           updated_at_ms = excluded.updated_at_ms,
+           candidates_json = excluded.candidates_json,
+           duplicates_json = excluded.duplicates_json,
+           excluded_identity_ids_json = excluded.excluded_identity_ids_json,
+           accepted_low_confidence_ids_json = excluded.accepted_low_confidence_ids_json,
+           resolved_duplicate_keys_json = excluded.resolved_duplicate_keys_json,
+           pending_split_ids_json = excluded.pending_split_ids_json,
+           pending_split_count = excluded.pending_split_count,
+           last_blockers_json = excluded.last_blockers_json",
+        params![
+            session.scan_id,
+            session.video,
+            session.yolo_model,
+            session.face_model,
+            session.status,
+            session.expected_count,
+            if session.review_ready { 1_i64 } else { 0_i64 },
+            session.selected_identity_id,
+            session.selected_anchor_x,
+            session.selected_anchor_y,
+            session.validated_threshold,
+            session.updated_at_ms,
+            session.candidates_json,
+            session.duplicates_json,
+            session.excluded_identity_ids_json,
+            session.accepted_low_confidence_ids_json,
+            session.resolved_duplicate_keys_json,
+            session.pending_split_ids_json,
+            session.pending_split_count,
+            session.last_blockers_json,
+        ],
+    )
+    .map_err(|e| format!("failed to upsert session row: {e}"))?;
+
+    tx.execute(
+        "DELETE FROM scan_session_events WHERE scan_id = ?1",
+        params![session.scan_id],
+    )
+    .map_err(|e| format!("failed to clear session events: {e}"))?;
+    for event in events {
+        tx.execute(
+            "INSERT INTO scan_session_events (scan_id, at_ms, action, details)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event.scan_id, event.at_ms, event.action, event.details],
+        )
+        .map_err(|e| format!("failed to insert session event row: {e}"))?;
+    }
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit sqlite transaction: {e}"))
+}
+
+pub fn delete_scan_rows(db_path: &Path, scan_ids: &[String]) -> Result<(), String> {
+    if scan_ids.is_empty() {
+        return Ok(());
+    }
+    let mut conn = open_db(db_path)?;
+    migrate(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to start sqlite transaction: {e}"))?;
+    for scan_id in scan_ids {
+        tx.execute(
+            "DELETE FROM scan_sessions WHERE scan_id = ?1",
+            params![scan_id],
+        )
+        .map_err(|e| format!("failed to delete session row: {e}"))?;
+    }
     tx.commit()
         .map_err(|e| format!("failed to commit sqlite transaction: {e}"))
 }
@@ -589,6 +697,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
                selected_identity_id INTEGER,
                selected_anchor_x REAL,
                selected_anchor_y REAL,
+               validated_threshold REAL,
                updated_at_ms INTEGER NOT NULL,
                candidates_json TEXT NOT NULL,
                duplicates_json TEXT NOT NULL,
@@ -636,6 +745,20 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("failed migration v3 backfill: {e}"))?;
         conn.execute_batch("PRAGMA user_version = 3;")
             .map_err(|e| format!("failed to set user_version v3: {e}"))?;
+    }
+
+    if version < 4 {
+        let alter_result = conn.execute(
+            "ALTER TABLE scan_sessions ADD COLUMN validated_threshold REAL",
+            [],
+        );
+        if let Err(e) = alter_result
+            && !e.to_string().contains("duplicate column name")
+        {
+            return Err(format!("failed migration v4 alter: {e}"));
+        }
+        conn.execute_batch("PRAGMA user_version = 4;")
+            .map_err(|e| format!("failed to set user_version v4: {e}"))?;
     }
 
     let final_version: i64 = conn
@@ -706,6 +829,7 @@ mod tests {
                     selected_identity_id: None,
                     selected_anchor_x: None,
                     selected_anchor_y: None,
+                    validated_threshold: Some(0.6),
                     updated_at_ms: now.saturating_sub(10_000),
                     candidates_json: "[]".to_string(),
                     duplicates_json: "[]".to_string(),
@@ -727,6 +851,7 @@ mod tests {
                     selected_identity_id: Some(2),
                     selected_anchor_x: Some(12.3),
                     selected_anchor_y: Some(22.1),
+                    validated_threshold: Some(0.72),
                     updated_at_ms: now,
                     candidates_json: "[]".to_string(),
                     duplicates_json: "[]".to_string(),

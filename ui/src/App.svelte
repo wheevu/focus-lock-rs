@@ -6,8 +6,8 @@
 
   // ── State ─────────────────────────────────────────────────────────────────
 
-  type JobStatus = 'idle' | 'running' | 'done' | 'error';
-  type ScanStatus = 'idle' | 'running' | 'done' | 'error';
+  type JobStatus = 'idle' | 'running' | 'cancelling' | 'done' | 'error';
+  type ScanStatus = 'idle' | 'running' | 'cancelling' | 'done' | 'error';
 
   type IdentityCandidate = {
     id: number;
@@ -121,6 +121,7 @@
     selected_identity_id?: number;
     selected_anchor_x?: number;
     selected_anchor_y?: number;
+    validated_threshold?: number;
     last_blockers: string[];
     candidates: IdentityCandidate[];
     duplicates: DuplicatePair[];
@@ -223,6 +224,11 @@
     last_error?: string;
   };
 
+  type ScanProgressPayload = {
+    sampled_frames: number;
+    total_decoded_frames: number;
+  };
+
   let videoPath    = $state('');
   let biasPath     = $state('');
   let outputPath   = $state('');
@@ -258,6 +264,10 @@
   let reviewReqSeq = $state(0);
   let scanNeedsReview = $state(false);
   let rescanPerformed = $state(false);
+  let scanSampledFrames = $state(0);
+  let scanDecodedFrames = $state(0);
+  let scanProgressFraction = $state(0);
+  let reviewDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   let queueHealth = $state<QueueHealth | null>(null);
   let queueMsg = $state('');
@@ -267,6 +277,7 @@
   let workerPollMsInput = $state('1200');
   let telemetryInterval: ReturnType<typeof setInterval> | null = null;
   let telemetryRefreshing = $state(false);
+  let telemetryTick = $state(0);
   let workerEventFilter = $state<'all' | 'issues'>('all');
   let scanSessionDetail = $state<ScanSessionDetail | null>(null);
   let scanSessions = $state<ScanSessionSummary[]>([]);
@@ -346,14 +357,20 @@
 
     refreshQueueHealth();
     refreshWorkerStatus();
+    await attachListeners();
   });
 
   // ── Event listeners ───────────────────────────────────────────────────────
 
   let unlistenProgress: (() => void) | null = null;
   let unlistenDone:     (() => void) | null = null;
+  let unlistenScanProgress: (() => void) | null = null;
+  let unlistenScanDone: (() => void) | null = null;
 
   async function attachListeners() {
+    if (unlistenProgress || unlistenDone || unlistenScanProgress || unlistenScanDone) {
+      return;
+    }
     unlistenProgress = await listen<{ current: number; total: number; fraction: number }>(
       'fancam://progress',
       (e) => {
@@ -378,18 +395,42 @@
         }
       }
     );
+    unlistenScanProgress = await listen<ScanProgressPayload>('scan://progress', (e) => {
+      scanSampledFrames = e.payload.sampled_frames;
+      scanDecodedFrames = e.payload.total_decoded_frames;
+      const denom = Math.max(scanDecodedFrames, scanSampledFrames, 1);
+      scanProgressFraction = Math.min(1, scanSampledFrames / denom);
+    });
+    unlistenScanDone = await listen<{ ok: boolean; message: string }>('scan://done', (e) => {
+      if (e.payload.ok) {
+        if (scanStatus !== 'done') {
+          scanStatus = 'done';
+        }
+      } else {
+        scanStatus = 'error';
+        scanErr = e.payload.message;
+      }
+    });
   }
 
   function detachListeners() {
     unlistenProgress?.();
     unlistenDone?.();
+    unlistenScanProgress?.();
+    unlistenScanDone?.();
     unlistenProgress = null;
     unlistenDone     = null;
+    unlistenScanProgress = null;
+    unlistenScanDone = null;
   }
 
   onDestroy(detachListeners);
 
   onDestroy(() => {
+    if (reviewDebounceTimer !== null) {
+      clearTimeout(reviewDebounceTimer);
+      reviewDebounceTimer = null;
+    }
     stopTelemetryLoop();
   });
 
@@ -468,6 +509,9 @@
     scanSessionsCursorId = null;
     scanNeedsReview = false;
     rescanPerformed = false;
+    scanSampledFrames = 0;
+    scanDecodedFrames = 0;
+    scanProgressFraction = 0;
   }
 
   function duplicateKey(a: number, b: number) {
@@ -523,12 +567,23 @@
     );
   }
 
+  function modelSetupReady() {
+    return !!yoloModel && !!faceModel;
+  }
+
   function expectedMembersValue(): number | null {
     const trimmed = expectedMembersInput.trim();
     if (!trimmed) return null;
     const n = Number.parseInt(trimmed, 10);
     if (!Number.isFinite(n) || n <= 0) return null;
     return n;
+  }
+
+  function expectedMembersInvalid() {
+    const trimmed = expectedMembersInput.trim();
+    if (!trimmed) return false;
+    const n = Number.parseInt(trimmed, 10);
+    return !Number.isFinite(n) || n <= 0;
   }
 
   function selectIdentity(candidate: IdentityCandidate) {
@@ -590,9 +645,17 @@
 
   async function runIdentityScan() {
     if (!videoPath || !yoloModel || !faceModel) return;
+    if (expectedMembersInvalid()) {
+      scanErr = 'expected members must be a positive whole number';
+      scanStatus = 'error';
+      return;
+    }
     scanStatus = 'running';
     scanErr = '';
     scanMessage = '';
+    scanSampledFrames = 0;
+    scanDecodedFrames = 0;
+    scanProgressFraction = 0;
     scanCandidates = [];
     duplicatePairs = [];
     selectedIdentityId = null;
@@ -625,11 +688,26 @@
       duplicatePairs = result.duplicates;
       scanNeedsReview = result.needs_review;
       rescanPerformed = result.rescan_performed;
+      scanSampledFrames = result.sampled_frames;
+      scanDecodedFrames = result.total_decoded_frames;
+      scanProgressFraction = 1;
 
       if (result.candidates.length > 0) {
         const best = result.candidates[0];
         selectIdentity(best);
       }
+    } catch (e: unknown) {
+      scanStatus = 'error';
+      scanErr = String(e);
+    }
+  }
+
+  async function cancelScan() {
+    if (scanStatus !== 'running') return;
+    scanStatus = 'cancelling';
+    try {
+      await invoke('cancel_scan');
+      scanMessage = 'scan cancellation requested';
     } catch (e: unknown) {
       scanStatus = 'error';
       scanErr = String(e);
@@ -711,15 +789,21 @@
 
   async function refreshQueueTelemetry() {
     if (!showSettings) return;
-    await Promise.allSettled([
+    telemetryTick += 1;
+    const calls: Promise<unknown>[] = [
       refreshQueueHealth(),
       refreshWorkerStatus(),
-      peekQueueAttempts(),
-      refreshScanSessionDetail(),
-      refreshScanStorageStats(),
-      refreshStorageWorkerStatus(),
-      refreshDiagnosticsBundles(),
-    ]);
+    ];
+    if (telemetryTick % 2 === 0) {
+      calls.push(peekQueueAttempts(), refreshScanSessionDetail());
+    }
+    if (telemetryTick % 3 === 0) {
+      calls.push(refreshScanStorageStats(), refreshStorageWorkerStatus());
+    }
+    if (telemetryTick % 6 === 0) {
+      calls.push(refreshDiagnosticsBundles(), refreshScanSessionsList());
+    }
+    await Promise.allSettled(calls);
   }
 
   async function refreshScanSessionDetail() {
@@ -850,6 +934,9 @@
   }
 
   async function pruneDiagnosticsBundles() {
+    if (!confirm('Prune diagnostics bundles? Older bundles will be deleted.')) {
+      return;
+    }
     queueErr = '';
     try {
       const keep = Number.parseInt(diagnosticsKeepInput, 10);
@@ -882,6 +969,9 @@
   }
 
   async function deleteDiagnosticsBundle(path: string) {
+    if (!confirm(`Delete diagnostics bundle?\n${path}`)) {
+      return;
+    }
     queueErr = '';
     try {
       const result = await invoke<DeleteDiagnosticsBundleResult>('delete_diagnostics_bundle', {
@@ -903,6 +993,9 @@
   }
 
   async function runStorageMaintenance() {
+    if (!confirm('Run storage maintenance now? This may delete old scan sessions and events.')) {
+      return;
+    }
     queueErr = '';
     try {
       const result = await invoke<ScanStorageMaintenanceResult>('run_scan_storage_maintenance', {
@@ -1032,6 +1125,9 @@
       selectedIdentityId = detail.selected_identity_id ?? null;
       selectedAnchorX = detail.selected_anchor_x ?? null;
       selectedAnchorY = detail.selected_anchor_y ?? null;
+      if (detail.validated_threshold !== undefined && detail.validated_threshold !== null) {
+        threshold = detail.validated_threshold;
+      }
       reviewReady = detail.review_ready;
       reviewBlockers = detail.last_blockers;
       scanSessionDetail = detail;
@@ -1043,6 +1139,9 @@
   }
 
   async function cleanupOldScanSessions() {
+    if (!confirm('Cleanup old scan sessions now?')) {
+      return;
+    }
     queueErr = '';
     try {
       const removed = await invoke<number>('cleanup_identity_scans', {
@@ -1059,7 +1158,7 @@
     if (telemetryInterval !== null) return;
     telemetryInterval = setInterval(() => {
       refreshQueueTelemetry();
-    }, 2000);
+    }, status === 'running' ? 4500 : 2500);
   }
 
   function stopTelemetryLoop() {
@@ -1194,8 +1293,6 @@
     errMsg   = '';
     resultPath = '';
 
-    await attachListeners();
-
     try {
       const result = await invoke<{ ok: boolean; message: string; output_path?: string }>(
         'run_fancam',
@@ -1215,26 +1312,33 @@
           }
       );
       if (!result.ok) {
-        status = 'error';
-        errMsg = result.message;
+        if (result.message.toLowerCase().includes('cancel')) {
+          status = 'idle';
+          errMsg = '';
+        } else {
+          status = 'error';
+          errMsg = result.message;
+        }
         etaSeconds = null;
       }
     } catch (e: unknown) {
       status = 'error';
       errMsg = String(e);
       etaSeconds = null;
-    } finally {
-      detachListeners();
-      startedAtMs = null;
     }
+    startedAtMs = null;
   }
 
   async function cancelJob() {
-    await invoke('cancel_job');
-    status = 'idle';
-    startedAtMs = null;
-    etaSeconds = null;
-    detachListeners();
+    if (status !== 'running') return;
+    status = 'cancelling';
+    try {
+      await invoke('cancel_job');
+      errMsg = 'cancellation requested...';
+    } catch (e: unknown) {
+      status = 'error';
+      errMsg = String(e);
+    }
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1363,6 +1467,10 @@
 
   $effect(() => {
     if (scanStatus !== 'done' || !scanId) {
+      if (reviewDebounceTimer !== null) {
+        clearTimeout(reviewDebounceTimer);
+        reviewDebounceTimer = null;
+      }
       reviewReady = false;
       reviewBlockers = [];
       return;
@@ -1373,28 +1481,41 @@
     const args = {
       scan_id: scanId,
       selected_identity_id: selectedIdentityId,
+      threshold,
       excluded_identity_ids: ignoredIdentityIds,
       accepted_low_confidence_ids: acceptedLowConfidenceIds,
       resolved_duplicates: resolvedDuplicates,
       pending_split_ids: pendingSplitIds,
       expected_member_count: expectedMembersValue(),
     };
-    invoke<IdentityReviewResult>('validate_identity_review', { args })
-      .then((result) => {
-        if (reqId !== reviewReqSeq) return;
-        reviewReady = result.ready;
-        reviewBlockers = result.blockers;
-        if (result.selected_identity_id !== undefined && result.selected_identity_id !== null) {
-          selectedIdentityId = result.selected_identity_id;
-          selectedAnchorX = result.selected_anchor_x ?? selectedAnchorX;
-          selectedAnchorY = result.selected_anchor_y ?? selectedAnchorY;
-        }
-      })
-      .catch((e: unknown) => {
-        if (reqId !== reviewReqSeq) return;
-        reviewReady = false;
-        reviewBlockers = [String(e)];
-      });
+    if (reviewDebounceTimer !== null) {
+      clearTimeout(reviewDebounceTimer);
+    }
+    reviewDebounceTimer = setTimeout(() => {
+      invoke<IdentityReviewResult>('validate_identity_review', { args })
+        .then((result) => {
+          if (reqId !== reviewReqSeq) return;
+          reviewReady = result.ready;
+          reviewBlockers = result.blockers;
+          if (result.selected_identity_id !== undefined && result.selected_identity_id !== null) {
+            selectedIdentityId = result.selected_identity_id;
+            selectedAnchorX = result.selected_anchor_x ?? selectedAnchorX;
+            selectedAnchorY = result.selected_anchor_y ?? selectedAnchorY;
+          }
+        })
+        .catch((e: unknown) => {
+          if (reqId !== reviewReqSeq) return;
+          reviewReady = false;
+          reviewBlockers = [String(e)];
+        });
+    }, 220);
+
+    return () => {
+      if (reviewDebounceTimer !== null) {
+        clearTimeout(reviewDebounceTimer);
+        reviewDebounceTimer = null;
+      }
+    };
   });
 
   $effect(() => {
@@ -1419,7 +1540,7 @@
       class:active={showSettings}
       onclick={() => (showSettings = !showSettings)}
       title="Settings"
-    >⚙</button>
+    >⚙ settings</button>
   </header>
 
   <!-- settings drawer -->
@@ -1680,6 +1801,12 @@
   <!-- main panel -->
   <main>
 
+    {#if !modelSetupReady()}
+      <section class="scan-warning">
+        model setup required: choose YOLO and face ONNX models in settings before scanning.
+      </section>
+    {/if}
+
     <!-- inputs -->
     <section class="inputs">
 
@@ -1774,12 +1901,29 @@
           </label>
           <button
             class="ghost-btn"
-            disabled={!videoPath || !yoloModel || !faceModel || scanStatus === 'running'}
+            disabled={!videoPath || !yoloModel || !faceModel || scanStatus === 'running' || scanStatus === 'cancelling'}
             onclick={runIdentityScan}
           >
             {scanStatus === 'running' ? 'scanning...' : 'scan members'}
           </button>
+          {#if scanStatus === 'running' || scanStatus === 'cancelling'}
+            <button class="ghost-btn" onclick={cancelScan} disabled={scanStatus === 'cancelling'}>
+              {scanStatus === 'cancelling' ? 'cancelling...' : 'cancel scan'}
+            </button>
+          {/if}
         </div>
+
+        {#if expectedMembersInvalid()}
+          <div class="scan-warning">expected members must be a positive whole number</div>
+        {/if}
+
+        {#if scanStatus === 'running' || scanStatus === 'cancelling'}
+          <div class="scan-meta detail">
+            <span>sampled {scanSampledFrames}</span>
+            <span>decoded {scanDecodedFrames}</span>
+            <span>{Math.round(scanProgressFraction * 100)}%</span>
+          </div>
+        {/if}
 
         {#if scanStatus === 'error'}
           <div class="scan-error">{scanErr}</div>
@@ -1962,6 +2106,9 @@
           <div class="prog-fill" style="width:{pct(progress)}"></div>
         </div>
 
+      {:else if status === 'cancelling'}
+        <div class="ready-msg">cancellation requested... waiting for render worker to stop</div>
+
       {:else if status === 'done'}
         <div class="done-msg">
           <span class="check">✓</span>
@@ -1977,8 +2124,10 @@
 
     <!-- actions -->
     <section class="actions">
-      {#if status === 'running'}
-        <button class="btn-cancel" onclick={cancelJob}>cancel</button>
+      {#if status === 'running' || status === 'cancelling'}
+        <button class="btn-cancel" onclick={cancelJob} disabled={status === 'cancelling'}>
+          {status === 'cancelling' ? 'cancelling...' : 'cancel'}
+        </button>
       {:else}
         <button
           class="btn-run"

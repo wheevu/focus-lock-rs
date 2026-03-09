@@ -31,6 +31,7 @@ const DEFAULT_MAX_SAMPLED_FRAMES: usize = 900;
 const DEFAULT_MAX_FACES_PER_FRAME: usize = 6;
 const DEFAULT_CLUSTER_SIMILARITY: f32 = 0.76;
 const DEFAULT_DUPLICATE_SIMILARITY: f32 = 0.86;
+const PROGRESS_EMIT_FRAME_INTERVAL: u64 = 24;
 
 /// Configuration for identity discovery.
 ///
@@ -161,6 +162,22 @@ impl DiscoveryEngine {
         video_path: P,
         config: &DiscoveryConfig,
     ) -> Result<DiscoveryReport> {
+        self.scan_video_with_hooks(video_path, config, |_, _| {}, || false)
+    }
+
+    /// Scans a video to discover distinct identities, with progress and cancellation hooks.
+    pub fn scan_video_with_hooks<P, F, C>(
+        &mut self,
+        video_path: P,
+        config: &DiscoveryConfig,
+        mut on_progress: F,
+        mut should_cancel: C,
+    ) -> Result<DiscoveryReport>
+    where
+        P: AsRef<Path>,
+        F: FnMut(u64, u64),
+        C: FnMut() -> bool,
+    {
         ffmpeg::init().context("failed to initialize ffmpeg for identity discovery")?;
 
         let mut ictx = format::input(&video_path).context("failed to open input video")?;
@@ -199,6 +216,12 @@ impl DiscoveryEngine {
 
         let mut process = |src: &frame::Video| -> Result<bool> {
             frame_index += 1;
+            if should_cancel() {
+                anyhow::bail!("identity scan cancelled");
+            }
+            if frame_index.is_multiple_of(PROGRESS_EMIT_FRAME_INTERVAL) {
+                on_progress(sampled_frames, frame_index);
+            }
             if config.sample_stride > 1 && !frame_index.is_multiple_of(config.sample_stride) {
                 return Ok(false);
             }
@@ -211,6 +234,7 @@ impl DiscoveryEngine {
                 .context("failed to convert frame to rgb")?;
             let rgb = copy_rgb_frame(&rgb_frame, frame_index);
             sampled_frames += 1;
+            on_progress(sampled_frames, frame_index);
 
             let mut persons = self.detector.detect(&rgb).unwrap_or_default();
             persons.sort_unstable_by(|a, b| {
@@ -225,7 +249,6 @@ impl DiscoveryEngine {
                     continue;
                 };
                 let (anchor_x, anchor_y) = (bbox.center_x(), bbox.center_y());
-                let thumb = thumbnail_from_bbox(&rgb, bbox)?;
                 update_clusters(
                     &mut clusters,
                     ClusterObservation {
@@ -234,9 +257,9 @@ impl DiscoveryEngine {
                         anchor_x,
                         anchor_y,
                         embedding,
-                        thumbnail: thumb,
                     },
                     config.cluster_similarity,
+                    &rgb,
                 );
             }
             Ok(sampled_frames as usize >= config.max_sampled_frames)
@@ -314,7 +337,6 @@ struct ClusterObservation {
     anchor_x: f32,
     anchor_y: f32,
     embedding: Vec<f32>,
-    thumbnail: Vec<u8>,
 }
 
 struct Cluster {
@@ -330,7 +352,7 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn new(obs: &ClusterObservation) -> Self {
+    fn new(obs: &ClusterObservation, thumbnail_jpeg: Vec<u8>) -> Self {
         Self {
             centroid: obs.embedding.clone(),
             confidence_sum: obs.bbox.confidence,
@@ -340,11 +362,17 @@ impl Cluster {
             anchor_x_acc: obs.anchor_x,
             anchor_y_acc: obs.anchor_y,
             thumbnail_score: obs.bbox.confidence,
-            thumbnail_jpeg: obs.thumbnail.clone(),
+            thumbnail_jpeg,
         }
     }
 
-    fn absorb(&mut self, obs: &ClusterObservation, similarity: f32) {
+    fn absorb(
+        &mut self,
+        obs: &ClusterObservation,
+        similarity: f32,
+        quality: f32,
+        thumbnail_jpeg: Option<Vec<u8>>,
+    ) {
         let n = self.observations as f32;
         for (c, e) in self.centroid.iter_mut().zip(obs.embedding.iter()) {
             *c = (*c * n + *e) / (n + 1.0);
@@ -356,10 +384,11 @@ impl Cluster {
         self.anchor_x_acc += obs.anchor_x;
         self.anchor_y_acc += obs.anchor_y;
 
-        let quality = obs.bbox.confidence * (0.5 + 0.5 * similarity.clamp(0.0, 1.0));
         if quality > self.thumbnail_score {
             self.thumbnail_score = quality;
-            self.thumbnail_jpeg = obs.thumbnail.clone();
+            if let Some(thumbnail_jpeg) = thumbnail_jpeg {
+                self.thumbnail_jpeg = thumbnail_jpeg;
+            }
         }
     }
 
@@ -383,7 +412,12 @@ impl Cluster {
     }
 }
 
-fn update_clusters(clusters: &mut Vec<Cluster>, obs: ClusterObservation, similarity_gate: f32) {
+fn update_clusters(
+    clusters: &mut Vec<Cluster>,
+    obs: ClusterObservation,
+    similarity_gate: f32,
+    frame: &RgbFrame,
+) {
     let mut best_idx = None;
     let mut best_sim = -1.0f32;
     for (idx, c) in clusters.iter().enumerate() {
@@ -397,9 +431,16 @@ fn update_clusters(clusters: &mut Vec<Cluster>, obs: ClusterObservation, similar
     if let Some(idx) = best_idx
         && best_sim >= similarity_gate
     {
-        clusters[idx].absorb(&obs, best_sim);
+        let quality = obs.bbox.confidence * (0.5 + 0.5 * best_sim.clamp(0.0, 1.0));
+        let thumbnail_jpeg = if quality > clusters[idx].thumbnail_score {
+            thumbnail_from_bbox(frame, obs.bbox).ok()
+        } else {
+            None
+        };
+        clusters[idx].absorb(&obs, best_sim, quality, thumbnail_jpeg);
     } else {
-        clusters.push(Cluster::new(&obs));
+        let thumbnail_jpeg = thumbnail_from_bbox(frame, obs.bbox).unwrap_or_default();
+        clusters.push(Cluster::new(&obs, thumbnail_jpeg));
     }
 }
 
@@ -463,4 +504,81 @@ fn thumbnail_from_bbox(frame: &RgbFrame, bbox: BBox) -> Result<Vec<u8>> {
 fn l2_normalize(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
     v.iter().map(|x| x / norm).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgb_frame() -> RgbFrame {
+        RgbFrame {
+            data: vec![127u8; 320 * 240 * 3],
+            width: 320,
+            height: 240,
+            pts: 0,
+        }
+    }
+
+    fn obs(id: u64, emb: Vec<f32>, bbox: BBox) -> ClusterObservation {
+        ClusterObservation {
+            frame_index: id,
+            bbox,
+            anchor_x: bbox.center_x(),
+            anchor_y: bbox.center_y(),
+            embedding: emb,
+        }
+    }
+
+    #[test]
+    fn cluster_update_merges_similar_embeddings() {
+        let mut clusters = Vec::new();
+        let frame = rgb_frame();
+        let bbox = BBox {
+            x1: 40.0,
+            y1: 30.0,
+            x2: 140.0,
+            y2: 210.0,
+            confidence: 0.9,
+        };
+        update_clusters(
+            &mut clusters,
+            obs(1, l2_normalize(&[1.0, 0.0, 0.0, 0.0]), bbox),
+            0.75,
+            &frame,
+        );
+        update_clusters(
+            &mut clusters,
+            obs(2, l2_normalize(&[0.98, 0.01, 0.0, 0.0]), bbox),
+            0.75,
+            &frame,
+        );
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].observations, 2);
+    }
+
+    #[test]
+    fn cluster_update_splits_dissimilar_embeddings() {
+        let mut clusters = Vec::new();
+        let frame = rgb_frame();
+        let bbox = BBox {
+            x1: 40.0,
+            y1: 30.0,
+            x2: 140.0,
+            y2: 210.0,
+            confidence: 0.85,
+        };
+        update_clusters(
+            &mut clusters,
+            obs(1, l2_normalize(&[1.0, 0.0, 0.0, 0.0]), bbox),
+            0.85,
+            &frame,
+        );
+        update_clusters(
+            &mut clusters,
+            obs(2, l2_normalize(&[0.0, 1.0, 0.0, 0.0]), bbox),
+            0.85,
+            &frame,
+        );
+        assert_eq!(clusters.len(), 2);
+    }
 }

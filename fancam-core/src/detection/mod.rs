@@ -114,8 +114,16 @@ pub struct Detector {
     session: Session,
     yolo_resizer: fr::Resizer,
     yolo_resize_buf: Vec<u8>,
+    yolo_letterbox_buf: Vec<u8>,
     downscale_resizer: fr::Resizer,
     downscale_buf: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct YoloMap {
+    scale: f32,
+    pad_x: f32,
+    pad_y: f32,
 }
 
 /// A matched identity with bounding box and similarity score.
@@ -140,7 +148,8 @@ impl Detector {
         Ok(Self {
             session,
             yolo_resizer: fr::Resizer::new(),
-            yolo_resize_buf: vec![0u8; (YOLO_SIZE * YOLO_SIZE * 3) as usize],
+            yolo_resize_buf: Vec::new(),
+            yolo_letterbox_buf: vec![114u8; (YOLO_SIZE * YOLO_SIZE * 3) as usize],
             downscale_resizer: fr::Resizer::new(),
             downscale_buf: Vec::new(),
         })
@@ -176,7 +185,7 @@ impl Detector {
     }
 
     fn detect_native(&mut self, frame: &RgbFrame) -> Result<Vec<BBox>> {
-        let input_tensor = self.preprocess_yolo(frame)?;
+        let (input_tensor, yolo_map) = self.preprocess_yolo(frame)?;
 
         let outputs = self
             .session
@@ -186,17 +195,15 @@ impl Detector {
         // YOLOv8 output: [1, 84, 8400]  (84 = 4 box coords + 80 class scores)
         let (_shape, data) = outputs["output0"]
             .try_extract_tensor::<f32>()
-            .map_err(|e| crate::FancamError::inference(format!(
-                "Failed to extract YOLOv8 output tensor: {e}"
-            )))?;
+            .map_err(|e| {
+                crate::FancamError::inference(format!(
+                    "Failed to extract YOLOv8 output tensor: {e}"
+                ))
+            })?;
 
         // shape = [1, 84, 8400]
         // num_proposals = 8400, num_classes = 80
         const NUM_PROPOSALS: usize = 8400;
-        const NUM_CLASSES: usize = 80;
-
-        let scale_x = frame.width as f32 / YOLO_SIZE as f32;
-        let scale_y = frame.height as f32 / YOLO_SIZE as f32;
 
         let candidates: Vec<BBox> = (0..NUM_PROPOSALS)
             .into_par_iter()
@@ -211,24 +218,15 @@ impl Detector {
                 // Person score (class 0)
                 let person_score = data[(4 + PERSON_CLASS) * NUM_PROPOSALS + i];
 
-                // Best class score across all 80 classes
-                let mut max_score = 0f32;
-                for c in 0..NUM_CLASSES {
-                    let s = data[(4 + c) * NUM_PROPOSALS + i];
-                    if s > max_score {
-                        max_score = s;
-                    }
-                }
-
-                if person_score < CONF_THRESHOLD || person_score < max_score {
+                if person_score < CONF_THRESHOLD {
                     return None;
                 }
 
-                // Convert YOLO (cx,cy,w,h) in 640-space → (x1,y1,x2,y2) in original frame
-                let x1 = (cx - w / 2.0) * scale_x;
-                let y1 = (cy - h / 2.0) * scale_y;
-                let x2 = (cx + w / 2.0) * scale_x;
-                let y2 = (cy + h / 2.0) * scale_y;
+                // Convert YOLO (cx,cy,w,h) in 640-space back through letterbox map.
+                let x1 = (cx - w / 2.0 - yolo_map.pad_x) / yolo_map.scale;
+                let y1 = (cy - h / 2.0 - yolo_map.pad_y) / yolo_map.scale;
+                let x2 = (cx + w / 2.0 - yolo_map.pad_x) / yolo_map.scale;
+                let y2 = (cy + h / 2.0 - yolo_map.pad_y) / yolo_map.scale;
 
                 Some(BBox {
                     x1: x1.max(0.0),
@@ -243,23 +241,33 @@ impl Detector {
         Ok(nms(candidates, IOU_THRESHOLD))
     }
 
-    fn preprocess_yolo(&mut self, frame: &RgbFrame) -> Result<ort::value::DynValue> {
+    fn preprocess_yolo(&mut self, frame: &RgbFrame) -> Result<(ort::value::DynValue, YoloMap)> {
         // Use fast_image_resize with NEON SIMD for the large 4K → 640x640 downscale.
-        let src = fr::images::ImageRef::new(
-            frame.width,
-            frame.height,
-            &frame.data,
-            fr::PixelType::U8x3,
-        )
-        .map_err(|e| {
-            crate::FancamError::image_processing(format!(
-                "Failed to create fast_image_resize source: {e}"
-            ))
-        })?;
+        let src =
+            fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
+                .map_err(|e| {
+                    crate::FancamError::image_processing(format!(
+                        "Failed to create fast_image_resize source: {e}"
+                    ))
+                })?;
 
+        let scale = (YOLO_SIZE as f32 / frame.width as f32)
+            .min(YOLO_SIZE as f32 / frame.height as f32)
+            .max(1e-6);
+        let resize_w = (frame.width as f32 * scale)
+            .round()
+            .clamp(1.0, YOLO_SIZE as f32) as u32;
+        let resize_h = (frame.height as f32 * scale)
+            .round()
+            .clamp(1.0, YOLO_SIZE as f32) as u32;
+
+        let resized_len = (resize_w * resize_h * 3) as usize;
+        if self.yolo_resize_buf.len() != resized_len {
+            self.yolo_resize_buf.resize(resized_len, 0);
+        }
         let mut dst = fr::images::Image::from_vec_u8(
-            YOLO_SIZE,
-            YOLO_SIZE,
+            resize_w,
+            resize_h,
             std::mem::take(&mut self.yolo_resize_buf),
             fr::PixelType::U8x3,
         )
@@ -280,7 +288,25 @@ impl Detector {
             })?;
 
         self.yolo_resize_buf = dst.into_vec();
-        let raw = &self.yolo_resize_buf;
+
+        let letterbox_len = (YOLO_SIZE * YOLO_SIZE * 3) as usize;
+        if self.yolo_letterbox_buf.len() != letterbox_len {
+            self.yolo_letterbox_buf.resize(letterbox_len, 114);
+        }
+        self.yolo_letterbox_buf.fill(114);
+
+        let pad_x = ((YOLO_SIZE - resize_w) / 2) as usize;
+        let pad_y = ((YOLO_SIZE - resize_h) / 2) as usize;
+        let src_stride = resize_w as usize * 3;
+        let dst_stride = YOLO_SIZE as usize * 3;
+        for row in 0..resize_h as usize {
+            let src_start = row * src_stride;
+            let dst_start = (pad_y + row) * dst_stride + pad_x * 3;
+            self.yolo_letterbox_buf[dst_start..dst_start + src_stride]
+                .copy_from_slice(&self.yolo_resize_buf[src_start..src_start + src_stride]);
+        }
+
+        let raw = &self.yolo_letterbox_buf;
 
         // NCHW float tensor: [1, 3, 640, 640].
         let size = (YOLO_SIZE * YOLO_SIZE) as usize;
@@ -319,20 +345,26 @@ impl Detector {
             .map_err(|e| {
                 crate::FancamError::inference(format!("Failed to create YOLO input tensor: {e}"))
             })
+            .map(|tensor| {
+                (
+                    tensor,
+                    YoloMap {
+                        scale,
+                        pad_x: pad_x as f32,
+                        pad_y: pad_y as f32,
+                    },
+                )
+            })
     }
 
     fn downscale_frame(&mut self, frame: &RgbFrame, out_w: u32, out_h: u32) -> Result<RgbFrame> {
-        let src = fr::images::ImageRef::new(
-            frame.width,
-            frame.height,
-            &frame.data,
-            fr::PixelType::U8x3,
-        )
-        .map_err(|e| {
-            crate::FancamError::image_processing(format!(
-                "Failed to create detection downscale source: {e}"
-            ))
-        })?;
+        let src =
+            fr::images::ImageRef::new(frame.width, frame.height, &frame.data, fr::PixelType::U8x3)
+                .map_err(|e| {
+                    crate::FancamError::image_processing(format!(
+                        "Failed to create detection downscale source: {e}"
+                    ))
+                })?;
 
         let out_len = (out_w * out_h * 3) as usize;
         if self.downscale_buf.len() != out_len {
@@ -423,9 +455,11 @@ impl FaceEmbedder {
                 .to_fancam_err("ArcFace discovery session lock poisoned")?;
             let outputs = session
                 .run(ort::inputs!["input.1" => tensor])
-                .map_err(|e| crate::FancamError::inference(format!(
-                    "ArcFace discovery inference failed: {e}"
-                )))?;
+                .map_err(|e| {
+                    crate::FancamError::inference(format!(
+                        "ArcFace discovery inference failed: {e}"
+                    ))
+                })?;
             l2_normalize(&extract_first_embedding(&outputs)?)
         };
         Ok(Some(embedding))
@@ -461,9 +495,9 @@ impl FaceIdentifier {
 
         // Load and embed the reference image (assumed to be a face crop)
         let ref_img = image::open(&reference_image_path)
-            .map_err(|e| crate::FancamError::image_processing(format!(
-                "Failed to open reference image: {e}"
-            )))?
+            .map_err(|e| {
+                crate::FancamError::image_processing(format!("Failed to open reference image: {e}"))
+            })?
             .into_rgb8();
 
         let tensor = preprocess_face(&ref_img)?;
@@ -475,9 +509,11 @@ impl FaceIdentifier {
                 .to_fancam_err("ArcFace session lock poisoned")?;
             let outputs = session
                 .run(ort::inputs!["input.1" => tensor])
-                .map_err(|e| crate::FancamError::inference(format!(
-                    "ArcFace reference inference failed: {e}"
-                )))?;
+                .map_err(|e| {
+                    crate::FancamError::inference(format!(
+                        "ArcFace reference inference failed: {e}"
+                    ))
+                })?;
             let embedding = extract_first_embedding(&outputs)?;
             l2_normalize(&embedding)
         };
@@ -610,11 +646,12 @@ fn preprocess_face_data(img: &RgbImage) -> Result<Vec<f32>> {
 }
 
 fn preprocess_face_data_from_raw(width: u32, height: u32, raw_rgb: &[u8]) -> Result<Vec<f32>> {
-    let src = fr::images::ImageRef::new(width, height, raw_rgb, fr::PixelType::U8x3).map_err(|e| {
-        crate::FancamError::image_processing(format!(
-            "Failed to create face resize source: {e}"
-        ))
-    })?;
+    let src =
+        fr::images::ImageRef::new(width, height, raw_rgb, fr::PixelType::U8x3).map_err(|e| {
+            crate::FancamError::image_processing(format!(
+                "Failed to create face resize source: {e}"
+            ))
+        })?;
 
     // NCHW float tensor: [1, 3, 112, 112].
     // Use flat indexed access over raw bytes — avoids per-pixel Pixel overhead.
@@ -715,11 +752,9 @@ fn extract_first_embedding(outputs: &ort::session::SessionOutputs<'_>) -> Result
         .ok_or_else(|| crate::FancamError::inference("ArcFace produced no outputs"))?
         .1;
 
-    let (_shape, data) = first_value
-        .try_extract_tensor::<f32>()
-        .map_err(|e| crate::FancamError::inference(format!(
-            "Failed to extract ArcFace embedding tensor: {e}"
-        )))?;
+    let (_shape, data) = first_value.try_extract_tensor::<f32>().map_err(|e| {
+        crate::FancamError::inference(format!("Failed to extract ArcFace embedding tensor: {e}"))
+    })?;
 
     Ok(data.to_vec())
 }
@@ -812,12 +847,14 @@ fn nms(mut boxes: Vec<BBox>, iou_thresh: f32) -> Vec<BBox> {
 /// Returns an error if the frame dimensions are invalid.
 pub fn draw_boxes(frame: &mut RgbFrame, boxes: &[BBox], color: [u8; 3]) -> Result<()> {
     // Build the image from the existing buffer — no clone; we write back in-place.
-    let mut img: RgbImage = ImageBuffer::from_raw(frame.width, frame.height, std::mem::take(&mut frame.data))
-        .ok_or_else(|| crate::FancamError::invalid_frame(format!(
-            "Invalid frame dimensions: {}x{}",
-            frame.width,
-            frame.height
-        )))?;
+    let mut img: RgbImage =
+        ImageBuffer::from_raw(frame.width, frame.height, std::mem::take(&mut frame.data))
+            .ok_or_else(|| {
+                crate::FancamError::invalid_frame(format!(
+                    "Invalid frame dimensions: {}x{}",
+                    frame.width, frame.height
+                ))
+            })?;
 
     for bbox in boxes {
         let rect = Rect::at(bbox.x1 as i32, bbox.y1 as i32)
@@ -827,4 +864,88 @@ pub fn draw_boxes(frame: &mut RgbFrame, boxes: &[BBox], color: [u8; 3]) -> Resul
 
     frame.data = img.into_raw();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(width: u32, height: u32) -> RgbFrame {
+        RgbFrame {
+            data: vec![0u8; (width * height * 3) as usize],
+            width,
+            height,
+            pts: 0,
+        }
+    }
+
+    #[test]
+    fn nms_suppresses_overlap() {
+        let boxes = vec![
+            BBox {
+                x1: 10.0,
+                y1: 10.0,
+                x2: 110.0,
+                y2: 210.0,
+                confidence: 0.95,
+            },
+            BBox {
+                x1: 14.0,
+                y1: 15.0,
+                x2: 108.0,
+                y2: 212.0,
+                confidence: 0.91,
+            },
+            BBox {
+                x1: 300.0,
+                y1: 20.0,
+                x2: 360.0,
+                y2: 180.0,
+                confidence: 0.70,
+            },
+        ];
+        let kept = nms(boxes, 0.45);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|b| (b.x1 - 10.0).abs() < f32::EPSILON));
+        assert!(kept.iter().any(|b| (b.x1 - 300.0).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn face_crop_region_stays_in_bounds() {
+        let frame = frame(1920, 1080);
+        let bbox = BBox {
+            x1: 1810.0,
+            y1: 2.0,
+            x2: 1918.0,
+            y2: 620.0,
+            confidence: 0.88,
+        };
+        let (x, y, w, h) = face_crop_region(&frame, bbox);
+        assert!(x < frame.width);
+        assert!(y < frame.height);
+        assert!(w > 0 && h > 0);
+        assert!(x + w <= frame.width);
+        assert!(y + h <= frame.height);
+    }
+
+    #[test]
+    fn rank_candidate_bias_prefers_search_hint() {
+        let near = BBox {
+            x1: 95.0,
+            y1: 95.0,
+            x2: 145.0,
+            y2: 230.0,
+            confidence: 0.50,
+        };
+        let far = BBox {
+            x1: 500.0,
+            y1: 500.0,
+            x2: 560.0,
+            y2: 700.0,
+            confidence: 0.60,
+        };
+        let near_score = rank_candidate(near, Some((120.0, 150.0)));
+        let far_score = rank_candidate(far, Some((120.0, 150.0)));
+        assert!(near_score > far_score);
+    }
 }

@@ -260,3 +260,42 @@ impl Default for BiasTracker {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bbox(cx: f32, cy: f32, size: f32) -> BBox {
+        BBox {
+            x1: cx - size,
+            y1: cy - size,
+            x2: cx + size,
+            y2: cy + size,
+            confidence: 0.9,
+        }
+    }
+
+    #[test]
+    fn pre_lock_uses_stride() {
+        let mut tracker = BiasTracker::new();
+        assert!(tracker.should_run_recognition());
+        tracker.update(None);
+        assert!(!tracker.should_run_recognition());
+        tracker.update(None);
+        assert!(!tracker.should_run_recognition());
+        tracker.update(None);
+        assert!(tracker.should_run_recognition());
+    }
+
+    #[test]
+    fn reset_after_long_loss() {
+        let mut tracker = BiasTracker::new();
+        tracker.update(Some(bbox(100.0, 120.0, 40.0)));
+        let mut has_camera = true;
+        for _ in 0..=MAX_LOST_FRAMES {
+            has_camera = tracker.update(None).is_some();
+        }
+        assert!(!has_camera);
+        assert!(tracker.search_hint().is_none());
+    }
+}

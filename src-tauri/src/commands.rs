@@ -3,8 +3,9 @@ use std::{
     collections::HashSet,
     fs,
     io::Cursor,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -21,8 +22,8 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::task;
 
 use crate::{
-    CancelFlag, IdentityScanState, IdentityScanStore, QueueStore, QueueWorkerStore,
-    StorageWorkerStore, queue, storage,
+    CancelFlag, IdentityScanState, IdentityScanStore, QueueStore, QueueWorkerStore, RenderJobStore,
+    ScanCancelFlag, StorageWorkerStore, queue, storage,
 };
 
 // ─── DTO types ───────────────────────────────────────────────────────────────
@@ -80,6 +81,7 @@ pub struct IdentityScanCache {
     pub selected_identity_id: Option<usize>,
     pub selected_anchor_x: Option<f32>,
     pub selected_anchor_y: Option<f32>,
+    pub validated_threshold: Option<f32>,
     pub last_blockers: Vec<String>,
     pub updated_at_ms: u64,
     pub status: ScanSessionStatus,
@@ -129,6 +131,7 @@ pub struct ScanSessionDetail {
     pub selected_identity_id: Option<usize>,
     pub selected_anchor_x: Option<f32>,
     pub selected_anchor_y: Option<f32>,
+    pub validated_threshold: Option<f32>,
     pub last_blockers: Vec<String>,
     pub candidates: Vec<IdentityCandidatePayload>,
     pub duplicates: Vec<DuplicatePairPayload>,
@@ -174,6 +177,7 @@ pub struct ReviewDuplicateResolution {
 pub struct ValidateIdentityReviewArgs {
     pub scan_id: String,
     pub selected_identity_id: Option<usize>,
+    pub threshold: f32,
     pub excluded_identity_ids: Vec<usize>,
     pub accepted_low_confidence_ids: Vec<usize>,
     pub resolved_duplicates: Vec<ReviewDuplicateResolution>,
@@ -417,6 +421,18 @@ pub struct ProgressPayload {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct ScanProgressPayload {
+    pub sampled_frames: u64,
+    pub total_decoded_frames: u64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ScanDonePayload {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct JobResult {
     pub ok: bool,
     pub message: String,
@@ -468,14 +484,51 @@ pub async fn read_thumbnail(path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn scan_identities(
+    app: AppHandle,
     state: State<'_, IdentityScanStore>,
+    scan_cancel: State<'_, ScanCancelFlag>,
     args: IdentityScanArgs,
 ) -> Result<IdentityScanResult, String> {
+    {
+        let mut flag = scan_cancel.0.lock().map_err(|e| e.to_string())?;
+        *flag = false;
+    }
+
+    let app_for_scan = app.clone();
+    let cancel_flag = Arc::clone(&scan_cancel.0);
     let yolo_model = args.yolo_model.clone();
     let face_model = args.face_model.clone();
-    let scan_result = task::spawn_blocking(move || run_identity_scan(args))
-        .await
-        .map_err(|e| e.to_string())??;
+    let scan_result = task::spawn_blocking(move || {
+        run_identity_scan_with_hooks(
+            args,
+            move |sampled_frames, total_decoded_frames| {
+                let _ = app_for_scan.emit(
+                    "scan://progress",
+                    ScanProgressPayload {
+                        sampled_frames,
+                        total_decoded_frames,
+                    },
+                );
+            },
+            move || cancel_flag.lock().map(|v| *v).unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let scan_result = match scan_result {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = app.emit(
+                "scan://done",
+                ScanDonePayload {
+                    ok: false,
+                    message: err.clone(),
+                },
+            );
+            return Err(err);
+        }
+    };
 
     let mut lock = state.0.lock().map_err(|e| e.to_string())?;
     ensure_scan_store_loaded(&mut lock);
@@ -488,7 +541,15 @@ pub async fn scan_identities(
         &yolo_model,
         &face_model,
     );
-    persist_scan_store(&lock)?;
+    persist_scan_entry(&lock, &scan_id)?;
+
+    let _ = app.emit(
+        "scan://done",
+        ScanDonePayload {
+            ok: true,
+            message: "Identity scan complete".to_string(),
+        },
+    );
 
     Ok(IdentityScanResult {
         scan_id,
@@ -531,6 +592,7 @@ fn upsert_scan_cache(
             selected_identity_id: None,
             selected_anchor_x: None,
             selected_anchor_y: None,
+            validated_threshold: None,
             last_blockers: Vec::new(),
             updated_at_ms: now,
             status: ScanSessionStatus::Proposed,
@@ -611,6 +673,7 @@ fn scan_to_row(scan_id: &str, scan: &IdentityScanCache) -> Result<storage::ScanS
         selected_identity_id: scan.selected_identity_id.map(|v| v as i64),
         selected_anchor_x: scan.selected_anchor_x,
         selected_anchor_y: scan.selected_anchor_y,
+        validated_threshold: scan.validated_threshold,
         updated_at_ms: scan.updated_at_ms,
         candidates_json: serde_json::to_string(&scan.candidates)
             .map_err(|e| format!("failed to serialize candidates: {e}"))?,
@@ -647,6 +710,7 @@ fn row_to_scan(
         selected_identity_id: row.selected_identity_id.map(|v| v as usize),
         selected_anchor_x: row.selected_anchor_x,
         selected_anchor_y: row.selected_anchor_y,
+        validated_threshold: row.validated_threshold,
         last_blockers: serde_json::from_str(&row.last_blockers_json)
             .map_err(|e| format!("failed to deserialize blockers: {e}"))?,
         updated_at_ms: row.updated_at_ms,
@@ -728,6 +792,33 @@ fn persist_scan_store(state: &IdentityScanState) -> Result<(), String> {
             events,
         },
     )
+}
+
+fn persist_scan_entry(state: &IdentityScanState, scan_id: &str) -> Result<(), String> {
+    let Some(scan) = state.scans.get(scan_id) else {
+        return Ok(());
+    };
+    let session = scan_to_row(scan_id, scan)?;
+    let events = scan
+        .events
+        .iter()
+        .map(|event| storage::ScanSessionEventRow {
+            scan_id: scan_id.to_string(),
+            at_ms: event.at_ms,
+            action: event.action.clone(),
+            details: event.details.clone(),
+        })
+        .collect::<Vec<_>>();
+    storage::save_scan_row(
+        &storage::scan_store_db_path(),
+        state.next_id,
+        &session,
+        &events,
+    )
+}
+
+fn delete_scan_entries(scan_ids: &[String]) -> Result<(), String> {
+    storage::delete_scan_rows(&storage::scan_store_db_path(), scan_ids)
 }
 
 fn make_thumbnail(path: &str) -> Result<String, String> {
@@ -845,6 +936,18 @@ fn extract_video_frame(path: &str) -> Result<image::RgbImage, String> {
 }
 
 fn run_identity_scan(args: IdentityScanArgs) -> Result<IdentityScanResult, String> {
+    run_identity_scan_with_hooks(args, |_, _| {}, || false)
+}
+
+fn run_identity_scan_with_hooks<F, C>(
+    args: IdentityScanArgs,
+    mut on_progress: F,
+    mut should_cancel: C,
+) -> Result<IdentityScanResult, String>
+where
+    F: FnMut(u64, u64),
+    C: FnMut() -> bool,
+{
     // Configure ORT - ignore errors, will fail later if truly unavailable
     let _ = OrtConfig::discover();
 
@@ -853,7 +956,7 @@ fn run_identity_scan(args: IdentityScanArgs) -> Result<IdentityScanResult, Strin
 
     let base = DiscoveryConfig::default();
     let mut report = engine
-        .scan_video(&args.video, &base)
+        .scan_video_with_hooks(&args.video, &base, &mut on_progress, &mut should_cancel)
         .map_err(|e| format!("identity discovery failed: {e}"))?;
     let mut rescan_performed = false;
 
@@ -869,11 +972,13 @@ fn run_identity_scan(args: IdentityScanArgs) -> Result<IdentityScanResult, Strin
             sample_stride: base.sample_stride.saturating_div(2).max(4),
             max_sampled_frames: base.max_sampled_frames.saturating_mul(2),
             max_faces_per_frame: (base.max_faces_per_frame + 2).min(10),
-            cluster_similarity: (base.cluster_similarity + 0.02).min(0.86),
-            duplicate_similarity: (base.duplicate_similarity + 0.03).min(0.92),
+            // Avoid over-fragmenting identities during informed rescans.
+            cluster_similarity: (base.cluster_similarity - 0.02).max(0.68),
+            // Keep duplicate detection permissive enough to catch near-duplicate clusters.
+            duplicate_similarity: (base.duplicate_similarity - 0.01).max(0.80),
         };
         report = engine
-            .scan_video(&args.video, &informed)
+            .scan_video_with_hooks(&args.video, &informed, &mut on_progress, &mut should_cancel)
             .map_err(|e| format!("informed identity rescan failed: {e}"))?;
     }
 
@@ -949,20 +1054,41 @@ pub fn validate_identity_review(
     let accepted_low_confidence: HashSet<usize> =
         args.accepted_low_confidence_ids.iter().copied().collect();
     let mut resolved_pairs = HashSet::<(usize, usize)>::new();
+    let mut forced_excluded = HashSet::<usize>::new();
+    let mut invalid_resolution = 0usize;
     for pair in &args.resolved_duplicates {
         let left = pair.a.min(pair.b);
         let right = pair.a.max(pair.b);
         resolved_pairs.insert((left, right));
+        match pair.keep {
+            keep if keep == pair.a => {
+                forced_excluded.insert(pair.b);
+            }
+            keep if keep == pair.b => {
+                forced_excluded.insert(pair.a);
+            }
+            _ => {
+                invalid_resolution += 1;
+            }
+        }
     }
+    let mut effective_excluded = excluded.clone();
+    effective_excluded.extend(forced_excluded.iter().copied());
 
     let active_candidates = scan
         .candidates
         .iter()
-        .filter(|c| !excluded.contains(&c.id))
+        .filter(|c| !effective_excluded.contains(&c.id))
         .cloned()
         .collect::<Vec<_>>();
 
     let mut blockers = Vec::new();
+
+    if invalid_resolution > 0 {
+        blockers.push(format!(
+            "invalid duplicate resolution entries: {invalid_resolution}"
+        ));
+    }
 
     let expected = args.expected_member_count.or(scan.expected_count);
     if let Some(k) = expected
@@ -977,7 +1103,7 @@ pub fn validate_identity_review(
     let unresolved_duplicates = scan
         .duplicates
         .iter()
-        .filter(|d| !excluded.contains(&d.a) && !excluded.contains(&d.b))
+        .filter(|d| !effective_excluded.contains(&d.a) && !effective_excluded.contains(&d.b))
         .filter(|d| {
             let key = (d.a.min(d.b), d.a.max(d.b));
             !resolved_pairs.contains(&key)
@@ -1030,9 +1156,12 @@ pub fn validate_identity_review(
     scan.selected_identity_id = selected_identity_id;
     scan.selected_anchor_x = selected_anchor_x;
     scan.selected_anchor_y = selected_anchor_y;
+    scan.validated_threshold = Some(args.threshold.clamp(0.0, 1.0));
     scan.last_blockers = blockers.clone();
     scan.updated_at_ms = epoch_ms();
-    scan.excluded_identity_ids = args.excluded_identity_ids.clone();
+    let mut excluded_ids = effective_excluded.into_iter().collect::<Vec<_>>();
+    excluded_ids.sort_unstable();
+    scan.excluded_identity_ids = excluded_ids;
     scan.accepted_low_confidence_ids = args.accepted_low_confidence_ids.clone();
     scan.resolved_duplicate_keys = resolved_pairs.iter().copied().collect();
     scan.pending_split_ids = args.pending_split_ids.clone();
@@ -1048,16 +1177,17 @@ pub fn validate_identity_review(
         scan,
         "review_validated",
         format!(
-            "ready={} blockers={} selected={} splits={}",
+            "ready={} blockers={} selected={} splits={} threshold={:.2}",
             ready,
             scan.last_blockers.len(),
             selected_identity_id
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_string()),
-            scan.pending_split_ids.len()
+            scan.pending_split_ids.len(),
+            args.threshold.clamp(0.0, 1.0)
         ),
     );
-    persist_scan_store(&lock)?;
+    persist_scan_entry(&lock, &args.scan_id)?;
 
     Ok(IdentityReviewResult {
         ok: true,
@@ -1120,6 +1250,7 @@ pub fn get_identity_scan(
         selected_identity_id: scan.selected_identity_id,
         selected_anchor_x: scan.selected_anchor_x,
         selected_anchor_y: scan.selected_anchor_y,
+        validated_threshold: scan.validated_threshold,
         last_blockers: scan.last_blockers.clone(),
         candidates: scan.candidates.clone(),
         duplicates: scan.duplicates.clone(),
@@ -1142,11 +1273,17 @@ pub fn cleanup_identity_scans(
     let cutoff = epoch_ms().saturating_sub(ttl);
     let mut lock = state.0.lock().map_err(|e| e.to_string())?;
     ensure_scan_store_loaded(&mut lock);
-    let before = lock.scans.len();
-    lock.scans.retain(|_, scan| scan.updated_at_ms >= cutoff);
-    let removed = before.saturating_sub(lock.scans.len());
+    let removed_ids = lock
+        .scans
+        .iter()
+        .filter_map(|(scan_id, scan)| (scan.updated_at_ms < cutoff).then_some(scan_id.clone()))
+        .collect::<Vec<_>>();
+    for scan_id in &removed_ids {
+        lock.scans.remove(scan_id);
+    }
+    let removed = removed_ids.len();
     if removed > 0 {
-        persist_scan_store(&lock)?;
+        delete_scan_entries(&removed_ids)?;
     }
     Ok(removed)
 }
@@ -1786,7 +1923,7 @@ pub async fn enqueue_split_rescan_job(
                 ),
             );
         }
-        let _ = persist_scan_store(&scans);
+        let _ = persist_scan_entry(&scans, &scan_id);
     }
 
     Ok(enqueue_result)
@@ -1866,7 +2003,7 @@ async fn process_next_discovery_job_core(
                         &yolo_model,
                         &face_model,
                     );
-                    persist_scan_store(&scans)?;
+                    persist_scan_entry(&scans, &envelope.payload.scan_id)?;
                 }
                 let health = queue::sqs_health(&config).await?;
                 return Ok(queue::QueueProcessResult {
@@ -1961,7 +2098,7 @@ async fn process_next_discovery_job_core(
                 &yolo_model,
                 &face_model,
             );
-            persist_scan_store(&scans)?;
+            persist_scan_entry(&scans, &payload.scan_id)?;
 
             let queue = queue_store.lock().map_err(|e| e.to_string())?;
             Ok(queue::QueueProcessResult {
@@ -2073,6 +2210,10 @@ async fn process_next_rescan_job_core(
                         scan.duplicates = scan_result.duplicates;
                         scan.pending_split_ids.clear();
                         scan.review_ready = false;
+                        scan.selected_identity_id = None;
+                        scan.selected_anchor_x = None;
+                        scan.selected_anchor_y = None;
+                        scan.validated_threshold = None;
                         set_scan_status(scan, ScanSessionStatus::Proposed);
                         scan.last_blockers =
                             vec!["split rescan complete: please validate again".to_string()];
@@ -2083,7 +2224,7 @@ async fn process_next_rescan_job_core(
                             "candidates refreshed and review reset".to_string(),
                         );
                     }
-                    persist_scan_store(&scans)?;
+                    persist_scan_entry(&scans, &payload.scan_id)?;
                 }
                 let health = queue::sqs_health(&config).await?;
                 Ok(queue::QueueProcessResult {
@@ -2174,6 +2315,10 @@ async fn process_next_rescan_job_core(
                         scan.duplicates = scan_result.duplicates;
                         scan.pending_split_ids.clear();
                         scan.review_ready = false;
+                        scan.selected_identity_id = None;
+                        scan.selected_anchor_x = None;
+                        scan.selected_anchor_y = None;
+                        scan.validated_threshold = None;
                         set_scan_status(scan, ScanSessionStatus::Proposed);
                         scan.last_blockers =
                             vec!["split rescan complete: please validate again".to_string()];
@@ -2184,7 +2329,7 @@ async fn process_next_rescan_job_core(
                             "candidates refreshed and review reset".to_string(),
                         );
                     }
-                    persist_scan_store(&scans)?;
+                    persist_scan_entry(&scans, &payload.scan_id)?;
                 }
                 let queue = queue_store.lock().map_err(|e| e.to_string())?;
                 Ok(queue::QueueProcessResult {
@@ -2559,7 +2704,20 @@ pub async fn queue_peek_discovery_attempts(
 }
 
 #[tauri::command]
-pub async fn cancel_job(state: State<'_, CancelFlag>) -> Result<(), String> {
+pub async fn cancel_job(
+    state: State<'_, CancelFlag>,
+    render_state: State<'_, RenderJobStore>,
+) -> Result<(), String> {
+    let mut flag = state.0.lock().map_err(|e| e.to_string())?;
+    *flag = true;
+    if let Ok(mut status) = render_state.0.lock() {
+        status.cancelling = true;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_scan(state: State<'_, ScanCancelFlag>) -> Result<(), String> {
     let mut flag = state.0.lock().map_err(|e| e.to_string())?;
     *flag = true;
     Ok(())
@@ -2569,15 +2727,39 @@ pub async fn cancel_job(state: State<'_, CancelFlag>) -> Result<(), String> {
 pub async fn run_fancam(
     app: AppHandle,
     state: State<'_, CancelFlag>,
+    render_state: State<'_, RenderJobStore>,
     scan_state: State<'_, IdentityScanStore>,
-    args: FancamArgs,
+    mut args: FancamArgs,
 ) -> Result<JobResult, String> {
+    validate_fancam_paths(&args)?;
+
+    {
+        let mut job = render_state.0.lock().map_err(|e| e.to_string())?;
+        if job.running {
+            return Ok(JobResult {
+                ok: false,
+                message: if job.cancelling {
+                    "render cancellation is in progress; wait for stop to finish".to_string()
+                } else {
+                    "a render job is already running".to_string()
+                },
+                output_path: None,
+            });
+        }
+        job.running = true;
+        job.cancelling = false;
+    }
+
     let scan_id_for_state = args.scan_id.clone();
 
     if let Some(scan_id) = &scan_id_for_state {
         let mut lock = scan_state.0.lock().map_err(|e| e.to_string())?;
         ensure_scan_store_loaded(&mut lock);
         let Some(scan) = lock.scans.get_mut(scan_id) else {
+            if let Ok(mut job) = render_state.0.lock() {
+                job.running = false;
+                job.cancelling = false;
+            }
             return Ok(JobResult {
                 ok: false,
                 message: "identity validation session not found; rerun scan".to_string(),
@@ -2593,6 +2775,10 @@ pub async fn run_fancam(
                     scan.last_blockers.join("; ")
                 )
             };
+            if let Ok(mut job) = render_state.0.lock() {
+                job.running = false;
+                job.cancelling = false;
+            }
             return Ok(JobResult {
                 ok: false,
                 message: why,
@@ -2600,12 +2786,24 @@ pub async fn run_fancam(
             });
         }
         if args.selected_identity_id != scan.selected_identity_id {
+            if let Ok(mut job) = render_state.0.lock() {
+                job.running = false;
+                job.cancelling = false;
+            }
             return Ok(JobResult {
                 ok: false,
                 message: "selected identity does not match validated selection".to_string(),
                 output_path: None,
             });
         }
+
+        // Backend-owned validated values: never trust caller overrides.
+        args.threshold = scan
+            .validated_threshold
+            .unwrap_or(args.threshold)
+            .clamp(0.0, 1.0);
+        args.target_anchor_x = scan.selected_anchor_x;
+        args.target_anchor_y = scan.selected_anchor_y;
 
         set_scan_status(scan, ScanSessionStatus::Tracking);
         scan.updated_at_ms = epoch_ms();
@@ -2620,7 +2818,13 @@ pub async fn run_fancam(
                 args.output
             ),
         );
-        persist_scan_store(&lock)?;
+        if let Err(err) = persist_scan_entry(&lock, scan_id) {
+            if let Ok(mut job) = render_state.0.lock() {
+                job.running = false;
+                job.cancelling = false;
+            }
+            return Err(err);
+        }
     }
 
     {
@@ -2631,9 +2835,21 @@ pub async fn run_fancam(
     let cancel = Arc::clone(&state.0);
     let app2 = app.clone();
 
-    let result = task::spawn_blocking(move || run_pipeline(app2, cancel, args))
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = match task::spawn_blocking(move || run_pipeline(app2, cancel, args)).await {
+        Ok(result) => result,
+        Err(e) => {
+            if let Ok(mut job) = render_state.0.lock() {
+                job.running = false;
+                job.cancelling = false;
+            }
+            return Err(e.to_string());
+        }
+    };
+
+    if let Ok(mut job) = render_state.0.lock() {
+        job.running = false;
+        job.cancelling = false;
+    }
 
     match result {
         Ok(path) => {
@@ -2645,7 +2861,7 @@ pub async fn run_fancam(
                         scan.updated_at_ms = epoch_ms();
                         append_scan_event(scan, "tracking_completed", format!("output={path}"));
                     }
-                    let _ = persist_scan_store(&lock);
+                    let _ = persist_scan_entry(&lock, scan_id);
                 }
             }
             Ok(JobResult {
@@ -2663,7 +2879,7 @@ pub async fn run_fancam(
                         scan.updated_at_ms = epoch_ms();
                         append_scan_event(scan, "tracking_failed", e.to_string());
                     }
-                    let _ = persist_scan_store(&lock);
+                    let _ = persist_scan_entry(&lock, scan_id);
                 }
             }
             Ok(JobResult {
@@ -2676,6 +2892,71 @@ pub async fn run_fancam(
 }
 
 // ─── Pipeline (blocking) ─────────────────────────────────────────────────────
+
+fn canonical_for_compare(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn validate_fancam_paths(args: &FancamArgs) -> Result<(), String> {
+    let video_path = PathBuf::from(args.video.trim());
+    let bias_path = PathBuf::from(args.bias.trim());
+    let output_path = PathBuf::from(args.output.trim());
+    let yolo_model = PathBuf::from(args.yolo_model.trim());
+    let face_model = PathBuf::from(args.face_model.trim());
+
+    if !video_path.is_file() {
+        return Err(format!(
+            "input video not found: {}",
+            video_path.to_string_lossy()
+        ));
+    }
+    if !bias_path.is_file() {
+        return Err(format!(
+            "bias image not found: {}",
+            bias_path.to_string_lossy()
+        ));
+    }
+    if !yolo_model.is_file() {
+        return Err(format!(
+            "YOLO model not found: {}",
+            yolo_model.to_string_lossy()
+        ));
+    }
+    if !face_model.is_file() {
+        return Err(format!(
+            "face model not found: {}",
+            face_model.to_string_lossy()
+        ));
+    }
+
+    if output_path.as_os_str().is_empty() {
+        return Err("output path is empty".to_string());
+    }
+
+    let input_cmp = canonical_for_compare(&video_path);
+    let output_cmp = canonical_for_compare(&output_path);
+    if input_cmp == output_cmp {
+        return Err("output path must be different from input video path".to_string());
+    }
+
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| "output path has no parent directory".to_string())?;
+    if !parent.exists() {
+        return Err(format!(
+            "output directory does not exist: {}",
+            parent.to_string_lossy()
+        ));
+    }
+    if !parent.is_dir() {
+        return Err(format!(
+            "output parent is not a directory: {}",
+            parent.to_string_lossy()
+        ));
+    }
+
+    Ok(())
+}
 
 fn run_pipeline(
     app: AppHandle,
@@ -2705,6 +2986,9 @@ fn run_pipeline(
 
     let cancel_analyze = Arc::clone(&cancel);
     let cancel_render = Arc::clone(&cancel);
+    let mut last_progress_emit = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
 
     transcode_with_progress_staged(
         video_path,
@@ -2724,6 +3008,15 @@ fn run_pipeline(
             renderer.render(frame, camera);
         },
         |current, total| {
+            let now = Instant::now();
+            let is_last = total > 0 && current >= total;
+            let should_emit = current <= 1
+                || is_last
+                || now.duration_since(last_progress_emit) >= Duration::from_millis(180);
+            if !should_emit {
+                return;
+            }
+            last_progress_emit = now;
             let fraction = if total > 0 {
                 current as f64 / total as f64
             } else {
@@ -2739,6 +3032,10 @@ fn run_pipeline(
             );
         },
     )?;
+
+    if cancel.lock().map(|g| *g).unwrap_or(false) {
+        anyhow::bail!("render cancelled");
+    }
 
     let _ = app.emit(
         "fancam://done",
@@ -2760,12 +3057,13 @@ mod tests {
     };
 
     use super::{
-        DeleteDiagnosticsBundleArgs, ListDiagnosticsBundlesArgs, PruneDiagnosticsBundlesArgs,
-        QueryIdentityScansArgs, QueryScanEventsArgs, ReadDiagnosticsBundleArgs, ScanSessionStatus,
-        VerifyDiagnosticsBundleArgs, can_transition_status, delete_diagnostics_bundle,
-        diagnostics_hash_hex, diagnostics_manifest_path, list_diagnostics_bundles,
-        manifest_sha_for, prune_diagnostics_bundles, query_identity_scans, query_scan_events,
-        read_diagnostics_bundle, verify_diagnostics_bundle,
+        DeleteDiagnosticsBundleArgs, FancamArgs, ListDiagnosticsBundlesArgs,
+        PruneDiagnosticsBundlesArgs, QueryIdentityScansArgs, QueryScanEventsArgs,
+        ReadDiagnosticsBundleArgs, ScanSessionStatus, VerifyDiagnosticsBundleArgs,
+        can_transition_status, delete_diagnostics_bundle, diagnostics_hash_hex,
+        diagnostics_manifest_path, list_diagnostics_bundles, manifest_sha_for,
+        prune_diagnostics_bundles, query_identity_scans, query_scan_events,
+        read_diagnostics_bundle, validate_fancam_paths, verify_diagnostics_bundle,
     };
     use crate::storage;
 
@@ -2964,6 +3262,7 @@ mod tests {
                         selected_identity_id: Some(1),
                         selected_anchor_x: None,
                         selected_anchor_y: None,
+                        validated_threshold: Some(0.65),
                         updated_at_ms: now,
                         candidates_json: "[]".to_string(),
                         duplicates_json: "[]".to_string(),
@@ -2985,6 +3284,7 @@ mod tests {
                         selected_identity_id: None,
                         selected_anchor_x: None,
                         selected_anchor_y: None,
+                        validated_threshold: None,
                         updated_at_ms: now.saturating_sub(1),
                         candidates_json: "[]".to_string(),
                         duplicates_json: "[]".to_string(),
@@ -3006,6 +3306,7 @@ mod tests {
                         selected_identity_id: None,
                         selected_anchor_x: None,
                         selected_anchor_y: None,
+                        validated_threshold: None,
                         updated_at_ms: now.saturating_sub(2),
                         candidates_json: "[]".to_string(),
                         duplicates_json: "[]".to_string(),
@@ -3085,6 +3386,7 @@ mod tests {
                     selected_identity_id: Some(1),
                     selected_anchor_x: None,
                     selected_anchor_y: None,
+                    validated_threshold: Some(0.6),
                     updated_at_ms: now,
                     candidates_json: "[]".to_string(),
                     duplicates_json: "[]".to_string(),
@@ -3167,6 +3469,65 @@ mod tests {
             );
             assert!(!with_zero_offset.offset_ignored);
             assert!(with_large_offset.offset_ignored);
+        });
+    }
+
+    #[test]
+    fn fancam_preflight_rejects_same_input_output() {
+        with_temp_workspace(|dir| {
+            let video = dir.join("input.mp4");
+            let bias = dir.join("bias.jpg");
+            let yolo = dir.join("yolo.onnx");
+            let face = dir.join("face.onnx");
+            std::fs::write(&video, b"v").expect("write video");
+            std::fs::write(&bias, b"b").expect("write bias");
+            std::fs::write(&yolo, b"y").expect("write yolo");
+            std::fs::write(&face, b"f").expect("write face");
+
+            let args = FancamArgs {
+                video: video.to_string_lossy().into_owned(),
+                bias: bias.to_string_lossy().into_owned(),
+                output: video.to_string_lossy().into_owned(),
+                yolo_model: yolo.to_string_lossy().into_owned(),
+                face_model: face.to_string_lossy().into_owned(),
+                threshold: 0.6,
+                scan_id: None,
+                selected_identity_id: None,
+                target_anchor_x: None,
+                target_anchor_y: None,
+            };
+            let result = validate_fancam_paths(&args);
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn fancam_preflight_accepts_valid_paths() {
+        with_temp_workspace(|dir| {
+            let video = dir.join("input.mp4");
+            let bias = dir.join("bias.jpg");
+            let yolo = dir.join("yolo.onnx");
+            let face = dir.join("face.onnx");
+            let output = dir.join("out.mp4");
+            std::fs::write(&video, b"v").expect("write video");
+            std::fs::write(&bias, b"b").expect("write bias");
+            std::fs::write(&yolo, b"y").expect("write yolo");
+            std::fs::write(&face, b"f").expect("write face");
+
+            let args = FancamArgs {
+                video: video.to_string_lossy().into_owned(),
+                bias: bias.to_string_lossy().into_owned(),
+                output: output.to_string_lossy().into_owned(),
+                yolo_model: yolo.to_string_lossy().into_owned(),
+                face_model: face.to_string_lossy().into_owned(),
+                threshold: 0.6,
+                scan_id: None,
+                selected_identity_id: None,
+                target_anchor_x: None,
+                target_anchor_y: None,
+            };
+            let result = validate_fancam_paths(&args);
+            assert!(result.is_ok());
         });
     }
 }

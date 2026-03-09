@@ -11,6 +11,28 @@ use std::{
 #[derive(Default)]
 pub struct CancelFlag(pub Arc<Mutex<bool>>);
 
+/// Cancel flag shared with active identity scan jobs.
+#[derive(Default)]
+pub struct ScanCancelFlag(pub Arc<Mutex<bool>>);
+
+#[derive(Debug)]
+pub struct RenderJobState {
+    pub running: bool,
+    pub cancelling: bool,
+}
+
+#[derive(Default)]
+pub struct RenderJobStore(pub Arc<Mutex<RenderJobState>>);
+
+impl Default for RenderJobState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            cancelling: false,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct IdentityScanState {
     pub next_id: u64,
@@ -115,6 +137,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .manage(CancelFlag::default())
+        .manage(ScanCancelFlag::default())
+        .manage(RenderJobStore::default())
         .manage(IdentityScanStore::default())
         .manage(QueueStore::default())
         .manage(QueueWorkerStore::default())
@@ -152,6 +176,7 @@ pub fn run() {
             commands::queue_worker_status,
             commands::queue_worker_clear_events,
             commands::cancel_job,
+            commands::cancel_scan,
             commands::run_fancam,
         ])
         .run(tauri::generate_context!())
