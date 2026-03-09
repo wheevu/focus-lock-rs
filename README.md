@@ -13,119 +13,68 @@ It features a modular Rust core for high-speed video processing, a CLI for batch
 <img src="./src/ui.png" width=70%>
 </p>
 
-##  Features
+## Features
 
-*   **Person Detection**: Uses **YOLOv8-Nano** via ONNX Runtime for fast, accurate person detection.
-*   **Identity Locking**: Uses **ArcFace** (cosine similarity) to distinguish the specific target person from others in the frame.
-    *   Uses your configured `--threshold` value end-to-end (CLI + GUI).
-    *   Adds relock bias from last known position and adaptive recognition stride for better stability under occlusion.
-*   **Identity Discovery Pass (GUI)**:
-    *   Scans sampled frames first and proposes member thumbnails before tracking begins.
-    *   Supports expected-member-count input and automatic informed rescan when duplicates/count mismatch are detected.
-    *   Adds manual validation controls (`exclude`, duplicate resolve, low-confidence confirm) before enabling render.
-    *   Lets you choose a target member card; the selected anchor is used as an extra tracking prior alongside the bias image.
-    *   Persists scan sessions in the Tauri backend and validates review state server-side before allowing render.
-    *   `run_fancam` now enforces validated scan session + selected identity match server-side (not only UI-side).
-    *   Scan sessions now track lifecycle state (`proposed`, `validated`, `tracking`, `completed`, `failed`) with audit events.
-    *   Adds manual split requests per identity and a split-rescan queue path to refresh candidate clustering.
-*   **Cinematic Smoothing**: Implements a **2D Kalman Filter** to smooth camera movements, preventing jittery tracking and simulating a professional camera operator.
-*   **Performance-First Pipeline**:
-    *   3-thread decode/inference/encode pipeline with bounded channels.
-    *   Recognition throttling before and after lock-on to avoid CPU stalls (adaptive while locked).
-    *   Caps ArcFace identity checks to top-confidence person candidates per frame.
-    *   Speeds up large-video processing with detection downscale, parallel tensor prep, and fast SIMD face preprocessing.
-    *   Reuses rendering buffers/resizer state to reduce per-frame allocations.
-    *   Emits periodic per-stage timing logs (`detect`, `identify`, `render`) for targeted profiling.
-*   **Smart Rendering**:
-    *   Automated 1080x1920 cropping.
-    *   SIMD-accelerated resize path (`fast_image_resize`) for crop and letterbox operations.
-    *   Lanczos3 upscaling for distant subjects.
-    *   Fallback letterboxing when the target is lost/occluded.
-*   **Cross-Platform**: Runs on Windows, macOS, and Linux.
+- **Person detection + identity lock** — YOLOv8 for detection, ArcFace for target matching
+- **Smooth tracking** — Kalman-filtered motion for less jitter and more stable framing
+- **Identity discovery (GUI)** — candidate scan and manual validation before render
+- **Performance-first pipeline** — threaded video pipeline with optimized preprocessing and rendering
+- **Smart output** — automatic 1080x1920 crop with fallback handling for occlusion or target loss
+- **Desktop + CLI** — Tauri app for interactive use, CLI for direct batch processing
 
 ##  Architecture
 
-The project is organized as a Cargo workspace:
+This project is organized as a Cargo workspace:
 
-*   **`fancam-core/`**: The engine. Handles FFmpeg transcoding, ONNX inference, Kalman tracking, and image processing.
-*   **`cli/`**: A command-line interface wrapper for the core engine.
-*   **`src-tauri/`** & **`ui/`**: The Desktop application built with Tauri 2 and Svelte 5.
+- **`fancam-core/`** — Rust engine for detection, identity matching, tracking, and rendering
+- **`cli/`** — command-line interface for batch and scripted workflows
+- **`src-tauri/` + `ui/`** — Tauri desktop app with a Svelte frontend
 
 ##  Logic Flow
 
-1.  **Decode**: FFmpeg decodes the video stream into RGB frames.
-2.  **Detect**: YOLOv8 runs inference on the frame to find all "Person" bounding boxes.
-3.  **Identify**: The system crops faces from top-confidence person boxes and compares their embeddings against the reference "bias" image using ArcFace.
-4.  **Track**:
-    *   If the target is found, the Kalman filter updates position and velocity.
-    *   Recognition runs at a stride (before and after lock-on) to reduce CPU load.
-    *   If occluded, the filter predicts the position based on previous momentum.
-5.  **Render**: The frame is cropped to the smoothed coordinates and re-encoded to H.264.
+1. **Decode** video frames with FFmpeg
+2. **Detect** people with YOLOv8
+3. **Match** the target identity with ArcFace
+4. **Track** motion across frames with Kalman smoothing
+5. **Render** a stabilized vertical crop to H.264
 
 <p align=center>
 <img src="./src/process.png" width=70%>
 <img src="./src/output.png" width=70%>
 </p>
-##  Prerequisites
 
-To build and run this project, you need:
+## Prerequisites
 
-1.  **Rust**: Stable toolchain ([Install](https://rustup.rs/)).
-2.  **Node.js**: Required for the UI build steps.
-3.  **FFmpeg Libraries**: The project links against FFmpeg native libraries.
-    *   **Ubuntu/Debian**: `sudo apt install libavutil-dev libavformat-dev libavcodec-dev libswscale-dev`
-    *   **macOS**: `brew install ffmpeg`
-    *   **Windows**: Set `FFMPEG_DIR` environment variable to your FFmpeg shared build.
+- **Rust** stable toolchain
+- **Node.js** for the desktop UI
+- **FFmpeg** native libraries installed on your system
+- ONNX models for **YOLOv8 Nano** and **ArcFace / MobileFaceNet**
 
-##  Installation & Setup
+## Setup
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/your-username/focus-lock-rs.git
-    cd focus-lock-rs
-    ```
-
-2.  **Download Models:**
-    Create a `models/` directory in the root and download the following ONNX models:
-    *   `yolov8n.onnx` (YOLOv8 Nano)
-    *   `w600k_mbf.onnx` (MobileFaceNet / ArcFace)
-
-3.  **Build the CLI:**
-    ```bash
-    cargo build --release -p cli
-    ```
+```bash
+git clone https://github.com/your-username/focus-lock-rs.git
+cd focus-lock-rs
+cargo build --release -p cli
+```
+Create a `models/` directory in the project root and add:
+- `yolov8n.onnx`
+- `w600k_mbf.onnx`
 
 ## Desktop Application (GUI)
 
+```bash
+cd ui
+npm install
+npm run tauri:dev
+```
+For a production build:
+```bash
+npm run tauri:build
+```
 
-1.  **Install frontend dependencies:**
-    ```bash
-    cd ui
-    npm install
-    ```
-
-2.  **Run in Development Mode:**
-    ```bash
-    npm run tauri:dev
-    ```
-
-    For near-production processing speed while iterating UI, use:
-    ```bash
-    npm run tauri:dev:release
-    ```
-
-3.  **Build for Production:**
-    ```bash
-    npm run tauri:build
-    ```
-    The executable will be located in `src-tauri/target/release/bundle/`.
-
-##  CLI Usage
-
-The CLI provides direct access to the pipeline phases.
-
-### Generate a Fancam
-The primary command. It performs detection, identification, tracking, and rendering in one pass.
+##  CLI
+Generate a fancam from a landscape video and reference image:
 
 ```bash
 cargo run --release -p cli -- fancam \
@@ -136,3 +85,112 @@ cargo run --release -p cli -- fancam \
   --face-model "models/w600k_mbf.onnx" \
   --threshold 0.6
 ```
+
+## License
+MIT
+
+<details>
+<summary><strong>Tracking, performance, and GUI details</strong></summary>
+
+## Tracking and identity locking
+
+The pipeline combines **person detection** and **face recognition** to keep the crop locked onto a specific subject rather than just the most visible person in frame.
+
+- **YOLOv8-Nano** detects person bounding boxes efficiently through ONNX Runtime
+- **ArcFace** compares cropped face embeddings against the provided reference image using cosine similarity
+- the configured `--threshold` value is used consistently across both CLI and GUI workflows
+- tracking includes **relock bias** from the last known position to improve recovery after brief occlusion
+- identity checks are throttled adaptively once lock-on is established to reduce unnecessary compute
+
+This makes the tracker more stable in crowded performance footage where multiple people may appear and disappear across frames.
+
+## Identity discovery pass (GUI)
+
+The desktop app includes a pre-tracking discovery flow designed to make target selection more reliable before rendering begins.
+
+- sampled frames are scanned first to propose likely identity candidates
+- the UI can accept an **expected member count** and trigger a smarter rescan if duplicates or count mismatches are detected
+- users can manually review candidates before rendering:
+  - exclude false positives
+  - resolve duplicates
+  - confirm low-confidence matches
+- once validated, the selected member card is used as an additional tracking prior alongside the reference image
+
+The Tauri backend persists scan sessions and validates review state server-side before allowing a render to begin.
+
+## Scan session lifecycle
+
+To make the review and render flow more robust, scan sessions track explicit lifecycle states:
+
+- `proposed`
+- `validated`
+- `tracking`
+- `completed`
+- `failed`
+
+Audit events are recorded through the session lifecycle, and `run_fancam` enforces that a validated session and selected identity match exist on the backend side, not just in the UI.
+
+The GUI also supports **manual split requests per identity**, with a split-rescan path that refreshes candidate clustering when the initial grouping is not clean enough.
+
+## Smoothing and motion stability
+
+To avoid shaky or jumpy crops, the render path uses a **2D Kalman filter** to smooth subject motion across frames.
+
+This helps with:
+- reducing abrupt camera jumps
+- keeping the framing more natural
+- preserving momentum when the target is briefly lost
+- simulating the feel of a human camera operator rather than a raw detector box snap
+
+If the subject becomes occluded, the filter predicts the next likely position based on previous motion until visual confirmation is regained.
+
+## Performance pipeline
+
+The core processing path is built around a **3-thread decode / inference / encode pipeline** with bounded channels.
+
+Performance-oriented behavior includes:
+
+- recognition throttling before and after lock-on to reduce CPU stalls
+- capping ArcFace checks to top-confidence person candidates per frame
+- detection downscale for faster large-video processing
+- parallel tensor preparation where possible
+- fast SIMD face preprocessing
+- render buffer and resizer reuse to reduce per-frame allocations
+- periodic per-stage timing logs for `detect`, `identify`, and `render`
+
+These optimizations are aimed at keeping the pipeline responsive and practical for longer videos without turning the whole thing into a heater-core cosplay.
+
+## Rendering behavior
+
+Rendering is optimized for vertical fancam output while remaining resilient when tracking quality changes.
+
+- automatic **1080x1920** framing for vertical output
+- SIMD-accelerated resize path with `fast_image_resize`
+- **Lanczos3** upscaling when the subject is distant in frame
+- fallback **letterboxing** when the target is lost or visibility drops too far
+
+This keeps output usable even when the tracker cannot confidently maintain a tight crop for every frame.
+
+## Interfaces
+
+The project supports two main usage paths:
+
+### Desktop app
+The Tauri desktop application is intended for interactive use:
+- scan identities visually
+- validate candidates
+- select a target
+- run render jobs without touching the command line
+
+### CLI
+The CLI is better suited for:
+- direct runs
+- repeated experiments
+- scripting and batch workflows
+- debugging model thresholds and pipeline behavior
+
+## Cross-platform scope
+
+The project is designed to run across **Windows, macOS, and Linux**, with a shared Rust processing core and a Tauri-based desktop frontend.
+
+</details>
