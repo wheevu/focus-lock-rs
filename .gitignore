@@ -11,3 +11,4 @@ ui/node_modules
 ui/dist
 ui/.svelte-kit
 
+.DS_Store
