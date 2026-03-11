@@ -53,7 +53,7 @@ This project is organized as a Cargo workspace:
 ## Setup
 
 ```bash
-git clone https://github.com/your-username/focus-lock-rs.git
+git clone https://github.com/wheevu/focus-lock-rs.git
 cd focus-lock-rs
 cargo build --release -p cli
 ```
