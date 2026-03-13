@@ -60,6 +60,9 @@ cargo build --release -p cli
 Create a `models/` directory in the project root and add:
 - `yolov8n.onnx`
 - `w600k_mbf.onnx`
+- `osnet_x0_25_msmt17.onnx` *(optional but recommended for harder multi-person tracking / occlusion recovery)*
+
+For macOS, ensure a CoreML-enabled `libonnxruntime.dylib` is available at `models/onnxruntime/lib/` (or set `ORT_DYLIB_PATH`).
 
 ## Desktop Application (GUI)
 
