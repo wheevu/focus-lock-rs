@@ -5,6 +5,10 @@
 *.avi
 *.pt
 *.zip
+*.dSYM/
+
+# runtime/debug symbol artifacts
+models/onnxruntime/lib/*.dSYM/
 
 # frontend
 ui/node_modules
