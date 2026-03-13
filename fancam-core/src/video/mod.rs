@@ -18,11 +18,15 @@ use ffmpeg_next::{
     codec, encoder, format, frame, media, software::scaling, util::rational::Rational,
 };
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::tracking::CameraState;
+use crate::{mode::ProcessingMode, tracking::CameraState};
 
 /// Output pixel format for the encoder (YUV420p is universally compatible).
 const ENCODE_FORMAT: format::Pixel = format::Pixel::YUV420P;
@@ -83,9 +87,11 @@ where
         input_path,
         output_path,
         0,
+        Arc::new(AtomicBool::new(false)),
         |_frame| None,
         move |frame, _camera| frame_fn(frame),
         |_, _| {},
+        ProcessingMode::default(),
     )
 }
 
@@ -109,9 +115,11 @@ where
         input_path,
         output_path,
         total,
+        Arc::new(AtomicBool::new(false)),
         |_frame| None,
         move |frame, _camera| frame_fn(frame),
         progress_fn,
+        ProcessingMode::default(),
     )
 }
 
@@ -131,13 +139,45 @@ where
     R: FnMut(&mut RgbFrame, Option<CameraState>) + Send + 'static,
     G: FnMut(u64, u64),
 {
+    transcode_with_progress_staged_mode(
+        input_path,
+        output_path,
+        total,
+        Arc::new(AtomicBool::new(false)),
+        analyze_fn,
+        render_fn,
+        ProcessingMode::default(),
+        progress_fn,
+    )
+}
+
+/// Staged variant with explicit processing mode tuning.
+pub fn transcode_with_progress_staged_mode<P, Q, A, R, G>(
+    input_path: P,
+    output_path: Q,
+    total: u64,
+    cancel_flag: Arc<AtomicBool>,
+    analyze_fn: A,
+    render_fn: R,
+    mode: ProcessingMode,
+    progress_fn: G,
+) -> Result<()>
+where
+    P: AsRef<Path> + Send + 'static,
+    Q: AsRef<Path>,
+    A: FnMut(&RgbFrame) -> Option<CameraState> + Send + 'static,
+    R: FnMut(&mut RgbFrame, Option<CameraState>) + Send + 'static,
+    G: FnMut(u64, u64),
+{
     transcode_inner(
         input_path,
         output_path,
         total,
+        cancel_flag,
         analyze_fn,
         render_fn,
         progress_fn,
+        mode,
     )
 }
 
@@ -145,9 +185,11 @@ fn transcode_inner<P, Q, A, R, G>(
     input_path: P,
     output_path: Q,
     total: u64,
+    cancel_flag: Arc<AtomicBool>,
     analyze_fn: A,
     render_fn: R,
     mut progress_fn: G,
+    mode: ProcessingMode,
 ) -> Result<()>
 where
     P: AsRef<Path> + Send + 'static,
@@ -226,7 +268,8 @@ where
         .format()
         .flags()
         .contains(format::flag::Flags::GLOBAL_HEADER);
-    let encoder_codec = encoder::find(codec::Id::H264)
+    let encoder_codec = select_h264_encoder(mode)
+        .or_else(|| encoder::find(codec::Id::H264))
         .context("H.264 encoder not found — is FFmpeg built with libx264?")?;
 
     // Pre-create the audio output stream (stream-copy) so stream indices are
@@ -250,6 +293,10 @@ where
     };
 
     // ── Thread A: decode ──────────────────────────────────────────────────────
+    let decode_cancel = Arc::clone(&cancel_flag);
+    let analyze_cancel = Arc::clone(&cancel_flag);
+    let render_cancel = Arc::clone(&cancel_flag);
+
     let thread_a = std::thread::spawn(move || -> Result<()> {
         let mut to_rgb = scaling::Context::get(
             src_pixel_fmt,
@@ -267,6 +314,9 @@ where
 
         let mut send_video = |dec: &mut ffmpeg_next::decoder::Video| -> Result<()> {
             while dec.receive_frame(&mut decoded_frame).is_ok() {
+                if decode_cancel.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 to_rgb
                     .run(&decoded_frame, &mut rgb_frame)
                     .context("to-RGB scaling failed")?;
@@ -298,13 +348,22 @@ where
                         height: src_height,
                         pts,
                     })
-                    // Receiver dropped (encode thread exited early due to error)
-                    .map_err(|_| anyhow::anyhow!("video_raw channel closed"))?;
+                    .map_err(|_| anyhow::anyhow!("video_raw channel closed"))
+                    .or_else(|err| {
+                        if decode_cancel.load(Ordering::Relaxed) {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
+                    })?;
             }
             Ok(())
         };
 
         for (stream, packet) in ictx.packets() {
+            if decode_cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let stream_index = stream.index();
 
             // Route audio packets as plain data structs
@@ -351,10 +410,20 @@ where
     let thread_b1 = std::thread::spawn(move || -> Result<()> {
         let mut analyze_fn = analyze_fn;
         for frame in video_raw_rx {
+            if analyze_cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let camera = analyze_fn(&frame);
             video_analyzed_tx
                 .send((frame, camera))
-                .map_err(|_| anyhow::anyhow!("video_analyzed channel closed"))?;
+                .map_err(|_| anyhow::anyhow!("video_analyzed channel closed"))
+                .or_else(|err| {
+                    if analyze_cancel.load(Ordering::Relaxed) {
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                })?;
         }
         Ok(())
     });
@@ -363,10 +432,20 @@ where
     let thread_b2 = std::thread::spawn(move || -> Result<()> {
         let mut render_fn = render_fn;
         for (mut frame, camera) in video_analyzed_rx {
+            if render_cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             render_fn(&mut frame, camera);
             video_xfm_tx
                 .send(frame)
-                .map_err(|_| anyhow::anyhow!("video_xfm channel closed"))?;
+                .map_err(|_| anyhow::anyhow!("video_xfm channel closed"))
+                .or_else(|err| {
+                    if render_cancel.load(Ordering::Relaxed) {
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                })?;
         }
         Ok(())
     });
@@ -389,6 +468,7 @@ where
     // Pre-allocate with reasonable capacity to avoid reallocations.
     let mut audio_buffer: Vec<AudioPacket> = Vec::with_capacity(64);
     let mut frame_count = 0u64;
+    let mut pipeline_error: Option<anyhow::Error> = None;
     // Wall-clock start for throughput / ETA logging.
     let encode_start = Instant::now();
 
@@ -433,7 +513,14 @@ where
     }
 
     for mut frame in video_xfm_rx {
-        drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written)?;
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(err) = drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written) {
+            cancel_flag.store(true, Ordering::Relaxed);
+            pipeline_error = Some(err.into());
+            break;
+        }
 
         let out_w = frame.width;
         let out_h = frame.height;
@@ -454,17 +541,23 @@ where
                 video_encoder_builder.set_flags(codec::flag::Flags::GLOBAL_HEADER);
             }
 
-            let video_encoder = video_encoder_builder
-                .open_as_with(
-                    encoder_codec,
-                    ffmpeg_next::Dictionary::from_iter([("crf", "18"), ("preset", "veryfast")]),
-                )
-                .context("failed to open H.264 encoder")?;
+            let encode_opts = encoder_options(mode);
+            let video_encoder = match video_encoder_builder
+                .open_as_with(encoder_codec, encode_opts)
+                .context("failed to open H.264 encoder")
+            {
+                Ok(encoder) => encoder,
+                Err(err) => {
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    pipeline_error = Some(err);
+                    break;
+                }
+            };
 
             video_out_stream.set_parameters(&video_encoder);
             let video_out_index = video_out_stream.index();
 
-            let to_yuv = scaling::Context::get(
+            let to_yuv = match scaling::Context::get(
                 format::Pixel::RGB24,
                 out_w,
                 out_h,
@@ -473,20 +566,42 @@ where
                 out_h,
                 SCALE_FLAGS,
             )
-            .context("failed to create to-YUV scaler")?;
+            .context("failed to create to-YUV scaler")
+            {
+                Ok(context) => context,
+                Err(err) => {
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    pipeline_error = Some(err);
+                    break;
+                }
+            };
 
             info!(out_w, out_h, "output dimensions determined; writing header");
             format::context::output::dump(&octx, 0, output_path.as_ref().to_str());
-            octx.write_header()
-                .context("failed to write output header")?;
+            if let Err(err) = octx.write_header().context("failed to write output header") {
+                cancel_flag.store(true, Ordering::Relaxed);
+                pipeline_error = Some(err);
+                break;
+            }
             header_written = true;
 
             // Flush all audio that arrived before the header
             for ap in audio_buffer.drain(..) {
-                write_audio_packet(&mut octx, &ap)?;
+                if let Err(err) = write_audio_packet(&mut octx, &ap) {
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    pipeline_error = Some(err);
+                    break;
+                }
+            }
+            if pipeline_error.is_some() {
+                break;
             }
             // Drain any audio that arrived during header setup
-            drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written)?;
+            if let Err(err) = drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written) {
+                cancel_flag.store(true, Ordering::Relaxed);
+                pipeline_error = Some(err.into());
+                break;
+            }
 
             enc_state = Some(EncoderState {
                 video_encoder,
@@ -518,24 +633,38 @@ where
         }
 
         // RGB24 → YUV420P
-        state
+        if let Err(err) = state
             .to_yuv
             .run(&state.out_rgb_frame, &mut state.yuv_frame)
-            .context("to-YUV scaling failed")?;
+            .context("to-YUV scaling failed")
+        {
+            cancel_flag.store(true, Ordering::Relaxed);
+            pipeline_error = Some(err);
+            break;
+        }
 
         state.yuv_frame.set_pts(Some(pts));
 
-        state
+        if let Err(err) = state
             .video_encoder
             .send_frame(&state.yuv_frame)
-            .context("encoder send_frame")?;
+            .context("encoder send_frame")
+        {
+            cancel_flag.store(true, Ordering::Relaxed);
+            pipeline_error = Some(err);
+            break;
+        }
 
-        flush_encoder(
+        if let Err(err) = flush_encoder(
             &mut state.video_encoder,
             &mut octx,
             state.video_out_index,
             video_time_base,
-        )?;
+        ) {
+            cancel_flag.store(true, Ordering::Relaxed);
+            pipeline_error = Some(err);
+            break;
+        }
 
         frame_count += 1;
 
@@ -584,15 +713,25 @@ where
     }
 
     // Join threads and propagate any errors
-    thread_a
+    let decode_result = thread_a
         .join()
-        .map_err(|_| anyhow::anyhow!("decode thread panicked"))??;
-    thread_b1
+        .map_err(|_| anyhow::anyhow!("decode thread panicked"))?;
+    let analyze_result = thread_b1
         .join()
-        .map_err(|_| anyhow::anyhow!("analysis thread panicked"))??;
-    thread_b2
+        .map_err(|_| anyhow::anyhow!("analysis thread panicked"))?;
+    let render_result = thread_b2
         .join()
-        .map_err(|_| anyhow::anyhow!("render thread panicked"))??;
+        .map_err(|_| anyhow::anyhow!("render thread panicked"))?;
+
+    if let Some(err) = pipeline_error {
+        return Err(err);
+    }
+    decode_result?;
+    analyze_result?;
+    render_result?;
+    if cancel_flag.load(Ordering::Relaxed) {
+        anyhow::bail!("transcode cancelled");
+    }
 
     let state = enc_state
         .as_mut()
@@ -617,6 +756,30 @@ where
 
     info!(frame_count, "transcode complete");
     Ok(())
+}
+
+fn encoder_options(mode: ProcessingMode) -> ffmpeg_next::Dictionary<'static> {
+    match mode {
+        ProcessingMode::Fast => {
+            ffmpeg_next::Dictionary::from_iter([("preset", "ultrafast"), ("crf", "23")])
+        }
+        ProcessingMode::Balanced => {
+            ffmpeg_next::Dictionary::from_iter([("preset", "veryfast"), ("crf", "20")])
+        }
+        ProcessingMode::Quality => {
+            ffmpeg_next::Dictionary::from_iter([("preset", "medium"), ("crf", "18")])
+        }
+    }
+}
+
+fn select_h264_encoder(mode: ProcessingMode) -> Option<ffmpeg_next::Codec> {
+    if mode == ProcessingMode::Fast
+        && let Some(codec) = encoder::find_by_name("h264_videotoolbox")
+    {
+        info!(encoder = codec.name(), "using fast hardware H.264 encoder");
+        return Some(codec);
+    }
+    None
 }
 
 /// Drain all pending packets from the encoder and write them to the muxer.
@@ -679,7 +842,11 @@ pub fn total_frames<P: AsRef<Path>>(input_path: P) -> u64 {
     0
 }
 
-fn open_input_with_hwaccel<P: AsRef<Path>>(input_path: P) -> Result<format::context::Input> {
+/// Open an input file while hinting hardware decode when available.
+///
+/// This attempts to open with macOS VideoToolbox first and falls back to
+/// default FFmpeg input opening when the hint cannot be applied.
+pub fn open_input_with_hwaccel<P: AsRef<Path>>(input_path: P) -> Result<format::context::Input> {
     let dict = ffmpeg_next::Dictionary::from_iter([("hwaccel", "videotoolbox")]);
     match format::input_with_dictionary(&input_path, dict) {
         Ok(ctx) => {

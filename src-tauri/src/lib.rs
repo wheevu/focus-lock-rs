@@ -4,16 +4,14 @@ pub mod storage;
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 /// Cancel flag shared with the active fancam job.
-#[derive(Default)]
-pub struct CancelFlag(pub Arc<Mutex<bool>>);
+pub struct CancelFlag(pub Arc<AtomicBool>);
 
 /// Cancel flag shared with active identity scan jobs.
-#[derive(Default)]
-pub struct ScanCancelFlag(pub Arc<Mutex<bool>>);
+pub struct ScanCancelFlag(pub Arc<AtomicBool>);
 
 #[derive(Debug)]
 pub struct RenderJobState {
@@ -23,6 +21,18 @@ pub struct RenderJobState {
 
 #[derive(Default)]
 pub struct RenderJobStore(pub Arc<Mutex<RenderJobState>>);
+
+impl Default for CancelFlag {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+}
+
+impl Default for ScanCancelFlag {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+}
 
 impl Default for RenderJobState {
     fn default() -> Self {

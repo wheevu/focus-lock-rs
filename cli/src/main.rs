@@ -104,8 +104,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    // Configure ORT - ignore errors, will fail later if truly unavailable
-    let _ = OrtConfig::discover();
+    OrtConfig::ensure_initialized().context("failed to initialize ONNX Runtime")?;
 
     let cli = Cli::parse();
 

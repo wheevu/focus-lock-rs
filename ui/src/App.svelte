@@ -18,6 +18,7 @@
     anchor_x: number;
     anchor_y: number;
     thumbnail_data_url: string;
+    embedding?: number[];
   };
 
   type DuplicatePair = {
@@ -34,9 +35,13 @@
     sampled_frames: number;
     total_decoded_frames: number;
     proposed_count: number;
+    processing_mode: string;
     expected_count?: number;
     rescan_performed: boolean;
     needs_review: boolean;
+    rejected_embeddings: number;
+    suppressed_clusters: number;
+    merged_clusters: number;
     candidates: IdentityCandidate[];
     duplicates: DuplicatePair[];
   };
@@ -117,6 +122,7 @@
     video: string;
     status: 'proposed' | 'validated' | 'tracking' | 'completed' | 'failed';
     expected_count?: number;
+    processing_mode: string;
     review_ready: boolean;
     selected_identity_id?: number;
     selected_anchor_x?: number;
@@ -127,7 +133,7 @@
     duplicates: DuplicatePair[];
     excluded_identity_ids: number[];
     accepted_low_confidence_ids: number[];
-    resolved_duplicate_keys: [number, number][];
+    resolved_duplicates: { a: number; b: number; keep: number }[];
     pending_split_ids: number[];
     updated_at_ms: number;
     event_count: number;
@@ -225,9 +231,38 @@
   };
 
   type ScanProgressPayload = {
+    run_id: string;
     sampled_frames: number;
     total_decoded_frames: number;
+    estimated_total_samples: number;
+    pass_fraction: number;
+    overall_fraction: number;
+    phase: string;
+    pass_index: number;
+    pass_total: number;
   };
+
+  type ScanDonePayload = {
+    run_id: string;
+    ok: boolean;
+    message: string;
+  };
+
+  type RenderProgressPayload = {
+    run_id: string;
+    current: number;
+    total: number;
+    fraction: number;
+  };
+
+  type RenderDonePayload = {
+    run_id?: string;
+    ok: boolean;
+    message: string;
+    output_path?: string;
+  };
+
+  type ProcessingMode = 'fast' | 'balanced' | 'quality';
 
   let videoPath    = $state('');
   let biasPath     = $state('');
@@ -248,6 +283,7 @@
   let scanMessage = $state('');
   let scanErr = $state('');
   let expectedMembersInput = $state('');
+  let processingMode: ProcessingMode = $state('fast');
   let scanCandidates = $state<IdentityCandidate[]>([]);
   let duplicatePairs = $state<DuplicatePair[]>([]);
   let selectedIdentityId = $state<number | null>(null);
@@ -261,13 +297,23 @@
   let scanId = $state('');
   let reviewReady = $state(false);
   let reviewBlockers = $state<string[]>([]);
-  let reviewReqSeq = $state(0);
   let scanNeedsReview = $state(false);
   let rescanPerformed = $state(false);
   let scanSampledFrames = $state(0);
   let scanDecodedFrames = $state(0);
   let scanProgressFraction = $state(0);
+  let scanEstimatedTotalSamples = $state(0);
+  let scanPassFraction = $state(0);
+  let scanPhase = $state('idle');
+  let scanPassIndex = $state(0);
+  let scanPassTotal = $state(1);
   let reviewDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let reviewRequestToken = 0;
+  let reviewValidationInFlight = $state(false);
+  let candidateRenderLimit = $state(24);
+  let autoReviewSuspended = $state(false);
+  let activeScanRunId = $state('');
+  let activeRenderRunId = $state('');
 
   let queueHealth = $state<QueueHealth | null>(null);
   let queueMsg = $state('');
@@ -277,7 +323,11 @@
   let workerPollMsInput = $state('1200');
   let telemetryInterval: ReturnType<typeof setInterval> | null = null;
   let telemetryRefreshing = $state(false);
+  let telemetrySweepInFlight = $state(false);
   let telemetryTick = $state(0);
+  let settingsAutoRefresh = $state(false);
+  let settingsNonce = 0;
+  let scanEventsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let workerEventFilter = $state<'all' | 'issues'>('all');
   let scanSessionDetail = $state<ScanSessionDetail | null>(null);
   let scanSessions = $state<ScanSessionSummary[]>([]);
@@ -297,6 +347,7 @@
   let diagnosticsPreviewPath = $state('');
   let diagnosticsVerifyState = $state<Record<string, 'ok' | 'mismatch' | 'untracked'>>({});
   let diagnosticsVerifyDetails = $state<Record<string, string>>({});
+  let scanTelemetrySummary = $state('');
 
   let showSettings = $state(false);
   let videoPreviewSrc = $state('');
@@ -371,18 +422,20 @@
     if (unlistenProgress || unlistenDone || unlistenScanProgress || unlistenScanDone) {
       return;
     }
-    unlistenProgress = await listen<{ current: number; total: number; fraction: number }>(
+    unlistenProgress = await listen<RenderProgressPayload>(
       'fancam://progress',
       (e) => {
+        if (!activeRenderRunId || e.payload.run_id !== activeRenderRunId) return;
         curFrame  = e.payload.current;
         totFrames = e.payload.total;
         progress  = e.payload.fraction;
         updateEta(e.payload.current, e.payload.total, e.payload.fraction);
       }
     );
-    unlistenDone = await listen<{ ok: boolean; message: string; output_path?: string }>(
+    unlistenDone = await listen<RenderDonePayload>(
       'fancam://done',
       (e) => {
+        if (e.payload.run_id && activeRenderRunId && e.payload.run_id !== activeRenderRunId) return;
         if (e.payload.ok) {
           status     = 'done';
           resultPath = e.payload.output_path ?? '';
@@ -396,13 +449,25 @@
       }
     );
     unlistenScanProgress = await listen<ScanProgressPayload>('scan://progress', (e) => {
+      if (!activeScanRunId || e.payload.run_id !== activeScanRunId) return;
+      if (scanStatus !== 'cancelling') {
+        scanStatus = 'running';
+      }
       scanSampledFrames = e.payload.sampled_frames;
       scanDecodedFrames = e.payload.total_decoded_frames;
-      const denom = Math.max(scanDecodedFrames, scanSampledFrames, 1);
-      scanProgressFraction = Math.min(1, scanSampledFrames / denom);
+      scanEstimatedTotalSamples = Math.max(0, e.payload.estimated_total_samples || 0);
+      scanPassFraction = Math.max(0, Math.min(1, e.payload.pass_fraction || 0));
+      scanPhase = e.payload.phase || 'scanning';
+      const passIndex = Math.max(1, e.payload.pass_index || 1);
+      const passTotal = Math.max(passIndex, e.payload.pass_total || 1);
+      scanPassIndex = passIndex;
+      scanPassTotal = passTotal;
+      scanProgressFraction = Math.max(0, Math.min(1, e.payload.overall_fraction || 0));
     });
-    unlistenScanDone = await listen<{ ok: boolean; message: string }>('scan://done', (e) => {
+    unlistenScanDone = await listen<ScanDonePayload>('scan://done', (e) => {
+      if (!activeScanRunId || e.payload.run_id !== activeScanRunId) return;
       if (e.payload.ok) {
+        scanMessage = e.payload.message;
         if (scanStatus !== 'done') {
           scanStatus = 'done';
         }
@@ -431,8 +496,16 @@
       clearTimeout(reviewDebounceTimer);
       reviewDebounceTimer = null;
     }
+    if (scanEventsDebounceTimer !== null) {
+      clearTimeout(scanEventsDebounceTimer);
+      scanEventsDebounceTimer = null;
+    }
     stopTelemetryLoop();
   });
+
+  function isSettingsNonceStale(nonce?: number) {
+    return nonce !== undefined && nonce !== settingsNonce;
+  }
 
   // ── File pickers ──────────────────────────────────────────────────────────
 
@@ -503,15 +576,34 @@
     scanId = '';
     reviewReady = false;
     reviewBlockers = [];
+    reviewValidationInFlight = false;
+    reviewRequestToken += 1;
+    if (reviewDebounceTimer !== null) {
+      clearTimeout(reviewDebounceTimer);
+      reviewDebounceTimer = null;
+    }
     scanEventsPage = [];
     scanEventsCursorId = null;
     scanSessionsCursorUpdatedAt = null;
     scanSessionsCursorId = null;
     scanNeedsReview = false;
     rescanPerformed = false;
+    autoReviewSuspended = false;
+    candidateRenderLimit = 24;
     scanSampledFrames = 0;
     scanDecodedFrames = 0;
     scanProgressFraction = 0;
+    scanEstimatedTotalSamples = 0;
+    scanPassFraction = 0;
+    scanPhase = 'idle';
+    scanPassIndex = 0;
+    scanPassTotal = 1;
+    scanTelemetrySummary = '';
+    activeScanRunId = '';
+  }
+
+  function nextClientRunId(prefix: 'scan' | 'render' | 'queue') {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
   function duplicateKey(a: number, b: number) {
@@ -556,15 +648,94 @@
     return reasons;
   }
 
+  function selectedIdentityEmbedding() {
+    if (selectedIdentityId === null) return null;
+    const selected = scanCandidates.find((c) => c.id === selectedIdentityId);
+    return selected?.embedding && selected.embedding.length > 0 ? selected.embedding : null;
+  }
+
+  function hasValidatedScanSelectionForRender() {
+    return scanStatus === 'done' && !!scanId && selectedIdentityId !== null;
+  }
+
+  function visibleCandidates() {
+    return scanCandidates.slice(0, candidateRenderLimit);
+  }
+
+  function hasMoreCandidates() {
+    return scanCandidates.length > candidateRenderLimit;
+  }
+
+  function showMoreCandidates() {
+    candidateRenderLimit = Math.min(scanCandidates.length, candidateRenderLimit + 24);
+  }
+
   function canRenderNow() {
     return (
       !!videoPath &&
-      !!biasPath &&
+      (!!biasPath || hasValidatedScanSelectionForRender()) &&
       !!outputPath &&
       scanStatus === 'done' &&
       reviewReady &&
       selectedIdentityId !== null
     );
+  }
+
+  function scheduleReviewValidation(immediate = false) {
+    if (scanStatus !== 'done' || !scanId || autoReviewSuspended) {
+      return;
+    }
+    const token = ++reviewRequestToken;
+    const args = {
+      scan_id: scanId,
+      selected_identity_id: selectedIdentityId,
+      threshold,
+      excluded_identity_ids: [...ignoredIdentityIds],
+      accepted_low_confidence_ids: [...acceptedLowConfidenceIds],
+      resolved_duplicates: [...resolvedDuplicates],
+      pending_split_ids: [...pendingSplitIds],
+      expected_member_count: expectedMembersValue(),
+    };
+
+    const runValidation = () => {
+      reviewValidationInFlight = true;
+      invoke<IdentityReviewResult>('validate_identity_review', { args })
+        .then((result) => {
+          if (token !== reviewRequestToken) return;
+          reviewReady = result.ready;
+          reviewBlockers = result.blockers;
+          if (result.selected_identity_id !== undefined && result.selected_identity_id !== null) {
+            selectedIdentityId = result.selected_identity_id;
+            selectedAnchorX = result.selected_anchor_x ?? selectedAnchorX;
+            selectedAnchorY = result.selected_anchor_y ?? selectedAnchorY;
+          }
+        })
+        .catch((e: unknown) => {
+          if (token !== reviewRequestToken) return;
+          reviewReady = false;
+          reviewBlockers = [String(e)];
+        })
+        .finally(() => {
+          if (token !== reviewRequestToken) return;
+          reviewValidationInFlight = false;
+        });
+    };
+
+    if (reviewDebounceTimer !== null) {
+      clearTimeout(reviewDebounceTimer);
+      reviewDebounceTimer = null;
+    }
+
+    if (immediate) {
+      runValidation();
+    } else {
+      reviewDebounceTimer = setTimeout(runValidation, 240);
+    }
+  }
+
+  function markReviewDirty() {
+    autoReviewSuspended = false;
+    scheduleReviewValidation(false);
   }
 
   function modelSetupReady() {
@@ -586,17 +757,25 @@
     return !Number.isFinite(n) || n <= 0;
   }
 
+  function normalizeProcessingMode(value?: string | null): ProcessingMode {
+    const next = (value ?? '').trim().toLowerCase();
+    if (next === 'balanced' || next === 'quality') return next;
+    return 'fast';
+  }
+
   function selectIdentity(candidate: IdentityCandidate) {
     if (isIgnored(candidate.id)) return;
     selectedIdentityId = candidate.id;
     selectedAnchorX = candidate.anchor_x;
     selectedAnchorY = candidate.anchor_y;
+    markReviewDirty();
   }
 
   function toggleIgnoreIdentity(candidate: IdentityCandidate) {
     const id = candidate.id;
     if (isIgnored(id)) {
       ignoredIdentityIds = ignoredIdentityIds.filter((x) => x !== id);
+      markReviewDirty();
       return;
     }
     ignoredIdentityIds = [...ignoredIdentityIds, id];
@@ -606,24 +785,29 @@
       selectedAnchorX = null;
       selectedAnchorY = null;
     }
+    markReviewDirty();
   }
 
   function toggleAcceptLowConfidence(candidate: IdentityCandidate) {
     const id = candidate.id;
     if (acceptedLowConfidenceIds.includes(id)) {
       acceptedLowConfidenceIds = acceptedLowConfidenceIds.filter((x) => x !== id);
+      markReviewDirty();
       return;
     }
     acceptedLowConfidenceIds = [...acceptedLowConfidenceIds, id];
+    markReviewDirty();
   }
 
   function toggleSplitRequest(candidate: IdentityCandidate) {
     const id = candidate.id;
     if (pendingSplitIds.includes(id)) {
       pendingSplitIds = pendingSplitIds.filter((x) => x !== id);
+      markReviewDirty();
       return;
     }
     pendingSplitIds = [...pendingSplitIds, id];
+    markReviewDirty();
   }
 
   function resolveDuplicate(pair: DuplicatePair, keep: number) {
@@ -641,6 +825,7 @@
       selectedAnchorX = null;
       selectedAnchorY = null;
     }
+    markReviewDirty();
   }
 
   async function runIdentityScan() {
@@ -656,6 +841,16 @@
     scanSampledFrames = 0;
     scanDecodedFrames = 0;
     scanProgressFraction = 0;
+    scanEstimatedTotalSamples = 0;
+    scanPassFraction = 0;
+    scanTelemetrySummary = '';
+    scanPhase = 'initial scan';
+    scanPassIndex = 1;
+    scanPassTotal = 1;
+    candidateRenderLimit = 24;
+    autoReviewSuspended = true;
+    reviewReady = false;
+    reviewBlockers = [];
     scanCandidates = [];
     duplicatePairs = [];
     selectedIdentityId = null;
@@ -666,6 +861,7 @@
     resolvedDuplicateKeys = [];
     resolvedDuplicates = [];
     pendingSplitIds = [];
+    activeScanRunId = nextClientRunId('scan');
 
     try {
       const result = await invoke<ScanResult>('scan_identities', {
@@ -674,6 +870,8 @@
           yolo_model: yoloModel,
           face_model: faceModel,
           expected_member_count: expectedMembersValue(),
+          processing_mode: processingMode,
+          client_run_id: activeScanRunId,
         },
       });
       if (!result.ok) {
@@ -685,26 +883,40 @@
       scanId = result.scan_id;
       scanMessage = result.message;
       scanCandidates = result.candidates;
+      candidateRenderLimit = Math.min(24, result.candidates.length);
       duplicatePairs = result.duplicates;
       scanNeedsReview = result.needs_review;
       rescanPerformed = result.rescan_performed;
       scanSampledFrames = result.sampled_frames;
       scanDecodedFrames = result.total_decoded_frames;
+      processingMode = normalizeProcessingMode(result.processing_mode);
+      scanEstimatedTotalSamples = result.sampled_frames;
+      scanPassFraction = 1;
+      scanTelemetrySummary = `mode ${normalizeProcessingMode(result.processing_mode)} · rejected ${result.rejected_embeddings} · suppressed ${result.suppressed_clusters} · merged ${result.merged_clusters}`;
       scanProgressFraction = 1;
+      scanPhase = result.rescan_performed ? 'informed rescan' : 'initial scan';
+      scanPassIndex = result.rescan_performed ? 2 : 1;
+      scanPassTotal = result.rescan_performed ? 2 : 1;
 
       if (result.candidates.length > 0) {
         const best = result.candidates[0];
-        selectIdentity(best);
+        selectedIdentityId = best.id;
+        selectedAnchorX = best.anchor_x;
+        selectedAnchorY = best.anchor_y;
       }
+      autoReviewSuspended = false;
+      scheduleReviewValidation(true);
     } catch (e: unknown) {
       scanStatus = 'error';
       scanErr = String(e);
+      autoReviewSuspended = false;
     }
   }
 
   async function cancelScan() {
     if (scanStatus !== 'running') return;
     scanStatus = 'cancelling';
+    scanPhase = 'cancelling';
     try {
       await invoke('cancel_scan');
       scanMessage = 'scan cancellation requested';
@@ -714,13 +926,16 @@
     }
   }
 
-  async function refreshQueueHealth() {
+  async function refreshQueueHealth(nonce?: number) {
     if (telemetryRefreshing) return;
     telemetryRefreshing = true;
     try {
-      queueHealth = await invoke<QueueHealth>('queue_health');
+      const nextHealth = await invoke<QueueHealth>('queue_health');
+      if (isSettingsNonceStale(nonce)) return;
+      queueHealth = nextHealth;
       queueErr = '';
     } catch (e: unknown) {
+      if (isSettingsNonceStale(nonce)) return;
       queueErr = String(e);
     } finally {
       telemetryRefreshing = false;
@@ -751,6 +966,7 @@
           yolo_model: yoloModel,
           face_model: faceModel,
           expected_member_count: expectedMembersValue(),
+          processing_mode: processingMode,
         },
       });
       queueMsg = result.deduplicated
@@ -770,6 +986,7 @@
       const result = await invoke<QueueActionResult>('enqueue_split_rescan_job', {
         args: {
           scan_id: scanId,
+          processing_mode: processingMode,
         },
       });
       queueMsg = result.deduplicated ? 'split rescan deduplicated' : 'split rescan queued';
@@ -779,46 +996,66 @@
     }
   }
 
-  async function refreshWorkerStatus() {
+  async function refreshWorkerStatus(nonce?: number) {
     try {
-      workerStatus = await invoke<QueueWorkerStatus>('queue_worker_status');
+      const next = await invoke<QueueWorkerStatus>('queue_worker_status');
+      if (isSettingsNonceStale(nonce)) return;
+      workerStatus = next;
     } catch (e: unknown) {
+      if (isSettingsNonceStale(nonce)) return;
       queueErr = String(e);
     }
   }
 
-  async function refreshQueueTelemetry() {
+  async function refreshQueueTelemetry(options?: { includeHeavy?: boolean; nonce?: number }) {
     if (!showSettings) return;
+    if (telemetrySweepInFlight) return;
+    telemetrySweepInFlight = true;
+    const includeHeavy = options?.includeHeavy ?? false;
+    const nonce = options?.nonce;
     telemetryTick += 1;
-    const calls: Promise<unknown>[] = [
-      refreshQueueHealth(),
-      refreshWorkerStatus(),
-    ];
-    if (telemetryTick % 2 === 0) {
-      calls.push(peekQueueAttempts(), refreshScanSessionDetail());
+    const calls: Promise<unknown>[] = [refreshQueueHealth(nonce), refreshWorkerStatus(nonce)];
+    if (includeHeavy) {
+      calls.push(
+        peekQueueAttempts(),
+        refreshScanSessionDetail(nonce),
+        refreshScanStorageStats(nonce),
+        refreshStorageWorkerStatus(nonce),
+        refreshDiagnosticsBundles(nonce),
+        refreshScanSessionsList(nonce)
+      );
     }
-    if (telemetryTick % 3 === 0) {
-      calls.push(refreshScanStorageStats(), refreshStorageWorkerStatus());
+    try {
+      await Promise.allSettled(calls);
+    } finally {
+      telemetrySweepInFlight = false;
     }
-    if (telemetryTick % 6 === 0) {
-      calls.push(refreshDiagnosticsBundles(), refreshScanSessionsList());
-    }
-    await Promise.allSettled(calls);
   }
 
-  async function refreshScanSessionDetail() {
+  async function refreshSettingsDiagnostics() {
+    queueErr = '';
+    queueMsg = '';
+    await refreshQueueTelemetry({ includeHeavy: true, nonce: settingsNonce });
+    queueMsg = 'settings diagnostics refreshed';
+  }
+
+  async function refreshScanSessionDetail(nonce?: number) {
     if (!scanId) {
+      if (isSettingsNonceStale(nonce)) return;
       scanSessionDetail = null;
       return;
     }
     try {
-      scanSessionDetail = await invoke<ScanSessionDetail>('get_identity_scan', { scan_id: scanId });
+      const detail = await invoke<ScanSessionDetail>('get_identity_scan', { scan_id: scanId });
+      if (isSettingsNonceStale(nonce)) return;
+      scanSessionDetail = detail;
     } catch {
+      if (isSettingsNonceStale(nonce)) return;
       scanSessionDetail = null;
     }
   }
 
-  async function refreshScanSessionsList() {
+  async function refreshScanSessionsList(nonce?: number) {
     try {
       const result = await invoke<QueryIdentityScansResult>('query_identity_scans', {
         args: {
@@ -828,10 +1065,12 @@
           cursor_scan_id: null,
         },
       });
+      if (isSettingsNonceStale(nonce)) return;
       scanSessions = result.rows;
       scanSessionsCursorUpdatedAt = result.next_cursor_updated_at_ms ?? null;
       scanSessionsCursorId = result.next_cursor_scan_id ?? null;
     } catch {
+      if (isSettingsNonceStale(nonce)) return;
       scanSessions = [];
       scanSessionsCursorUpdatedAt = null;
       scanSessionsCursorId = null;
@@ -862,27 +1101,34 @@
     }
   }
 
-  async function refreshScanStorageStats() {
+  async function refreshScanStorageStats(nonce?: number) {
     try {
-      scanStorageStats = await invoke<ScanStorageStats>('scan_storage_stats');
+      const stats = await invoke<ScanStorageStats>('scan_storage_stats');
+      if (isSettingsNonceStale(nonce)) return;
+      scanStorageStats = stats;
     } catch {
+      if (isSettingsNonceStale(nonce)) return;
       scanStorageStats = null;
     }
   }
 
-  async function refreshStorageWorkerStatus() {
+  async function refreshStorageWorkerStatus(nonce?: number) {
     try {
-      storageWorkerStatus = await invoke<StorageWorkerStatus>('storage_worker_status');
+      const next = await invoke<StorageWorkerStatus>('storage_worker_status');
+      if (isSettingsNonceStale(nonce)) return;
+      storageWorkerStatus = next;
     } catch {
+      if (isSettingsNonceStale(nonce)) return;
       storageWorkerStatus = null;
     }
   }
 
-  async function refreshDiagnosticsBundles() {
+  async function refreshDiagnosticsBundles(nonce?: number) {
     try {
       const result = await invoke<ListDiagnosticsBundlesResult>('list_diagnostics_bundles', {
         args: { limit: 30 },
       });
+      if (isSettingsNonceStale(nonce)) return;
       diagnosticsBundles = result.bundles;
       const next: Record<string, 'ok' | 'mismatch' | 'untracked'> = {};
       const details: Record<string, string> = {};
@@ -895,6 +1141,7 @@
       diagnosticsVerifyState = next;
       diagnosticsVerifyDetails = details;
     } catch {
+      if (isSettingsNonceStale(nonce)) return;
       diagnosticsBundles = [];
       diagnosticsVerifyState = {};
       diagnosticsVerifyDetails = {};
@@ -1082,6 +1329,16 @@
     }
   }
 
+  function scheduleScanEventsRefresh() {
+    if (!showSettings || !scanId) return;
+    if (scanEventsDebounceTimer !== null) {
+      clearTimeout(scanEventsDebounceTimer);
+    }
+    scanEventsDebounceTimer = setTimeout(() => {
+      refreshScanEventsFirstPage();
+    }, 320);
+  }
+
   async function loadMoreScanEvents() {
     if (!scanId || scanEventsCursorId === null) return;
     const mins = Number.parseInt(scanEventWindowMinutesInput, 10);
@@ -1107,20 +1364,24 @@
   async function loadScanSession(scanIdToLoad: string) {
     queueErr = '';
     try {
+      activeScanRunId = '';
       const detail = await invoke<ScanSessionDetail>('get_identity_scan', { scan_id: scanIdToLoad });
       scanId = detail.scan_id;
       scanStatus = 'done';
       scanMessage = `loaded saved scan (${detail.status})`;
       scanErr = '';
+      autoReviewSuspended = false;
       expectedMembersInput = detail.expected_count !== undefined && detail.expected_count !== null
         ? String(detail.expected_count)
         : '';
+      processingMode = normalizeProcessingMode(detail.processing_mode);
       scanCandidates = detail.candidates;
+      candidateRenderLimit = Math.min(24, detail.candidates.length);
       duplicatePairs = detail.duplicates;
       ignoredIdentityIds = detail.excluded_identity_ids;
       acceptedLowConfidenceIds = detail.accepted_low_confidence_ids;
-      resolvedDuplicateKeys = detail.resolved_duplicate_keys.map(([a, b]) => duplicateKey(a, b));
-      resolvedDuplicates = detail.resolved_duplicate_keys.map(([a, b]) => ({ a, b, keep: a }));
+      resolvedDuplicateKeys = detail.resolved_duplicates.map(({ a, b }) => duplicateKey(a, b));
+      resolvedDuplicates = detail.resolved_duplicates;
       pendingSplitIds = detail.pending_split_ids;
       selectedIdentityId = detail.selected_identity_id ?? null;
       selectedAnchorX = detail.selected_anchor_x ?? null;
@@ -1132,6 +1393,7 @@
       reviewBlockers = detail.last_blockers;
       scanSessionDetail = detail;
       await refreshScanEventsFirstPage();
+      scheduleReviewValidation(true);
       queueMsg = `loaded ${detail.scan_id}`;
     } catch (e: unknown) {
       queueErr = String(e);
@@ -1157,8 +1419,8 @@
   function startTelemetryLoop() {
     if (telemetryInterval !== null) return;
     telemetryInterval = setInterval(() => {
-      refreshQueueTelemetry();
-    }, status === 'running' ? 4500 : 2500);
+      refreshQueueTelemetry({ includeHeavy: false, nonce: settingsNonce });
+    }, 6000);
   }
 
   function stopTelemetryLoop() {
@@ -1234,12 +1496,23 @@
   async function processNextQueuedScan() {
     queueMsg = '';
     queueErr = '';
+    scanStatus = 'running';
+    scanPhase = 'queued discovery';
+    scanSampledFrames = 0;
+    scanDecodedFrames = 0;
+    scanProgressFraction = 0;
+    scanEstimatedTotalSamples = 0;
+    scanPassFraction = 0;
+    scanPassIndex = 1;
+    scanPassTotal = 1;
+    activeScanRunId = nextClientRunId('queue');
     try {
       const result = await invoke<QueueActionResult>('process_next_discovery_job', {
-        args: { max_attempts_before_dlq: 3 },
+        args: { max_attempts_before_dlq: 3, client_run_id: activeScanRunId },
       });
       if (!result.processed) {
         queueMsg = 'no queued discovery jobs';
+        scanStatus = 'idle';
       } else if (result.error) {
         if (result.moved_to_dlq) {
           queueErr = `failed and moved to dlq (attempt ${result.attempt ?? 0})`;
@@ -1248,11 +1521,17 @@
         } else {
           queueErr = result.error;
         }
+        scanStatus = 'error';
+        scanErr = result.error;
       } else {
         queueMsg = `processed ${result.message_id ?? 'message'}`;
+        scanStatus = 'done';
+        scanMessage = 'queued discovery scan complete';
       }
-      await refreshQueueHealth();
+      await refreshQueueTelemetry({ includeHeavy: true, nonce: settingsNonce });
     } catch (e: unknown) {
+      scanStatus = 'error';
+      scanErr = String(e);
       queueErr = String(e);
     }
   }
@@ -1260,12 +1539,23 @@
   async function processNextQueuedRescan() {
     queueMsg = '';
     queueErr = '';
+    scanStatus = 'running';
+    scanPhase = 'queued rescan';
+    scanSampledFrames = 0;
+    scanDecodedFrames = 0;
+    scanProgressFraction = 0;
+    scanEstimatedTotalSamples = 0;
+    scanPassFraction = 0;
+    scanPassIndex = 1;
+    scanPassTotal = 1;
+    activeScanRunId = nextClientRunId('queue');
     try {
       const result = await invoke<QueueActionResult>('process_next_rescan_job', {
-        args: { max_attempts_before_dlq: 3 },
+        args: { max_attempts_before_dlq: 3, client_run_id: activeScanRunId },
       });
       if (!result.processed) {
         queueMsg = 'no queued rescan jobs';
+        scanStatus = 'idle';
       } else if (result.error) {
         if (result.moved_to_dlq) {
           queueErr = `rescan failed and moved to dlq (attempt ${result.attempt ?? 0})`;
@@ -1274,17 +1564,24 @@
         } else {
           queueErr = result.error;
         }
+        scanStatus = 'error';
+        scanErr = result.error;
       } else {
         queueMsg = `processed rescan ${result.message_id ?? 'message'}`;
+        scanStatus = 'done';
+        scanMessage = 'queued split rescan complete';
       }
-      await refreshQueueTelemetry();
+      await refreshQueueTelemetry({ includeHeavy: true, nonce: settingsNonce });
     } catch (e: unknown) {
+      scanStatus = 'error';
+      scanErr = String(e);
       queueErr = String(e);
     }
   }
 
   async function startJob() {
     if (!canRenderNow()) return;
+    activeRenderRunId = nextClientRunId('render');
     status   = 'running';
     progress = 0;
     curFrame = 0;
@@ -1304,6 +1601,14 @@
               yolo_model: yoloModel,
               face_model: faceModel,
               threshold,
+              processing_mode: processingMode,
+              target_embedding: selectedIdentityEmbedding(),
+              expected_member_count: expectedMembersValue(),
+              excluded_identity_ids: ignoredIdentityIds,
+              accepted_low_confidence_ids: acceptedLowConfidenceIds,
+              resolved_duplicates: resolvedDuplicates,
+              pending_split_ids: pendingSplitIds,
+              client_run_id: activeRenderRunId,
               scan_id: scanId,
               selected_identity_id: selectedIdentityId,
               target_anchor_x: selectedAnchorX,
@@ -1320,6 +1625,11 @@
           errMsg = result.message;
         }
         etaSeconds = null;
+      } else {
+        status = 'done';
+        resultPath = result.output_path ?? '';
+        progress = 1;
+        etaSeconds = 0;
       }
     } catch (e: unknown) {
       status = 'error';
@@ -1427,17 +1737,27 @@
 
   $effect(() => {
     if (showSettings) {
-      refreshQueueTelemetry();
-      refreshScanSessionsList();
-      startTelemetryLoop();
+      settingsNonce += 1;
+      refreshQueueHealth(settingsNonce);
+      refreshWorkerStatus(settingsNonce);
+      if (settingsAutoRefresh) {
+        startTelemetryLoop();
+      } else {
+        stopTelemetryLoop();
+      }
     } else {
+      settingsNonce += 1;
+      if (scanEventsDebounceTimer !== null) {
+        clearTimeout(scanEventsDebounceTimer);
+        scanEventsDebounceTimer = null;
+      }
       stopTelemetryLoop();
     }
   });
 
   $effect(() => {
     scanId;
-    if (scanId) {
+    if (scanId && showSettings) {
       refreshScanEventsFirstPage();
     } else {
       scanEventsPage = [];
@@ -1446,23 +1766,19 @@
 
   $effect(() => {
     scanSessionStatusFilter;
-    if (showSettings) {
+    if (showSettings && scanSessions.length > 0) {
       refreshScanSessionsList();
     }
   });
 
   $effect(() => {
     scanEventActionFilter;
-    if (showSettings && scanId) {
-      refreshScanEventsFirstPage();
-    }
+    scheduleScanEventsRefresh();
   });
 
   $effect(() => {
     scanEventWindowMinutesInput;
-    if (showSettings && scanId) {
-      refreshScanEventsFirstPage();
-    }
+    scheduleScanEventsRefresh();
   });
 
   $effect(() => {
@@ -1471,51 +1787,20 @@
         clearTimeout(reviewDebounceTimer);
         reviewDebounceTimer = null;
       }
+      reviewRequestToken += 1;
+      reviewValidationInFlight = false;
       reviewReady = false;
       reviewBlockers = [];
       return;
     }
+  });
 
-    const reqId = reviewReqSeq + 1;
-    reviewReqSeq = reqId;
-    const args = {
-      scan_id: scanId,
-      selected_identity_id: selectedIdentityId,
-      threshold,
-      excluded_identity_ids: ignoredIdentityIds,
-      accepted_low_confidence_ids: acceptedLowConfidenceIds,
-      resolved_duplicates: resolvedDuplicates,
-      pending_split_ids: pendingSplitIds,
-      expected_member_count: expectedMembersValue(),
-    };
-    if (reviewDebounceTimer !== null) {
-      clearTimeout(reviewDebounceTimer);
+  $effect(() => {
+    threshold;
+    expectedMembersInput;
+    if (scanStatus === 'done' && scanId && !autoReviewSuspended) {
+      scheduleReviewValidation(false);
     }
-    reviewDebounceTimer = setTimeout(() => {
-      invoke<IdentityReviewResult>('validate_identity_review', { args })
-        .then((result) => {
-          if (reqId !== reviewReqSeq) return;
-          reviewReady = result.ready;
-          reviewBlockers = result.blockers;
-          if (result.selected_identity_id !== undefined && result.selected_identity_id !== null) {
-            selectedIdentityId = result.selected_identity_id;
-            selectedAnchorX = result.selected_anchor_x ?? selectedAnchorX;
-            selectedAnchorY = result.selected_anchor_y ?? selectedAnchorY;
-          }
-        })
-        .catch((e: unknown) => {
-          if (reqId !== reviewReqSeq) return;
-          reviewReady = false;
-          reviewBlockers = [String(e)];
-        });
-    }, 220);
-
-    return () => {
-      if (reviewDebounceTimer !== null) {
-        clearTimeout(reviewDebounceTimer);
-        reviewDebounceTimer = null;
-      }
-    };
   });
 
   $effect(() => {
@@ -1590,6 +1875,12 @@
         </div>
       {/if}
       <div class="queue-actions">
+        <button class="ghost-btn" onclick={refreshSettingsDiagnostics}>refresh diagnostics</button>
+        <button
+          class="ghost-btn"
+          class:active={settingsAutoRefresh}
+          onclick={() => { settingsAutoRefresh = !settingsAutoRefresh; }}
+        >{settingsAutoRefresh ? 'auto refresh: on' : 'auto refresh: off'}</button>
         <button class="ghost-btn" onclick={refreshQueueHealth}>refresh queue</button>
         <button class="ghost-btn" onclick={refreshScanSessionDetail}>refresh session</button>
         <button class="ghost-btn" onclick={refreshScanSessionsList}>refresh sessions</button>
@@ -1899,6 +2190,14 @@
               placeholder="optional"
             />
           </label>
+          <label class="count-input-wrap" for="processing-mode">
+            <span>mode</span>
+            <select id="processing-mode" class="count-input" bind:value={processingMode}>
+              <option value="fast">fast</option>
+              <option value="balanced">balanced</option>
+              <option value="quality">quality</option>
+            </select>
+          </label>
           <button
             class="ghost-btn"
             disabled={!videoPath || !yoloModel || !faceModel || scanStatus === 'running' || scanStatus === 'cancelling'}
@@ -1918,10 +2217,31 @@
         {/if}
 
         {#if scanStatus === 'running' || scanStatus === 'cancelling'}
+          <div class="scan-progress-label">
+            <span>
+              {#if scanStatus === 'cancelling'}
+                cancelling scan...
+              {:else if scanPhase === 'informed rescan'}
+                informed rescan in progress
+              {:else}
+                scanning members...
+              {/if}
+            </span>
+            <span class="scan-progress-pct">{pct(scanProgressFraction)}</span>
+          </div>
+          <div class="scan-progress-track">
+            <div class="scan-progress-fill" style="width:{pct(scanProgressFraction)}"></div>
+          </div>
           <div class="scan-meta detail">
             <span>sampled {scanSampledFrames}</span>
             <span>decoded {scanDecodedFrames}</span>
-            <span>{Math.round(scanProgressFraction * 100)}%</span>
+            {#if scanEstimatedTotalSamples > 0}
+              <span>target samples {scanEstimatedTotalSamples}</span>
+            {/if}
+            <span>pass {pct(scanPassFraction)}</span>
+            {#if scanPassTotal > 1}
+              <span>pass {scanPassIndex} / {scanPassTotal}</span>
+            {/if}
           </div>
         {/if}
 
@@ -1932,6 +2252,7 @@
         {#if scanStatus === 'done'}
           <div class="scan-meta">
             <span>{scanMessage}</span>
+            <span class="tag">mode {processingMode}</span>
             {#if rescanPerformed}
               <span class="tag">informed rescan used</span>
             {/if}
@@ -1944,6 +2265,9 @@
             <span>{activeCandidates().length} active members</span>
             {#if expectedMembersValue() !== null}
               <span>expected {expectedMembersValue()}</span>
+            {/if}
+            {#if scanTelemetrySummary}
+              <span>{scanTelemetrySummary}</span>
             {/if}
           </div>
 
@@ -1994,7 +2318,7 @@
 
           {#if scanCandidates.length > 0}
             <div class="identity-grid">
-              {#each scanCandidates as candidate}
+              {#each visibleCandidates() as candidate}
                 <div
                   class="identity-card"
                   class:selected={selectedIdentityId === candidate.id}
@@ -2055,6 +2379,15 @@
                 </div>
               {/each}
             </div>
+            <div class="scan-meta detail">
+              <span>thumbnails preserve aspect (no crop distortion)</span>
+            </div>
+            {#if hasMoreCandidates()}
+              <div class="scan-meta detail">
+                <span>showing {visibleCandidates().length} / {scanCandidates.length}</span>
+                <button class="ghost-btn tiny" onclick={showMoreCandidates}>show more</button>
+              </div>
+            {/if}
           {/if}
 
           {#if reviewReasons().length > 0}
@@ -2080,8 +2413,14 @@
     <section class="status-panel">
       {#if status === 'idle'}
         <div class="ready-msg">
-          {#if !videoPath || !biasPath || !outputPath}
-            select inputs above to begin
+          {#if !videoPath || !outputPath || (!biasPath && !hasValidatedScanSelectionForRender())}
+            {#if !videoPath || !outputPath}
+              select inputs above to begin
+            {:else if !biasPath && !hasValidatedScanSelectionForRender()}
+              choose a bias image or keep a selected scanned identity
+            {:else}
+              select inputs above to begin
+            {/if}
           {:else if scanStatus !== 'done'}
             run identity scan before rendering
           {:else if scanNeedsReview}
@@ -2129,16 +2468,16 @@
           {status === 'cancelling' ? 'cancelling...' : 'cancel'}
         </button>
       {:else}
-        <button
-          class="btn-run"
-          disabled={
-            !videoPath ||
-            !biasPath ||
-            !outputPath ||
-            scanStatus !== 'done' ||
-            !reviewReady ||
-            selectedIdentityId === null
-          }
+          <button
+            class="btn-run"
+            disabled={
+              !videoPath ||
+              (!biasPath && !hasValidatedScanSelectionForRender()) ||
+              !outputPath ||
+              scanStatus !== 'done' ||
+              !reviewReady ||
+              selectedIdentityId === null
+            }
           onclick={startJob}
         >
           {status === 'done' ? 'render again' : 'render fancam'}
@@ -2244,6 +2583,9 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
+    max-height: min(52vh, 520px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
   .drawer h3 {
     font-size: 10px;
@@ -2432,6 +2774,7 @@
   /* ── Main ────────────────────────────────────────────────────────────── */
   main {
     flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: 20px;
@@ -2572,6 +2915,30 @@
   .scan-meta.detail {
     color: #6f6f7e;
   }
+  .scan-progress-label {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 11px;
+    color: #9a9aaa;
+  }
+  .scan-progress-pct {
+    margin-left: auto;
+    color: #6ee7b7;
+    font-weight: 600;
+  }
+  .scan-progress-track {
+    height: 3px;
+    background: #27272d;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .scan-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #059669, #6ee7b7);
+    border-radius: 999px;
+    transition: width 0.2s ease;
+  }
   .tag {
     border: 1px solid #2f513f;
     color: #7ee6bd;
@@ -2649,10 +3016,10 @@
   .identity-card img {
     width: 100%;
     aspect-ratio: 2 / 3;
-    object-fit: cover;
+    object-fit: contain;
     border-radius: 6px;
     border: 1px solid #22222b;
-    background: #0a0a0d;
+    background: #0f0f13;
   }
   .identity-info {
     display: flex;

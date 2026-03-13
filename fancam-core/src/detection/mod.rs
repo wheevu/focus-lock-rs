@@ -10,10 +10,12 @@ use fast_image_resize as fr;
 use image::{ImageBuffer, Rgb, RgbImage};
 use imageproc::rect::Rect;
 use ort::execution_providers as ep;
+use ort::execution_providers::ExecutionProvider;
 use ort::session::Session;
 use ort::value::Tensor;
 use rayon::prelude::*;
 use std::cell::RefCell;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Mutex;
 use tracing::debug;
@@ -39,6 +41,8 @@ pub const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.6;
 /// Maximum number of person candidates to run ArcFace on per frame.
 /// In concert scenes with 10-20 detections, this caps inference cost.
 const MAX_FACE_CANDIDATES: usize = 8;
+/// Recovery-mode candidate budget to avoid starvation under occlusion.
+const MAX_FACE_CANDIDATES_RECOVERY: usize = 12;
 /// Approximate fraction range of the person bounding box height occupied by head.
 const MIN_HEAD_FRACTION: f32 = 0.18;
 const MAX_HEAD_FRACTION: f32 = 0.35;
@@ -47,10 +51,16 @@ const FACE_WIDTH_FRACTION: f32 = 0.72;
 /// For very high-resolution inputs, run person detection on a downscaled frame
 /// and map detections back to source coordinates.
 const DETECTION_MAX_DIM: u32 = 1920;
-/// Number of high-confidence matches to fold into the running identity gallery.
-const MAX_GALLERY_SAMPLES: usize = 12;
-/// Similarity margin above threshold required to update gallery prototype.
-const GALLERY_UPDATE_MARGIN: f32 = 0.08;
+/// Minimum margin between target and impostor similarities for a valid identity.
+pub const DEFAULT_IDENTITY_MARGIN_THRESHOLD: f32 = 0.03;
+/// Spatial gate (in candidate-box sizes) around the tracker hint.
+const SEARCH_GATE_SCALE: f32 = 8.0;
+/// Minimum absolute search gate radius in pixels.
+const SEARCH_GATE_MIN_RADIUS: f32 = 140.0;
+/// Maximum absolute search gate radius in pixels.
+const SEARCH_GATE_MAX_RADIUS: f32 = 440.0;
+/// Fallback candidates when the search gate rejects all detections.
+const SEARCH_GATE_FALLBACK_KEEP: usize = 3;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -133,6 +143,21 @@ pub struct IdentityMatch {
     pub bbox: BBox,
     /// The cosine similarity score (0.0-1.0).
     pub similarity: f32,
+}
+
+/// Scored identity observation for one person candidate in a frame.
+#[derive(Debug, Clone, Copy)]
+pub struct FaceObservation {
+    /// Candidate person bounding box.
+    pub bbox: BBox,
+    /// Best cosine similarity against positive target gallery.
+    pub similarity: f32,
+    /// Best cosine similarity against negative/impostor gallery.
+    pub impostor_similarity: f32,
+    /// Similarity margin (`similarity - impostor_similarity`).
+    pub margin: f32,
+    /// Optional body re-identification similarity for this candidate.
+    pub body_similarity: Option<f32>,
 }
 
 impl Detector {
@@ -409,9 +434,10 @@ impl Detector {
 #[derive(Debug)]
 pub struct FaceIdentifier {
     sessions: Vec<Mutex<Session>>,
-    reference_embedding: Vec<f32>,
+    target_embeddings: Vec<Vec<f32>>,
+    negative_embeddings: Vec<Vec<f32>>,
     similarity_threshold: f32,
-    gallery_samples: usize,
+    margin_threshold: f32,
 }
 
 /// ArcFace embedding helper that does not require a reference image.
@@ -420,8 +446,14 @@ pub struct FaceIdentifier {
 /// chooses which member to track.
 #[derive(Debug)]
 pub struct FaceEmbedder {
-    session: Mutex<Session>,
+    sessions: Vec<Mutex<Session>>,
 }
+
+/// Number of ArcFace sessions used by discovery embedding.
+///
+/// A small pool improves throughput on crowded sampled frames without creating
+/// excessive memory pressure in local development.
+const DISCOVERY_EMBEDDER_POOL: usize = 4;
 
 impl FaceEmbedder {
     /// Load an ArcFace model for embedding extraction.
@@ -430,11 +462,14 @@ impl FaceEmbedder {
     ///
     /// Returns an error if the model cannot be loaded.
     pub fn load<P: AsRef<Path>>(model_path: P) -> Result<Self> {
-        let session = build_ort_session(model_path.as_ref())
-            .map_err(|e| crate::FancamError::model_load(model_path.as_ref(), e))?;
-        Ok(Self {
-            session: Mutex::new(session),
-        })
+        let model_path = model_path.as_ref().to_path_buf();
+        let mut sessions = Vec::with_capacity(DISCOVERY_EMBEDDER_POOL);
+        for _ in 0..DISCOVERY_EMBEDDER_POOL {
+            let session = build_ort_session(&model_path)
+                .map_err(|e| crate::FancamError::model_load(&model_path, e))?;
+            sessions.push(Mutex::new(session));
+        }
+        Ok(Self { sessions })
     }
 
     /// Extract a face embedding from a bounding box.
@@ -443,27 +478,82 @@ impl FaceEmbedder {
     ///
     /// Returns an error if the face cannot be preprocessed or inference fails.
     pub fn embed_from_bbox(&self, frame: &RgbFrame, bbox: BBox) -> Result<Option<Vec<f32>>> {
-        let tensor_data = match preprocess_face_from_bbox(frame, bbox) {
-            Ok(data) => data,
-            Err(_) => return Ok(None),
-        };
-        let tensor = face_tensor_from_data(tensor_data)?;
-        let embedding = {
-            let mut session = self
-                .session
-                .lock()
-                .to_fancam_err("ArcFace discovery session lock poisoned")?;
-            let outputs = session
-                .run(ort::inputs!["input.1" => tensor])
-                .map_err(|e| {
-                    crate::FancamError::inference(format!(
-                        "ArcFace discovery inference failed: {e}"
-                    ))
-                })?;
-            l2_normalize(&extract_first_embedding(&outputs)?)
-        };
-        Ok(Some(embedding))
+        self.embed_many_from_bboxes(frame, &[bbox], 1)
+            .map(|rows| rows.into_iter().next().map(|(_, emb)| emb))
     }
+
+    /// Extract embeddings for many candidate bounding boxes.
+    ///
+    /// Work is parallelized across a small ArcFace session pool to improve
+    /// discovery throughput on crowded scenes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if face tensor construction fails.
+    pub fn embed_many_from_bboxes(
+        &self,
+        frame: &RgbFrame,
+        bboxes: &[BBox],
+        min_face_crop_edge: u32,
+    ) -> Result<Vec<(BBox, Vec<f32>)>> {
+        if bboxes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sessions = &self.sessions;
+        let rows = bboxes
+            .par_iter()
+            .enumerate()
+            .filter_map(|(idx, &bbox)| {
+                let min_edge = NonZeroU32::new(min_face_crop_edge.max(1))?;
+                let tensor_data =
+                    preprocess_face_from_bbox_with_min(frame, bbox, min_edge).ok()??;
+                let tensor = face_tensor_from_data(tensor_data).ok()?;
+                let session_idx = idx % sessions.len();
+                let embedding = {
+                    let mut session = sessions.get(session_idx)?.lock().ok()?;
+                    let outputs = session.run(ort::inputs!["input.1" => tensor]).ok()?;
+                    l2_normalize(&extract_first_embedding(&outputs).ok()?)
+                };
+                Some((bbox, embedding))
+            })
+            .collect::<Vec<_>>();
+
+        Ok(rows)
+    }
+}
+
+fn preprocess_face_from_bbox_with_min(
+    frame: &RgbFrame,
+    bbox: BBox,
+    min_edge: NonZeroU32,
+) -> Result<Option<Vec<f32>>> {
+    let (face_x1, face_y1, face_w, face_h) = face_crop_region(frame, bbox);
+    if face_w < min_edge.get() || face_h < min_edge.get() {
+        return Ok(None);
+    }
+
+    let src_stride = (frame.width * 3) as usize;
+    let dst_stride = (face_w * 3) as usize;
+    let crop_len = dst_stride * face_h as usize;
+
+    FACE_CROP_BUF.with(|crop_cell| {
+        let mut crop_buf = crop_cell.borrow_mut();
+        let current_cap = crop_buf.capacity();
+        if current_cap < crop_len {
+            crop_buf.reserve(crop_len - current_cap);
+        }
+        crop_buf.resize(crop_len, 0);
+
+        for row in 0..face_h as usize {
+            let src_start = (face_y1 as usize + row) * src_stride + face_x1 as usize * 3;
+            let dst_start = row * dst_stride;
+            crop_buf[dst_start..dst_start + dst_stride]
+                .copy_from_slice(&frame.data[src_start..src_start + dst_stride]);
+        }
+
+        preprocess_face_data_from_raw(face_w, face_h, &crop_buf).map(Some)
+    })
 }
 
 /// Compute cosine similarity between two embeddings.
@@ -473,6 +563,74 @@ pub fn embedding_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 impl FaceIdentifier {
+    /// Current minimum similarity required for target acceptance.
+    #[must_use]
+    pub const fn similarity_threshold(&self) -> f32 {
+        self.similarity_threshold
+    }
+
+    /// Current minimum positive-vs-negative margin required for acceptance.
+    #[must_use]
+    pub const fn margin_threshold(&self) -> f32 {
+        self.margin_threshold
+    }
+
+    fn create_sessions(model_path: &Path, session_count: usize) -> Result<Vec<Mutex<Session>>> {
+        let mut sessions = Vec::with_capacity(session_count.max(1));
+        for _ in 0..session_count.max(1) {
+            let session = build_ort_session(model_path)
+                .map_err(|e| crate::FancamError::model_load(model_path, e))?;
+            sessions.push(Mutex::new(session));
+        }
+        Ok(sessions)
+    }
+
+    fn from_reference_embedding<P: AsRef<Path>>(
+        model_path: P,
+        reference_embedding: Vec<f32>,
+        similarity_threshold: f32,
+    ) -> Result<Self> {
+        if reference_embedding.is_empty() {
+            return Err(crate::FancamError::invalid_config(
+                "reference embedding is empty",
+            ));
+        }
+        let model_path = model_path.as_ref().to_path_buf();
+        let sessions = Self::create_sessions(&model_path, MAX_FACE_CANDIDATES)?;
+
+        Ok(Self {
+            sessions,
+            target_embeddings: vec![l2_normalize(&reference_embedding)],
+            negative_embeddings: Vec::new(),
+            similarity_threshold,
+            margin_threshold: DEFAULT_IDENTITY_MARGIN_THRESHOLD,
+        })
+    }
+
+    fn with_galleries(
+        mut self,
+        target_embeddings: Vec<Vec<f32>>,
+        negative_embeddings: Vec<Vec<f32>>,
+        margin_threshold: f32,
+    ) -> Result<Self> {
+        if target_embeddings.is_empty() {
+            return Err(crate::FancamError::invalid_config(
+                "target embedding gallery is empty",
+            ));
+        }
+        self.target_embeddings = target_embeddings
+            .into_iter()
+            .map(|emb| l2_normalize(&emb))
+            .collect();
+        self.negative_embeddings = negative_embeddings
+            .into_iter()
+            .filter(|emb| !emb.is_empty())
+            .map(|emb| l2_normalize(&emb))
+            .collect();
+        self.margin_threshold = margin_threshold.max(0.0);
+        Ok(self)
+    }
+
     /// Load an ArcFace ONNX model and embed `reference_image_path` as the
     /// target identity.
     ///
@@ -485,13 +643,7 @@ impl FaceIdentifier {
         similarity_threshold: f32,
     ) -> Result<Self> {
         let model_path = model_path.as_ref().to_path_buf();
-        let session_count = MAX_FACE_CANDIDATES;
-        let mut sessions = Vec::with_capacity(session_count);
-        for _ in 0..session_count {
-            let session = build_ort_session(&model_path)
-                .map_err(|e| crate::FancamError::model_load(&model_path, e))?;
-            sessions.push(Mutex::new(session));
-        }
+        let sessions = Self::create_sessions(&model_path, MAX_FACE_CANDIDATES)?;
 
         // Load and embed the reference image (assumed to be a face crop)
         let ref_img = image::open(&reference_image_path)
@@ -525,38 +677,88 @@ impl FaceIdentifier {
 
         Ok(Self {
             sessions,
-            reference_embedding,
+            target_embeddings: vec![reference_embedding],
+            negative_embeddings: Vec::new(),
             similarity_threshold,
-            gallery_samples: 1,
+            margin_threshold: DEFAULT_IDENTITY_MARGIN_THRESHOLD,
         })
     }
 
-    /// Given a full RGB frame and a list of person bounding boxes, return the
-    /// bbox of the target identity (highest similarity above threshold), or
-    /// `None` if not found.
+    /// Load an ArcFace ONNX model with an already-computed reference embedding.
     ///
-    /// To limit per-frame latency in crowded scenes, only the top
-    /// `MAX_FACE_CANDIDATES` persons (by detection confidence) are evaluated.
+    /// # Errors
+    ///
+    /// Returns an error if the model cannot be loaded or embedding is invalid.
+    pub fn load_from_embedding<P: AsRef<Path>>(
+        model_path: P,
+        reference_embedding: Vec<f32>,
+        similarity_threshold: f32,
+    ) -> Result<Self> {
+        Self::from_reference_embedding(model_path, reference_embedding, similarity_threshold)
+    }
+
+    /// Load ArcFace with explicit positive and negative identity galleries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if model loading fails or target gallery is empty.
+    pub fn load_from_galleries<P: AsRef<Path>>(
+        model_path: P,
+        target_embeddings: Vec<Vec<f32>>,
+        negative_embeddings: Vec<Vec<f32>>,
+        similarity_threshold: f32,
+        margin_threshold: f32,
+    ) -> Result<Self> {
+        let seed = target_embeddings.first().cloned().ok_or_else(|| {
+            crate::FancamError::invalid_config("target embedding gallery is empty")
+        })?;
+        let identifier =
+            Self::from_reference_embedding(model_path, seed, similarity_threshold.clamp(0.0, 1.0))?;
+        identifier.with_galleries(target_embeddings, negative_embeddings, margin_threshold)
+    }
+
+    /// Compute scored face observations for person candidates.
+    ///
+    /// The output is sorted by target similarity (desc), then by margin (desc).
     ///
     /// # Errors
     ///
     /// Returns an error if face processing or inference fails.
-    pub fn identify(
-        &mut self,
+    pub fn observations(
+        &self,
         frame: &RgbFrame,
         persons: &[BBox],
         search_hint: Option<(f32, f32)>,
-    ) -> Result<Option<IdentityMatch>> {
-        let mut best: Option<(f32, BBox, Vec<f32>)> = None;
+    ) -> Result<Vec<FaceObservation>> {
+        self.observations_with_candidate_budget(frame, persons, search_hint, MAX_FACE_CANDIDATES)
+    }
 
-        // Sort candidates by confidence descending and cap at MAX_FACE_CANDIDATES.
+    /// Compute scored face observations with an explicit candidate budget.
+    ///
+    /// This is used by recovery paths to temporarily evaluate more detections
+    /// without changing steady-state cost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if face processing or inference fails.
+    pub fn observations_with_candidate_budget(
+        &self,
+        frame: &RgbFrame,
+        persons: &[BBox],
+        search_hint: Option<(f32, f32)>,
+        max_candidates: usize,
+    ) -> Result<Vec<FaceObservation>> {
         let mut candidates: Vec<BBox> = persons.to_vec();
         candidates.sort_unstable_by(|a, b| {
             rank_candidate(*b, search_hint)
                 .partial_cmp(&rank_candidate(*a, search_hint))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        candidates.truncate(MAX_FACE_CANDIDATES);
+        let mut candidates = apply_search_gate(candidates, search_hint);
+        candidates.truncate(max_candidates.max(1));
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let prepared: Vec<(BBox, Vec<f32>)> = candidates
             .par_iter()
@@ -568,10 +770,10 @@ impl FaceIdentifier {
             .collect();
 
         let sessions = &self.sessions;
-        let reference_embedding = &self.reference_embedding;
-        let similarity_threshold = self.similarity_threshold;
+        let target_gallery = &self.target_embeddings;
+        let negative_gallery = &self.negative_embeddings;
 
-        let matches: Vec<(f32, BBox, Vec<f32>)> = prepared
+        let mut observations: Vec<FaceObservation> = prepared
             .into_par_iter()
             .enumerate()
             .filter_map(|(i, (bbox, tensor_data))| {
@@ -582,45 +784,99 @@ impl FaceIdentifier {
                     let outputs = session.run(ort::inputs!["input.1" => tensor]).ok()?;
                     l2_normalize(&extract_first_embedding(&outputs).ok()?)
                 };
-                let sim = cosine_similarity(&embedding, reference_embedding);
-                debug!(sim, "face similarity");
-                if sim >= similarity_threshold {
-                    Some((sim, bbox, embedding))
-                } else {
-                    None
+
+                let similarity = target_gallery
+                    .iter()
+                    .map(|target| cosine_similarity(&embedding, target))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if !similarity.is_finite() {
+                    return None;
                 }
+
+                let impostor_similarity = negative_gallery
+                    .iter()
+                    .map(|neg| cosine_similarity(&embedding, neg))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let impostor_similarity = if impostor_similarity.is_finite() {
+                    impostor_similarity
+                } else {
+                    -1.0
+                };
+
+                let margin = similarity - impostor_similarity;
+                Some(FaceObservation {
+                    bbox,
+                    similarity,
+                    impostor_similarity,
+                    margin,
+                    body_similarity: None,
+                })
             })
             .collect();
 
-        for (sim, bbox, embedding) in matches {
-            if best.as_ref().is_none_or(|b| sim > b.0) {
-                best = Some((sim, bbox, embedding));
-            }
-        }
-
-        if let Some((sim, bbox, embedding)) = best {
-            if sim >= self.similarity_threshold + GALLERY_UPDATE_MARGIN
-                && self.gallery_samples < MAX_GALLERY_SAMPLES
-            {
-                self.update_reference_gallery(&embedding);
-            }
-            return Ok(Some(IdentityMatch {
-                bbox,
-                similarity: sim,
-            }));
-        }
-
-        Ok(None)
+        observations.sort_unstable_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.margin
+                        .partial_cmp(&a.margin)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        Ok(observations)
     }
 
-    fn update_reference_gallery(&mut self, embedding: &[f32]) {
-        let prev_weight = self.gallery_samples as f32;
-        let next_weight = prev_weight + 1.0;
-        for (r, e) in self.reference_embedding.iter_mut().zip(embedding.iter()) {
-            *r = (*r * prev_weight + *e) / next_weight;
+    /// Best-match helper compatible with legacy call sites.
+    ///
+    /// A match is accepted only when similarity and positive-vs-negative margin
+    /// both clear configured thresholds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if face processing or inference fails.
+    pub fn identify(
+        &self,
+        frame: &RgbFrame,
+        persons: &[BBox],
+        search_hint: Option<(f32, f32)>,
+    ) -> Result<Option<IdentityMatch>> {
+        let observations = self.observations(frame, persons, search_hint)?;
+        let Some(best) = observations.first() else {
+            return Ok(None);
+        };
+        if best.similarity < self.similarity_threshold || best.margin < self.margin_threshold {
+            return Ok(None);
         }
-        self.reference_embedding = l2_normalize(&self.reference_embedding);
-        self.gallery_samples += 1;
+        debug!(
+            similarity = best.similarity,
+            impostor_similarity = best.impostor_similarity,
+            margin = best.margin,
+            "face identity accepted"
+        );
+        Ok(Some(IdentityMatch {
+            bbox: best.bbox,
+            similarity: best.similarity,
+        }))
+    }
+
+    /// Recovery observations helper with wider candidate budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if face processing or inference fails.
+    pub fn recovery_observations(
+        &self,
+        frame: &RgbFrame,
+        persons: &[BBox],
+        search_hint: Option<(f32, f32)>,
+    ) -> Result<Vec<FaceObservation>> {
+        self.observations_with_candidate_budget(
+            frame,
+            persons,
+            search_hint,
+            MAX_FACE_CANDIDATES_RECOVERY,
+        )
     }
 }
 
@@ -732,14 +988,36 @@ fn face_tensor_from_data(tensor_data: Vec<f32>) -> Result<ort::value::DynValue> 
         })
 }
 
-fn build_ort_session(model_path: &Path) -> std::result::Result<Session, ort::Error> {
-    let mut builder = Session::builder()?;
-    builder = builder.with_intra_threads(1)?;
-    builder = builder.with_inter_threads(1)?;
-    builder = builder.with_parallel_execution(false)?;
-    builder = builder.with_execution_providers([ep::CoreMLExecutionProvider::default()
+pub(crate) fn build_ort_session(model_path: &Path) -> std::result::Result<Session, ort::Error> {
+    if let Err(err) = crate::runtime::OrtConfig::ensure_initialized() {
+        return Err(ort::Error::new(format!(
+            "ONNX Runtime init failure (CoreML required): {err}"
+        )));
+    }
+    let base_builder = Session::builder()?
+        .with_intra_threads(1)?
+        .with_inter_threads(1)?
+        .with_parallel_execution(false)?;
+
+    let coreml = ep::CoreMLExecutionProvider::default()
+        .with_subgraphs(true)
+        .with_static_input_shapes(false)
         .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
-        .build()])?;
+        .with_specialization_strategy(ep::coreml::CoreMLSpecializationStrategy::FastPrediction);
+    let coreml_available = coreml.is_available().unwrap_or(false);
+    if !coreml_available {
+        return Err(ort::Error::new(
+            "CoreML execution provider is unavailable in the loaded ONNX Runtime.",
+        ));
+    }
+
+    let builder =
+        base_builder.with_execution_providers([ep::CoreMLExecutionProvider::default()
+            .with_subgraphs(true)
+            .with_static_input_shapes(false)
+            .with_compute_units(ep::coreml::CoreMLComputeUnits::CPUAndNeuralEngine)
+            .with_specialization_strategy(ep::coreml::CoreMLSpecializationStrategy::FastPrediction)
+            .build()])?;
     builder.commit_from_file(model_path)
 }
 
@@ -777,8 +1055,8 @@ fn face_crop_region(frame: &RgbFrame, bbox: BBox) -> (u32, u32, u32, u32) {
     let face_x1_f = bbox.center_x() - face_w_f / 2.0;
     let face_y1_f = bbox.y1 + bh * 0.02;
 
-    let face_x1 = face_x1_f.max(0.0) as u32;
-    let face_y1 = face_y1_f.max(0.0) as u32;
+    let face_x1 = (face_x1_f.max(0.0) as u32).min(frame.width.saturating_sub(1));
+    let face_y1 = (face_y1_f.max(0.0) as u32).min(frame.height.saturating_sub(1));
     let face_w = (face_w_f as u32)
         .min(frame.width.saturating_sub(face_x1))
         .max(1);
@@ -787,6 +1065,125 @@ fn face_crop_region(frame: &RgbFrame, bbox: BBox) -> (u32, u32, u32, u32) {
         .max(1);
 
     (face_x1, face_y1, face_w, face_h)
+}
+
+/// Returns the heuristic face crop region for a person detection box.
+#[must_use]
+pub fn face_crop_region_for_bbox(frame: &RgbFrame, bbox: BBox) -> (u32, u32, u32, u32) {
+    face_crop_region(frame, bbox)
+}
+
+/// Estimates whether the upper-body crop contains a valid frontal/near-frontal face.
+///
+/// This is a lightweight image heuristic used during discovery to suppress
+/// obvious non-face clusters (for example backs of heads, shoulders, or torso-only
+/// detections) before embedding + clustering.
+#[must_use]
+pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
+    let (x1, y1, w, h) = face_crop_region(frame, bbox);
+    if w < 12 || h < 12 {
+        return 0.0;
+    }
+
+    let step_x = (w / 26).max(1) as usize;
+    let step_y = (h / 26).max(1) as usize;
+    let cols = ((w as usize + step_x - 1) / step_x).max(2);
+    let rows = ((h as usize + step_y - 1) / step_y).max(2);
+
+    let stride = frame.width as usize * 3;
+    let mut luma = vec![0.0f32; rows * cols];
+
+    for row in 0..rows {
+        let sample_y = y1 as usize + (row * step_y).min(h as usize - 1);
+        for col in 0..cols {
+            let sample_x = x1 as usize + (col * step_x).min(w as usize - 1);
+            let idx = sample_y * stride + sample_x * 3;
+            let r = frame.data[idx] as f32;
+            let g = frame.data[idx + 1] as f32;
+            let b = frame.data[idx + 2] as f32;
+            // Rec.709 luma approximation in [0, 255]
+            luma[row * cols + col] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        }
+    }
+
+    let total = (rows * cols) as f32;
+    let mean = luma.iter().sum::<f32>() / total.max(1.0);
+    let variance = luma
+        .iter()
+        .map(|v| {
+            let d = *v - mean;
+            d * d
+        })
+        .sum::<f32>()
+        / total.max(1.0);
+    let std_dev = variance.sqrt();
+    let texture_score = ((std_dev - 12.0) / 38.0).clamp(0.0, 1.0);
+
+    let mut edge_sum = 0.0f32;
+    let mut edge_count = 0usize;
+    let mut center_edge_sum = 0.0f32;
+    for row in 0..(rows - 1) {
+        for col in 0..(cols - 1) {
+            let c = luma[row * cols + col];
+            let right = luma[row * cols + (col + 1)];
+            let down = luma[(row + 1) * cols + col];
+            let edge = (c - right).abs() + (c - down).abs();
+            edge_sum += edge;
+            edge_count += 1;
+
+            let center_row = row >= rows / 4 && row <= (rows * 3) / 4;
+            let center_col = col >= cols / 4 && col <= (cols * 3) / 4;
+            if center_row && center_col {
+                center_edge_sum += edge;
+            }
+        }
+    }
+    let edge_mean = edge_sum / edge_count.max(1) as f32;
+    let edge_score = ((edge_mean - 7.0) / 26.0).clamp(0.0, 1.0);
+    let outer_edge = (edge_sum - center_edge_sum).max(0.0);
+    let center_ratio = center_edge_sum / outer_edge.max(1e-3);
+    let center_focus_score = ((center_ratio - 0.75) / 0.85).clamp(0.0, 1.0);
+
+    let mut symmetry_diff = 0.0f32;
+    let mut symmetry_count = 0usize;
+    for row in 0..rows {
+        for col in 0..(cols / 2) {
+            let left = luma[row * cols + col];
+            let right = luma[row * cols + (cols - 1 - col)];
+            symmetry_diff += (left - right).abs();
+            symmetry_count += 1;
+        }
+    }
+    let symmetry_mean = symmetry_diff / symmetry_count.max(1) as f32;
+    let symmetry_score = (1.0 - symmetry_mean / 58.0).clamp(0.0, 1.0);
+
+    let mut upper_sum = 0.0f32;
+    let mut upper_count = 0usize;
+    let mut lower_sum = 0.0f32;
+    let mut lower_count = 0usize;
+    for row in 0..rows {
+        for col in 0..cols {
+            let value = luma[row * cols + col];
+            if row < rows / 3 {
+                upper_sum += value;
+                upper_count += 1;
+            } else if row >= (rows * 2) / 3 {
+                lower_sum += value;
+                lower_count += 1;
+            }
+        }
+    }
+    let upper_mean = upper_sum / upper_count.max(1) as f32;
+    let lower_mean = lower_sum / lower_count.max(1) as f32;
+    let upper_lower_diff = (upper_mean - lower_mean).abs();
+    let upper_lower_score = ((upper_lower_diff - 10.0) / 42.0).clamp(0.0, 1.0);
+
+    (texture_score * 0.24
+        + edge_score * 0.22
+        + symmetry_score * 0.20
+        + center_focus_score * 0.22
+        + upper_lower_score * 0.12)
+        .clamp(0.0, 1.0)
 }
 
 fn rank_candidate(bbox: BBox, search_hint: Option<(f32, f32)>) -> f32 {
@@ -800,6 +1197,36 @@ fn rank_candidate(bbox: BBox, search_hint: Option<(f32, f32)>) -> f32 {
         score += proximity * 0.35;
     }
     score
+}
+
+fn apply_search_gate(candidates: Vec<BBox>, search_hint: Option<(f32, f32)>) -> Vec<BBox> {
+    let Some((hx, hy)) = search_hint else {
+        return candidates;
+    };
+
+    let gated = candidates
+        .iter()
+        .copied()
+        .filter(|bbox| {
+            let dx = bbox.center_x() - hx;
+            let dy = bbox.center_y() - hy;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let scale = bbox.width().max(bbox.height()).max(1.0);
+            let gate =
+                (scale * SEARCH_GATE_SCALE).clamp(SEARCH_GATE_MIN_RADIUS, SEARCH_GATE_MAX_RADIUS);
+            distance <= gate
+        })
+        .collect::<Vec<_>>();
+
+    if gated.is_empty() {
+        // Avoid hard lockout when prediction drifts briefly.
+        // Caller already ranked candidates by proximity/confidence.
+        return candidates
+            .into_iter()
+            .take(SEARCH_GATE_FALLBACK_KEEP)
+            .collect();
+    }
+    gated
 }
 
 // ── Math helpers ─────────────────────────────────────────────────────────────
@@ -818,7 +1245,12 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Greedy NMS: sort by confidence descending, suppress overlapping boxes.
 fn nms(mut boxes: Vec<BBox>, iou_thresh: f32) -> Vec<BBox> {
-    boxes.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+    boxes.retain(|b| b.confidence.is_finite());
+    boxes.sort_unstable_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut kept: Vec<BBox> = Vec::new();
     let mut suppressed = vec![false; boxes.len()];
@@ -947,5 +1379,69 @@ mod tests {
         let near_score = rank_candidate(near, Some((120.0, 150.0)));
         let far_score = rank_candidate(far, Some((120.0, 150.0)));
         assert!(near_score > far_score);
+    }
+
+    #[test]
+    fn face_presence_prefers_face_like_pattern_over_flat_patch() {
+        let mut frame = frame(160, 180);
+
+        // Flat patch (very low texture)
+        for px in frame.data.chunks_mut(3) {
+            px[0] = 128;
+            px[1] = 128;
+            px[2] = 128;
+        }
+        let bbox = BBox {
+            x1: 40.0,
+            y1: 30.0,
+            x2: 120.0,
+            y2: 170.0,
+            confidence: 0.9,
+        };
+        let flat_score = face_presence_score(&frame, bbox);
+
+        // Paint a rough face-like symmetric pattern in the same region.
+        for y in 48..118 {
+            for x in 52..108 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 212;
+                frame.data[idx + 1] = 182;
+                frame.data[idx + 2] = 160;
+            }
+        }
+        // Eyes
+        for y in 68..78 {
+            for x in 64..74 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 32;
+                frame.data[idx + 1] = 32;
+                frame.data[idx + 2] = 32;
+            }
+            for x in 86..96 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 32;
+                frame.data[idx + 1] = 32;
+                frame.data[idx + 2] = 32;
+            }
+        }
+        // Nose/mouth contrast
+        for y in 84..106 {
+            let x = 80usize;
+            let idx = (y as usize * frame.width as usize + x) * 3;
+            frame.data[idx] = 80;
+            frame.data[idx + 1] = 60;
+            frame.data[idx + 2] = 58;
+        }
+        for y in 106..112 {
+            for x in 68..92 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 74;
+                frame.data[idx + 1] = 40;
+                frame.data[idx + 2] = 40;
+            }
+        }
+
+        let face_like_score = face_presence_score(&frame, bbox);
+        assert!(face_like_score > flat_score);
     }
 }

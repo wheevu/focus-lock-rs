@@ -51,7 +51,9 @@
 pub mod detection;
 pub mod discovery;
 pub mod error;
+pub mod mode;
 pub mod pipeline;
+pub mod reid;
 pub mod rendering;
 pub mod runtime;
 pub mod tracking;

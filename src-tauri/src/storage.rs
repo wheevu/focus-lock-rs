@@ -37,6 +37,25 @@ pub struct ScanSessionEventRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct ScanReviewStateRow {
+    pub scan_id: String,
+    pub status: String,
+    pub expected_count: Option<i64>,
+    pub review_ready: bool,
+    pub selected_identity_id: Option<i64>,
+    pub selected_anchor_x: Option<f32>,
+    pub selected_anchor_y: Option<f32>,
+    pub validated_threshold: Option<f32>,
+    pub updated_at_ms: u64,
+    pub excluded_identity_ids_json: String,
+    pub accepted_low_confidence_ids_json: String,
+    pub resolved_duplicate_keys_json: String,
+    pub pending_split_ids_json: String,
+    pub pending_split_count: i64,
+    pub last_blockers_json: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ScanStoreRows {
     pub next_id: u64,
     pub sessions: Vec<ScanSessionRow>,
@@ -321,6 +340,74 @@ pub fn save_scan_row(
     tx.execute(
         "DELETE FROM scan_session_events WHERE scan_id = ?1",
         params![session.scan_id],
+    )
+    .map_err(|e| format!("failed to clear session events: {e}"))?;
+    for event in events {
+        tx.execute(
+            "INSERT INTO scan_session_events (scan_id, at_ms, action, details)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![event.scan_id, event.at_ms, event.action, event.details],
+        )
+        .map_err(|e| format!("failed to insert session event row: {e}"))?;
+    }
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit sqlite transaction: {e}"))
+}
+
+pub fn save_scan_review_state(
+    db_path: &Path,
+    next_id: u64,
+    review: &ScanReviewStateRow,
+    events: &[ScanSessionEventRow],
+) -> Result<(), String> {
+    let mut conn = open_db(db_path)?;
+    migrate(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to start sqlite transaction: {e}"))?;
+    upsert_next_id(&tx, next_id)?;
+
+    tx.execute(
+        "UPDATE scan_sessions
+         SET status = ?2,
+             expected_count = ?3,
+             review_ready = ?4,
+             selected_identity_id = ?5,
+             selected_anchor_x = ?6,
+             selected_anchor_y = ?7,
+             validated_threshold = ?8,
+             updated_at_ms = ?9,
+             excluded_identity_ids_json = ?10,
+             accepted_low_confidence_ids_json = ?11,
+             resolved_duplicate_keys_json = ?12,
+             pending_split_ids_json = ?13,
+             pending_split_count = ?14,
+             last_blockers_json = ?15
+         WHERE scan_id = ?1",
+        params![
+            review.scan_id,
+            review.status,
+            review.expected_count,
+            if review.review_ready { 1_i64 } else { 0_i64 },
+            review.selected_identity_id,
+            review.selected_anchor_x,
+            review.selected_anchor_y,
+            review.validated_threshold,
+            review.updated_at_ms,
+            review.excluded_identity_ids_json,
+            review.accepted_low_confidence_ids_json,
+            review.resolved_duplicate_keys_json,
+            review.pending_split_ids_json,
+            review.pending_split_count,
+            review.last_blockers_json,
+        ],
+    )
+    .map_err(|e| format!("failed to update scan review state: {e}"))?;
+
+    tx.execute(
+        "DELETE FROM scan_session_events WHERE scan_id = ?1",
+        params![review.scan_id],
     )
     .map_err(|e| format!("failed to clear session events: {e}"))?;
     for event in events {

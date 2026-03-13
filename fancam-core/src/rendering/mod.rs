@@ -7,7 +7,11 @@
 use anyhow::{Context, Result};
 use fast_image_resize as fr;
 
-use crate::{tracking::CameraState, video::RgbFrame};
+use crate::{
+    mode::ProcessingMode,
+    tracking::{CameraSource, CameraState},
+    video::RgbFrame,
+};
 
 /// Output fancam width in pixels.
 pub const OUT_WIDTH: u32 = 1080;
@@ -24,6 +28,7 @@ pub struct FrameRenderer {
     crop_buf: Vec<u8>,
     out_buf: Vec<u8>,
     scaled_buf: Vec<u8>,
+    mode: ProcessingMode,
 }
 
 /// Typical maximum crop dimensions for 4K source to avoid repeated reallocations.
@@ -33,11 +38,18 @@ impl FrameRenderer {
     /// Create a new frame renderer with pre-allocated buffers.
     #[must_use]
     pub fn new() -> Self {
+        Self::new_with_mode(ProcessingMode::default())
+    }
+
+    /// Create a new frame renderer with an explicit processing mode.
+    #[must_use]
+    pub fn new_with_mode(mode: ProcessingMode) -> Self {
         Self {
             resizer: fr::Resizer::new(),
             crop_buf: Vec::with_capacity(TYPICAL_MAX_CROP_BYTES),
             out_buf: vec![0u8; (OUT_WIDTH * OUT_HEIGHT * 3) as usize],
             scaled_buf: Vec::with_capacity(TYPICAL_MAX_CROP_BYTES),
+            mode,
         }
     }
 
@@ -81,11 +93,29 @@ impl FrameRenderer {
 
         // Decide filter quality based on whether we're upscaling significantly
         let subject_height_fraction = state.half_size * 2.0 / frame.height as f32;
-        let filter = if subject_height_fraction < UPSCALE_THRESHOLD {
-            fr::FilterType::Lanczos3 // subject is small — use high-quality upscale
-        } else {
-            fr::FilterType::CatmullRom // subject is large — fast enough
+        let filter = match self.mode {
+            ProcessingMode::Fast => fr::FilterType::Bilinear,
+            ProcessingMode::Balanced => {
+                if subject_height_fraction < UPSCALE_THRESHOLD {
+                    fr::FilterType::CatmullRom
+                } else {
+                    fr::FilterType::Bilinear
+                }
+            }
+            ProcessingMode::Quality => {
+                if subject_height_fraction < UPSCALE_THRESHOLD {
+                    fr::FilterType::Lanczos3 // subject is small — use high-quality upscale
+                } else {
+                    fr::FilterType::CatmullRom // subject is large — fast enough
+                }
+            }
         };
+
+        // During uncertain tracking periods, avoid compounding drift by falling
+        // back to a stable full-frame letterbox after an extended miss window.
+        if state.source != CameraSource::Observed && state.miss_count > 16 {
+            return self.letterbox_passthrough_inplace(frame);
+        }
 
         // SIMD-accelerated resize via fast_image_resize (NEON on M1).
         let src =
@@ -147,8 +177,13 @@ impl FrameRenderer {
         )
         .context("failed to create fast_image_resize destination for letterbox")?;
 
-        let options = fr::ResizeOptions::new()
-            .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom));
+        let letterbox_filter = if self.mode == ProcessingMode::Quality {
+            fr::FilterType::CatmullRom
+        } else {
+            fr::FilterType::Bilinear
+        };
+        let options =
+            fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(letterbox_filter));
         self.resizer
             .resize(&src, &mut dst, Some(&options))
             .context("fast_image_resize letterbox scale failed")?;
