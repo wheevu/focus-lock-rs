@@ -8,7 +8,9 @@
 *.dSYM/
 
 # runtime/debug symbol artifacts
+models/onnxruntime/
 models/onnxruntime/lib/*.dSYM/
+src-tauri/.focus-lock/
 
 # frontend
 ui/node_modules
