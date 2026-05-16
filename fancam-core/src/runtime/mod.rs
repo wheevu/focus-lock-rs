@@ -159,15 +159,13 @@ impl OrtConfig {
                 );
                 if !coreml_available {
                     return Err(crate::FancamError::ort_config(format!(
-                        "ONNX Runtime initialized from {} but CoreML execution provider is unavailable. Install CoreML-enabled ONNX Runtime {}.",
-                        path, ort_expected
+                        "ONNX Runtime initialized from {path} but CoreML execution provider is unavailable. Install CoreML-enabled ONNX Runtime {ort_expected}."
                     )));
                 }
                 Ok(config)
             }
             Ok(Err(err)) => Err(crate::FancamError::ort_config(format!(
-                "failed to initialize ONNX Runtime from {}: {err}. This build expects ONNX Runtime {}.",
-                path, ort_expected
+                "failed to initialize ONNX Runtime from {path}: {err}. This build expects ONNX Runtime {ort_expected}."
             ))),
             Err(payload) => {
                 let panic_msg = if let Some(s) = payload.downcast_ref::<&str>() {
@@ -178,8 +176,7 @@ impl OrtConfig {
                     "unknown panic payload".to_string()
                 };
                 Err(crate::FancamError::ort_config(format!(
-                    "ONNX Runtime initialization panicked for {}: {}. This build expects ONNX Runtime {}.",
-                    path, panic_msg, ort_expected
+                    "ONNX Runtime initialization panicked for {path}: {panic_msg}. This build expects ONNX Runtime {ort_expected}."
                 )))
             }
         }
@@ -203,7 +200,8 @@ impl OrtConfig {
     }
 
     /// Generate candidate paths to search for the ORT library.
-    fn candidates() -> Vec<PathBuf> {
+    #[must_use]
+    pub fn candidates() -> Vec<PathBuf> {
         let mut candidates = Vec::new();
 
         // Add relative paths from current directory
@@ -258,7 +256,7 @@ impl Default for OrtConfig {
 /// This function is only safe when:
 /// - Called before any ORT sessions are created
 /// - Called from a single thread (no concurrent env access)
-/// - No other code relies on the previous ORT_DYLIB_PATH value
+/// - No other code relies on the previous `ORT_DYLIB_PATH` value
 #[deprecated(since = "0.2.0", note = "Use OrtConfig::discover() instead")]
 pub fn configure_ort_dylib() {
     #[allow(unsafe_code)]

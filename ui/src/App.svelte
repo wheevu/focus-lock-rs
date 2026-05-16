@@ -17,8 +17,13 @@
     last_frame: number;
     anchor_x: number;
     anchor_y: number;
+    anchor_x_norm?: number;
+    anchor_y_norm?: number;
     thumbnail_data_url: string;
     embedding?: number[];
+    body_embedding?: number[];
+    preview_score?: number;
+    preview_observations?: number;
   };
 
   type DuplicatePair = {
@@ -42,6 +47,7 @@
     rejected_embeddings: number;
     suppressed_clusters: number;
     merged_clusters: number;
+    provisional_tracklets: number;
     candidates: IdentityCandidate[];
     duplicates: DuplicatePair[];
   };
@@ -269,6 +275,7 @@
   let outputPath   = $state('');
   let yoloModel    = $state('');
   let faceModel    = $state('');
+  let identityModel = $state('');
   let threshold    = $state(0.6);
   let modelDir     = $state('');   // resolved at mount time
 
@@ -282,7 +289,7 @@
   let scanStatus: ScanStatus = $state('idle');
   let scanMessage = $state('');
   let scanErr = $state('');
-  let expectedMembersInput = $state('');
+  let expectedMembersInput = $state<string | number | null>('');
   let processingMode: ProcessingMode = $state('fast');
   let scanCandidates = $state<IdentityCandidate[]>([]);
   let duplicatePairs = $state<DuplicatePair[]>([]);
@@ -400,10 +407,12 @@
       modelDir  = dir;
       yoloModel = dir + '/yolov8n.onnx';
       faceModel = dir + '/w600k_mbf.onnx';
+      identityModel = faceModel;
     } catch {
       // fallback — leave as empty string; user can browse
       yoloModel = 'models/yolov8n.onnx';
       faceModel = 'models/w600k_mbf.onnx';
+      identityModel = faceModel;
     }
 
     refreshQueueHealth();
@@ -428,8 +437,8 @@
         if (!activeRenderRunId || e.payload.run_id !== activeRenderRunId) return;
         curFrame  = e.payload.current;
         totFrames = e.payload.total;
-        progress  = e.payload.fraction;
-        updateEta(e.payload.current, e.payload.total, e.payload.fraction);
+        progress  = Math.max(0, Math.min(1, e.payload.fraction));
+        updateEta(e.payload.current, e.payload.total, progress);
       }
     );
     unlistenDone = await listen<RenderDonePayload>(
@@ -626,6 +635,14 @@
     );
   }
 
+  function unresolvedWeakPreviewCandidates() {
+    return activeCandidates().filter(
+      (c) =>
+        ((c.preview_score ?? 0) < 0.58 || (c.preview_observations ?? 0) < 2) &&
+        !acceptedLowConfidenceIds.includes(c.id)
+    );
+  }
+
   function unresolvedDuplicatePairs() {
     return duplicatePairs.filter((p) => {
       if (isIgnored(p.a) || isIgnored(p.b)) return false;
@@ -644,6 +661,7 @@
     if (countMismatchExists()) reasons.push('member count mismatch');
     if (unresolvedDuplicatePairs().length > 0) reasons.push('duplicate identities unresolved');
     if (unresolvedLowConfidenceCandidates().length > 0) reasons.push('low-confidence identities unreviewed');
+    if (unresolvedWeakPreviewCandidates().length > 0) reasons.push('weak-preview identities unreviewed');
     if (pendingSplitIds.length > 0) reasons.push('split requests pending');
     return reasons;
   }
@@ -659,7 +677,18 @@
   }
 
   function visibleCandidates() {
-    return scanCandidates.slice(0, candidateRenderLimit);
+    return [...scanCandidates]
+      .sort((a, b) => {
+        const aPreview = a.preview_score ?? 0;
+        const bPreview = b.preview_score ?? 0;
+        if (bPreview !== aPreview) return bPreview - aPreview;
+        if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+        const aPrevObs = a.preview_observations ?? 0;
+        const bPrevObs = b.preview_observations ?? 0;
+        if (bPrevObs !== aPrevObs) return bPrevObs - aPrevObs;
+        return b.observations - a.observations;
+      })
+      .slice(0, candidateRenderLimit);
   }
 
   function hasMoreCandidates() {
@@ -742,8 +771,16 @@
     return !!yoloModel && !!faceModel;
   }
 
+  function expectedMembersString(): string {
+    if (expectedMembersInput === null || expectedMembersInput === undefined) return '';
+    if (typeof expectedMembersInput === 'number') {
+      return Number.isFinite(expectedMembersInput) ? String(expectedMembersInput) : '';
+    }
+    return String(expectedMembersInput);
+  }
+
   function expectedMembersValue(): number | null {
-    const trimmed = expectedMembersInput.trim();
+    const trimmed = expectedMembersString().trim();
     if (!trimmed) return null;
     const n = Number.parseInt(trimmed, 10);
     if (!Number.isFinite(n) || n <= 0) return null;
@@ -751,7 +788,7 @@
   }
 
   function expectedMembersInvalid() {
-    const trimmed = expectedMembersInput.trim();
+    const trimmed = expectedMembersString().trim();
     if (!trimmed) return false;
     const n = Number.parseInt(trimmed, 10);
     return !Number.isFinite(n) || n <= 0;
@@ -869,6 +906,7 @@
           video: videoPath,
           yolo_model: yoloModel,
           face_model: faceModel,
+          identity_model: identityModel || faceModel,
           expected_member_count: expectedMembersValue(),
           processing_mode: processingMode,
           client_run_id: activeScanRunId,
@@ -892,7 +930,15 @@
       processingMode = normalizeProcessingMode(result.processing_mode);
       scanEstimatedTotalSamples = result.sampled_frames;
       scanPassFraction = 1;
-      scanTelemetrySummary = `mode ${normalizeProcessingMode(result.processing_mode)} · rejected ${result.rejected_embeddings} · suppressed ${result.suppressed_clusters} · merged ${result.merged_clusters}`;
+      const avgPreview =
+        result.candidates.length > 0
+          ? result.candidates.reduce((sum, c) => sum + (c.preview_score ?? 0), 0) /
+            result.candidates.length
+          : 0;
+      const weakPreview = result.candidates.filter(
+        (c) => (c.preview_score ?? 0) < 0.58 || (c.preview_observations ?? 0) < 2
+      ).length;
+      scanTelemetrySummary = `mode ${normalizeProcessingMode(result.processing_mode)} · tracklets ${result.provisional_tracklets} · rejected ${result.rejected_embeddings} · suppressed ${result.suppressed_clusters} · merged ${result.merged_clusters} · preview ${(avgPreview * 100).toFixed(0)}% avg · weak ${weakPreview}`;
       scanProgressFraction = 1;
       scanPhase = result.rescan_performed ? 'informed rescan' : 'initial scan';
       scanPassIndex = result.rescan_performed ? 2 : 1;
@@ -965,6 +1011,7 @@
           video: videoPath,
           yolo_model: yoloModel,
           face_model: faceModel,
+          identity_model: identityModel || faceModel,
           expected_member_count: expectedMembersValue(),
           processing_mode: processingMode,
         },
@@ -1371,9 +1418,10 @@
       scanMessage = `loaded saved scan (${detail.status})`;
       scanErr = '';
       autoReviewSuspended = false;
-      expectedMembersInput = detail.expected_count !== undefined && detail.expected_count !== null
-        ? String(detail.expected_count)
-        : '';
+      expectedMembersInput =
+        detail.expected_count !== undefined && detail.expected_count !== null
+          ? detail.expected_count
+          : null;
       processingMode = normalizeProcessingMode(detail.processing_mode);
       scanCandidates = detail.candidates;
       candidateRenderLimit = Math.min(24, detail.candidates.length);
@@ -1600,6 +1648,7 @@
             output:     outputPath,
               yolo_model: yoloModel,
               face_model: faceModel,
+              identity_model: identityModel || faceModel,
               threshold,
               processing_mode: processingMode,
               target_embedding: selectedIdentityEmbedding(),
@@ -1695,9 +1744,10 @@
     }
 
     const elapsed = Math.max((Date.now() - startedAtMs) / 1000, 0.01);
+    const normalizedFraction = Math.max(0, Math.min(1, fraction));
     const ratio =
-      fraction > 0
-        ? fraction
+      normalizedFraction > 0
+        ? normalizedFraction
         : total > 0 && current > 0
           ? current / total
           : 0;
@@ -2187,6 +2237,11 @@
               min="1"
               step="1"
               bind:value={expectedMembersInput}
+              oninput={() => {
+                if (scanStatus === 'done' && scanId && !autoReviewSuspended) {
+                  scheduleReviewValidation(false);
+                }
+              }}
               placeholder="optional"
             />
           </label>
@@ -2301,6 +2356,15 @@
             </div>
           {/if}
 
+          {#if unresolvedWeakPreviewCandidates().length > 0}
+            <div class="scan-warning">
+              weak-preview cards need confirmation:
+              {#each unresolvedWeakPreviewCandidates() as c, idx}
+                <span>{idx === 0 ? ' ' : ', '}#{c.id + 1}</span>
+              {/each}
+            </div>
+          {/if}
+
           {#if countMismatchExists()}
             <div class="scan-warning">
               active members ({activeCandidates().length}) do not match expected count ({expectedMembersValue()})
@@ -2338,8 +2402,15 @@
                     <span class="identity-name">member {candidate.id + 1}</span>
                     <span>confidence {(candidate.confidence * 100).toFixed(0)}%</span>
                     <span>{candidate.observations} samples</span>
+                    <span>preview {((candidate.preview_score ?? 0) * 100).toFixed(0)}%</span>
+                    <span>{candidate.preview_observations ?? 0} preview samples</span>
                     {#if candidate.confidence < 0.55}
                       <span class="confidence-tag">low confidence</span>
+                    {/if}
+                    {#if (candidate.preview_score ?? 0) >= 0.58 && (candidate.preview_observations ?? 0) >= 2}
+                      <span class="preview-tag strong">preview strong</span>
+                    {:else}
+                      <span class="preview-tag weak">preview weak</span>
                     {/if}
                   </div>
                   <div class="identity-actions">
@@ -2353,7 +2424,7 @@
                     >
                       {isIgnored(candidate.id) ? 'include' : 'exclude'}
                     </button>
-                    {#if candidate.confidence < 0.55}
+                    {#if candidate.confidence < 0.55 || (candidate.preview_score ?? 0) < 0.58 || (candidate.preview_observations ?? 0) < 2}
                       <button
                         type="button"
                         class="ghost-btn tiny"
@@ -3041,6 +3112,24 @@
     border-radius: 999px;
     padding: 1px 7px;
     font-size: 10px;
+  }
+  .preview-tag {
+    display: inline-flex;
+    width: fit-content;
+    border-radius: 999px;
+    padding: 1px 7px;
+    font-size: 10px;
+    border: 1px solid transparent;
+  }
+  .preview-tag.strong {
+    border-color: #2e5d47;
+    color: #8fe2bc;
+    background: #173529;
+  }
+  .preview-tag.weak {
+    border-color: #5b4732;
+    color: #f5c992;
+    background: #2e2418;
   }
   .identity-actions {
     display: flex;

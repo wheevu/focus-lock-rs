@@ -28,16 +28,34 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::detection::{Detector, FaceIdentifier};
+use crate::camera::CameraCursor;
+use crate::detection::{BBox, Detector, FaceIdentifier};
 use crate::mode::ProcessingMode;
 use crate::reid::BodyReidentifier;
 use crate::rendering::FrameRenderer;
+use crate::solver::{IdentitySolver, SolverResult};
 use crate::tracking::{CameraState, TargetTracker, TrackingState};
+use crate::tracklet::Tracklet;
+use crate::video;
 use crate::video::RgbFrame;
+
+const TRACKLET_MAX_GAP_FRAMES: u64 = 6;
+const TRACKLET_MIN_IOU: f32 = 0.12;
+const TRACKLET_MAX_CENTER_DISTANCE_NORM: f32 = 0.24;
+const OBS_MATCH_MIN_SCORE: f32 = 0.56;
+
+/// Progress updates emitted while building offline prepass tracklets.
+#[derive(Debug, Clone, Copy)]
+pub struct OfflinePrepassProgress {
+    /// Number of decoded frames seen in prepass.
+    pub decoded_frames: u64,
+    /// Number of sampled frames actually processed for identity cues.
+    pub sampled_frames: u64,
+}
 
 /// Analyzes video frames to detect and identify the target person.
 ///
-/// The analyzer runs YOLO detection and ArcFace identification on each frame,
+/// The analyzer runs YOLO detection and `ArcFace` identification on each frame,
 /// then feeds the results to the tracker for smooth camera movement.
 ///
 /// Profiling metrics are logged every 300 frames to help diagnose performance.
@@ -52,16 +70,21 @@ pub struct Analyzer {
     prof_detect: Duration,
     prof_identify: Duration,
     prof_reid: Duration,
+    offline_cursor: Option<CameraCursor>,
+    offline_frame_index: u64,
+    mode: ProcessingMode,
 }
 
 impl Analyzer {
     /// Creates a new analyzer with the given detector, identifier, and tracker.
-    pub fn new(
+    #[must_use]
+    pub const fn new(
         detector: Detector,
         identifier: FaceIdentifier,
         body_reidentifier: Option<BodyReidentifier>,
         body_gallery: Vec<Vec<f32>>,
         tracker: TargetTracker,
+        mode: ProcessingMode,
     ) -> Self {
         Self {
             detector,
@@ -73,6 +96,9 @@ impl Analyzer {
             prof_detect: Duration::ZERO,
             prof_identify: Duration::ZERO,
             prof_reid: Duration::ZERO,
+            offline_cursor: None,
+            offline_frame_index: 0,
+            mode,
         }
     }
 
@@ -83,6 +109,11 @@ impl Analyzer {
     ///
     /// Profiling metrics are logged every 300 frames.
     pub fn analyze(&mut self, frame: &RgbFrame) -> Option<CameraState> {
+        if let Some(cursor) = self.offline_cursor.as_mut() {
+            self.offline_frame_index = self.offline_frame_index.saturating_add(1);
+            return cursor.camera_for_frame(self.offline_frame_index);
+        }
+
         let run_recognition = self.tracker.should_run_recognition();
 
         let detect_start = Instant::now();
@@ -180,24 +211,367 @@ impl Analyzer {
 
         camera
     }
+
+    /// Enable offline solved camera mode from prebuilt tracklets.
+    pub fn enable_offline_from_tracklets(&mut self, tracklets: &[Tracklet]) {
+        let solved = IdentitySolver::solve(tracklets);
+        self.enable_offline_from_solver_result(solved);
+    }
+
+    /// Enable offline solved camera mode from an existing solver result.
+    pub fn enable_offline_from_solver_result(&mut self, solved: SolverResult) {
+        if solved.camera_path.is_empty() {
+            self.offline_cursor = None;
+            self.offline_frame_index = 0;
+            return;
+        }
+        if let Some(identity_id) = solved.selected_identity_id {
+            tracing::info!(identity_id, "offline identity selected for render");
+        }
+        self.offline_cursor = Some(CameraCursor::from_path(solved.camera_path));
+        self.offline_frame_index = 0;
+    }
+
+    /// Disable offline mode and return to online tracking.
+    pub fn disable_offline_mode(&mut self) {
+        self.offline_cursor = None;
+        self.offline_frame_index = 0;
+    }
+
+    /// Pass-1 helper: build short-term tracklets from frame stream.
+    pub fn build_tracklets<F>(&mut self, frame_source: F) -> Result<Vec<Tracklet>>
+    where
+        F: FnOnce() -> Result<Vec<(u64, RgbFrame)>>,
+    {
+        let frames = frame_source()?;
+        let mut next_tracklet_id = 0usize;
+        let mut tracklets = Vec::<Tracklet>::new();
+
+        for (frame_index, frame) in frames {
+            let persons = self.detector.detect(&frame)?;
+            if persons.is_empty() {
+                continue;
+            }
+
+            let mut observations = self
+                .identifier
+                .observations(&frame, &persons, self.tracker.search_hint())?
+                .into_iter()
+                .collect::<Vec<crate::detection::FaceObservation>>();
+
+            if !observations.is_empty()
+                && !self.body_gallery.is_empty()
+                && let Some(body_reid) = self.body_reidentifier.as_ref()
+            {
+                let _ = body_reid.annotate_observations_with_gallery(
+                    &frame,
+                    &mut observations,
+                    &self.body_gallery,
+                );
+            }
+
+            let mut identity_rows = observations
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<crate::observation::IdentityObservation>>();
+
+            for bbox in persons {
+                let identity = take_best_identity_for_bbox(&mut identity_rows, bbox)
+                    .unwrap_or_else(|| {
+                        crate::observation::IdentityObservation::from_face_scores(
+                            bbox, 0.0, -1.0, 0.0, None,
+                        )
+                    });
+
+                let best_idx = find_tracklet_assignment(
+                    &tracklets,
+                    frame_index,
+                    bbox,
+                    &identity,
+                    frame.width,
+                    frame.height,
+                );
+                if let Some(tracklet_idx) = best_idx {
+                    if let Some(tracklet) = tracklets.get_mut(tracklet_idx) {
+                        tracklet.push(frame_index, bbox, identity);
+                        continue;
+                    }
+                }
+
+                let mut tracklet = Tracklet::new(next_tracklet_id);
+                next_tracklet_id = next_tracklet_id.saturating_add(1);
+                tracklet.push(frame_index, bbox, identity);
+                tracklets.push(tracklet);
+            }
+        }
+
+        // Discard one-off fragments unless they are high-confidence.
+        Ok(tracklets
+            .into_iter()
+            .filter(|tracklet| tracklet.len() > 1 || tracklet.best_composite_score() >= 0.66)
+            .collect())
+    }
+
+    /// Pass-1 helper: build short-term tracklets directly from a source video.
+    ///
+    /// This decodes frames incrementally and does not retain full-frame RGB
+    /// buffers, so it is suitable for long videos.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decode, detection, or identity inference fails.
+    pub fn build_tracklets_from_video<P: AsRef<Path>>(
+        &mut self,
+        video_path: P,
+    ) -> Result<Vec<Tracklet>> {
+        self.build_tracklets_from_video_with_hooks(video_path, |_| {}, || false)
+    }
+
+    /// Pass-1 helper: build short-term tracklets from a source video with
+    /// progress and cancellation hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decode, detection, identity inference fails, or the
+    /// cancellation hook requests stop.
+    pub fn build_tracklets_from_video_with_hooks<P, F, C>(
+        &mut self,
+        video_path: P,
+        mut on_progress: F,
+        mut should_cancel: C,
+    ) -> Result<Vec<Tracklet>>
+    where
+        P: AsRef<Path>,
+        F: FnMut(OfflinePrepassProgress),
+        C: FnMut() -> bool,
+    {
+        let mut next_tracklet_id = 0usize;
+        let mut tracklets = Vec::<Tracklet>::new();
+        let mut sampled_frames = 0u64;
+        let sample_stride = self.offline_sample_stride().max(1);
+
+        video::for_each_rgb_frame(video_path, |frame_index, frame| {
+            if should_cancel() {
+                anyhow::bail!("offline prepass cancelled");
+            }
+
+            if sample_stride > 1 && !frame_index.is_multiple_of(sample_stride) {
+                on_progress(OfflinePrepassProgress {
+                    decoded_frames: frame_index,
+                    sampled_frames,
+                });
+                return Ok(false);
+            }
+
+            sampled_frames = sampled_frames.saturating_add(1);
+            let persons = self.detector.detect(frame)?;
+            if persons.is_empty() {
+                on_progress(OfflinePrepassProgress {
+                    decoded_frames: frame_index,
+                    sampled_frames,
+                });
+                return Ok(false);
+            }
+
+            let mut observations = self
+                .identifier
+                .observations(frame, &persons, self.tracker.search_hint())?
+                .into_iter()
+                .collect::<Vec<crate::detection::FaceObservation>>();
+
+            if !observations.is_empty()
+                && !self.body_gallery.is_empty()
+                && let Some(body_reid) = self.body_reidentifier.as_ref()
+            {
+                let _ = body_reid.annotate_observations_with_gallery(
+                    frame,
+                    &mut observations,
+                    &self.body_gallery,
+                );
+            }
+
+            let mut identity_rows = observations
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<crate::observation::IdentityObservation>>();
+
+            for bbox in persons {
+                let identity = take_best_identity_for_bbox(&mut identity_rows, bbox)
+                    .unwrap_or_else(|| {
+                        crate::observation::IdentityObservation::from_face_scores(
+                            bbox, 0.0, -1.0, 0.0, None,
+                        )
+                    });
+
+                let best_idx = find_tracklet_assignment(
+                    &tracklets,
+                    frame_index,
+                    bbox,
+                    &identity,
+                    frame.width,
+                    frame.height,
+                );
+                if let Some(tracklet_idx) = best_idx {
+                    if let Some(tracklet) = tracklets.get_mut(tracklet_idx) {
+                        tracklet.push(frame_index, bbox, identity);
+                        continue;
+                    }
+                }
+
+                let mut tracklet = Tracklet::new(next_tracklet_id);
+                next_tracklet_id = next_tracklet_id.saturating_add(1);
+                tracklet.push(frame_index, bbox, identity);
+                tracklets.push(tracklet);
+            }
+
+            on_progress(OfflinePrepassProgress {
+                decoded_frames: frame_index,
+                sampled_frames,
+            });
+
+            Ok(false)
+        })?;
+
+        Ok(tracklets
+            .into_iter()
+            .filter(|tracklet| tracklet.len() > 1 || tracklet.best_composite_score() >= 0.66)
+            .collect())
+    }
+
+    const fn offline_sample_stride(&self) -> u64 {
+        match self.mode {
+            ProcessingMode::Fast => 3,
+            ProcessingMode::Balanced => 2,
+            ProcessingMode::Quality => 1,
+        }
+    }
+
+    /// Pass-2 helper: run global identity solving on tracklets.
+    #[must_use]
+    pub fn solve_tracklets(&self, tracklets: &[Tracklet]) -> SolverResult {
+        IdentitySolver::solve(tracklets)
+    }
 }
 
-fn recovery_priority(
-    obs: crate::detection::FaceObservation,
-    last_bbox: crate::detection::BBox,
+fn take_best_identity_for_bbox(
+    rows: &mut Vec<crate::observation::IdentityObservation>,
+    bbox: BBox,
+) -> Option<crate::observation::IdentityObservation> {
+    let mut best: Option<(usize, f32)> = None;
+    for (idx, row) in rows.iter().enumerate() {
+        let iou = row.bbox.iou(&bbox).clamp(0.0, 1.0);
+        let dx = row.bbox.center_x() - bbox.center_x();
+        let dy = row.bbox.center_y() - bbox.center_y();
+        let center_distance = dx.hypot(dy);
+        let scale = bbox.width().max(bbox.height()).max(1.0);
+        let center_term = (1.0 - (center_distance / scale).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let score = iou * 0.85 + center_term * 0.15;
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((idx, score));
+        }
+    }
+
+    let (idx, score) = best?;
+    (score >= OBS_MATCH_MIN_SCORE).then_some(rows.swap_remove(idx))
+}
+
+fn find_tracklet_assignment(
+    tracklets: &[Tracklet],
+    frame_index: u64,
+    bbox: BBox,
+    identity: &crate::observation::IdentityObservation,
+    frame_width: u32,
+    frame_height: u32,
+) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+
+    for (idx, tracklet) in tracklets.iter().enumerate() {
+        let Some(last_obs) = tracklet.last_observation() else {
+            continue;
+        };
+
+        let frame_gap = frame_index.saturating_sub(last_obs.frame_index);
+        if frame_gap == 0 || frame_gap > TRACKLET_MAX_GAP_FRAMES {
+            continue;
+        }
+
+        let iou = last_obs.bbox.iou(&bbox).clamp(0.0, 1.0);
+        let center_distance = normalized_distance(
+            last_obs.bbox.center_x(),
+            last_obs.bbox.center_y(),
+            bbox.center_x(),
+            bbox.center_y(),
+            frame_width,
+            frame_height,
+        );
+        if iou < TRACKLET_MIN_IOU && center_distance > TRACKLET_MAX_CENTER_DISTANCE_NORM {
+            continue;
+        }
+
+        let appearance = cosine_like(
+            last_obs.observation.similarity,
+            last_obs.observation.impostor_similarity,
+            identity.similarity,
+            identity.impostor_similarity,
+        );
+
+        let score = identity.composite_score().clamp(0.0, 1.0).mul_add(
+            0.05,
+            ((appearance + 1.0) * 0.5).clamp(0.0, 1.0).mul_add(
+                0.20,
+                iou * 0.45
+                    + (1.0 - (center_distance / TRACKLET_MAX_CENTER_DISTANCE_NORM).clamp(0.0, 1.0))
+                        * 0.30,
+            ),
+        ) - ((frame_gap.saturating_sub(1)) as f32 * 0.03).clamp(0.0, 0.15);
+
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((idx, score));
+        }
+    }
+
+    best.and_then(|(idx, score)| (score > 0.0).then_some(idx))
+}
+
+fn normalized_distance(
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    frame_width: u32,
+    frame_height: u32,
 ) -> f32 {
+    let dx = ax - bx;
+    let dy = ay - by;
+    let distance = dx.hypot(dy);
+    let norm = (frame_width.max(1) as f32)
+        .hypot(frame_height.max(1) as f32)
+        .max(1.0);
+    (distance / norm).clamp(0.0, 1.0)
+}
+
+fn cosine_like(a_sim: f32, a_imp: f32, b_sim: f32, b_imp: f32) -> f32 {
+    // Heuristic compatibility score from ranked similarities/margins.
+    let a_margin = a_sim - a_imp;
+    let b_margin = b_sim - b_imp;
+    let dot = a_sim.mul_add(b_sim, a_margin * b_margin);
+    let an = a_sim.hypot(a_margin).max(1e-5);
+    let bn = b_sim.hypot(b_margin).max(1e-5);
+    (dot / (an * bn)).clamp(-1.0, 1.0)
+}
+
+fn recovery_priority(obs: crate::detection::FaceObservation, last_bbox: BBox) -> f32 {
     let iou = obs.bbox.iou(&last_bbox).clamp(0.0, 1.0);
     let dx = obs.bbox.center_x() - last_bbox.center_x();
     let dy = obs.bbox.center_y() - last_bbox.center_y();
-    let distance = (dx * dx + dy * dy).sqrt();
+    let distance = dx.hypot(dy);
     let norm = (last_bbox.width().max(last_bbox.height()) * 6.5).max(1.0);
     let proximity = 1.0 - (distance / norm).clamp(0.0, 1.0);
     let body = obs
         .body_similarity
-        .map(|sim| ((sim + 1.0) * 0.5).clamp(0.0, 1.0))
-        .unwrap_or(0.0);
+        .map_or(0.0, |sim| ((sim + 1.0) * 0.5).clamp(0.0, 1.0));
 
-    obs.similarity * 0.55 + obs.margin * 0.15 + iou * 0.16 + proximity * 0.10 + body * 0.04
+    obs.similarity.mul_add(0.50, obs.margin * 0.13) + iou * 0.15 + proximity * 0.08 + body * 0.14
 }
 
 /// Renders output frames by cropping and scaling to the target resolution.
@@ -216,7 +590,8 @@ pub struct Renderer {
 
 impl Renderer {
     /// Creates a new renderer wrapping the given frame renderer.
-    pub fn new(renderer: FrameRenderer) -> Self {
+    #[must_use]
+    pub const fn new(renderer: FrameRenderer) -> Self {
         Self {
             renderer,
             prof_frames: 0,
@@ -290,6 +665,7 @@ impl Pipeline {
                 body_reidentifier,
                 body_gallery,
                 tracker,
+                mode,
             ),
             renderer: Renderer::new(renderer),
         }
@@ -299,8 +675,8 @@ impl Pipeline {
     ///
     /// # Arguments
     ///
-    /// * `yolo_model_path` - Path to the YOLOv8 ONNX model for person detection
-    /// * `face_model_path` - Path to the ArcFace ONNX model for face identification
+    /// * `yolo_model_path` - Path to the `YOLOv8` ONNX model for person detection
+    /// * `face_model_path` - Path to the `ArcFace` ONNX model for face identification
     /// * `reference_image_path` - Path to the reference face image of the target person
     /// * `similarity_threshold` - Cosine similarity threshold (0.0-1.0) for matching
     ///
@@ -330,8 +706,8 @@ impl Pipeline {
     ///
     /// # Arguments
     ///
-    /// * `yolo_model_path` - Path to the YOLOv8 ONNX model
-    /// * `face_model_path` - Path to the ArcFace ONNX model
+    /// * `yolo_model_path` - Path to the `YOLOv8` ONNX model
+    /// * `face_model_path` - Path to the `ArcFace` ONNX model
     /// * `reference_image_path` - Path to the reference face image
     /// * `similarity_threshold` - Cosine similarity threshold (0.0-1.0)
     /// * `initial_search_hint` - Optional (x, y) starting position hint
@@ -460,5 +836,48 @@ impl Pipeline {
     #[must_use]
     pub fn into_parts(self) -> (Analyzer, Renderer) {
         (self.analyzer, self.renderer)
+    }
+
+    /// Solve an offline camera path and consume the pipeline into parts.
+    ///
+    /// This runs a first pass to build short-term tracklets from the video,
+    /// then a second pass uses solved camera states for render-time framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding or inference fails during tracklet build.
+    pub fn into_parts_with_offline_solution<P: AsRef<Path>>(
+        self,
+        video_path: P,
+    ) -> Result<(Analyzer, Renderer)> {
+        self.into_parts_with_offline_solution_with_hooks(video_path, |_| {}, || false)
+    }
+
+    /// Solve an offline camera path and consume the pipeline into parts,
+    /// forwarding prepass progress and cancellation hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding or inference fails during tracklet build,
+    /// or if cancellation is requested.
+    pub fn into_parts_with_offline_solution_with_hooks<P, F, C>(
+        mut self,
+        video_path: P,
+        on_progress: F,
+        should_cancel: C,
+    ) -> Result<(Analyzer, Renderer)>
+    where
+        P: AsRef<Path>,
+        F: FnMut(OfflinePrepassProgress),
+        C: FnMut() -> bool,
+    {
+        let tracklets = self.analyzer.build_tracklets_from_video_with_hooks(
+            video_path,
+            on_progress,
+            should_cancel,
+        )?;
+        let solved = self.analyzer.solve_tracklets(&tracklets);
+        self.analyzer.enable_offline_from_solver_result(solved);
+        Ok((self.analyzer, self.renderer))
     }
 }

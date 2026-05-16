@@ -12,7 +12,7 @@ use thiserror::Error;
 /// model inference, and pipeline execution.
 #[derive(Error, Debug)]
 pub enum FancamError {
-    /// Error loading an ML model (YOLOv8, ArcFace, etc.)
+    /// Error loading an ML model (`YOLOv8`, `ArcFace`, etc.)
     #[error("Failed to load model at {path}: {source}")]
     ModelLoad {
         /// Path to the model file
@@ -183,7 +183,7 @@ impl FancamError {
 /// Result type alias for fancam-core
 pub type Result<T> = std::result::Result<T, FancamError>;
 
-/// Convert anyhow::Error to FancamError
+/// Convert `anyhow::Error` to `FancamError`
 impl From<anyhow::Error> for FancamError {
     fn from(err: anyhow::Error) -> Self {
         Self::Unexpected(err.to_string())
@@ -192,7 +192,7 @@ impl From<anyhow::Error> for FancamError {
 
 /// Helper trait for converting poison errors
 pub trait PoisonExt<T> {
-    /// Convert a poison error to FancamError
+    /// Convert a poison error to `FancamError`
     fn to_fancam_err(self, context: &str) -> Result<T>;
 }
 

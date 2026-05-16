@@ -12,26 +12,27 @@ use ort::value::Tensor;
 use rayon::prelude::*;
 
 use crate::detection::{BBox, FaceObservation};
+use crate::observation::IdentityObservation;
 use crate::video::RgbFrame;
 use crate::{FancamError, Result};
 
-/// OSNet input width.
+/// `OSNet` input width.
 const REID_WIDTH: u32 = 128;
-/// OSNet input height.
+/// `OSNet` input height.
 const REID_HEIGHT: u32 = 256;
-/// Session pool size for ReID scoring.
+/// Session pool size for `ReID` scoring.
 const REID_SESSION_POOL: usize = 8;
-/// Max detections scored with ReID per frame.
+/// Max detections scored with `ReID` per frame.
 const REID_MAX_CANDIDATES: usize = 16;
 
-/// Body ReID scorer backed by ONNX Runtime sessions.
+/// Body `ReID` scorer backed by ONNX Runtime sessions.
 #[derive(Debug)]
 pub struct BodyReidentifier {
     sessions: Vec<Mutex<Session>>,
 }
 
 impl BodyReidentifier {
-    /// Load a body ReID model.
+    /// Load a body `ReID` model.
     ///
     /// # Errors
     ///
@@ -164,6 +165,42 @@ impl BodyReidentifier {
 
         Ok(())
     }
+
+    /// Annotate generic identity observations with body similarities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if inference fails.
+    pub fn annotate_identity_observations_with_gallery(
+        &self,
+        frame: &RgbFrame,
+        observations: &mut [IdentityObservation],
+        target_gallery: &[Vec<f32>],
+    ) -> Result<()> {
+        if observations.is_empty() {
+            return Ok(());
+        }
+
+        let mut legacy = observations
+            .iter()
+            .map(|obs| FaceObservation {
+                bbox: obs.bbox,
+                similarity: obs.similarity,
+                impostor_similarity: obs.impostor_similarity,
+                margin: obs.margin,
+                body_similarity: obs.body_similarity,
+            })
+            .collect::<Vec<_>>();
+
+        self.annotate_observations_with_gallery(frame, &mut legacy, target_gallery)?;
+
+        for (identity, face) in observations.iter_mut().zip(legacy.into_iter()) {
+            identity.body_similarity = face.body_similarity;
+            identity.sync_default_cues();
+        }
+
+        Ok(())
+    }
 }
 
 fn run_reid_inference(
@@ -178,7 +215,7 @@ fn run_reid_inference(
 fn body_tensor_from_data(tensor_data: Vec<f32>) -> Result<ort::value::DynValue> {
     let shape = [1usize, 3, REID_HEIGHT as usize, REID_WIDTH as usize];
     Tensor::from_array((shape, tensor_data.into_boxed_slice()))
-        .map(|t| t.into_dyn())
+        .map(ort::value::Value::into_dyn)
         .map_err(|e| {
             FancamError::inference(format!("failed to create body reid input tensor: {e}"))
         })
@@ -213,9 +250,9 @@ fn preprocess_body_from_bbox(frame: &RgbFrame, bbox: BBox) -> Result<Vec<f32>> {
     let size = (REID_WIDTH * REID_HEIGHT) as usize;
     let mut tensor = vec![0f32; 3 * size];
     for idx in 0..size {
-        tensor[idx] = raw[idx * 3] as f32 / 255.0;
-        tensor[size + idx] = raw[idx * 3 + 1] as f32 / 255.0;
-        tensor[2 * size + idx] = raw[idx * 3 + 2] as f32 / 255.0;
+        tensor[idx] = f32::from(raw[idx * 3]) / 255.0;
+        tensor[size + idx] = f32::from(raw[idx * 3 + 1]) / 255.0;
+        tensor[2 * size + idx] = f32::from(raw[idx * 3 + 2]) / 255.0;
     }
     Ok(tensor)
 }

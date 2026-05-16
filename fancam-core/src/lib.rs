@@ -24,7 +24,9 @@
 //!     0.6, // similarity threshold
 //! ).expect("Failed to load pipeline");
 //!
-//! let (mut analyzer, mut renderer) = pipeline.into_parts();
+//! let (mut analyzer, mut renderer) = pipeline
+//!     .into_parts_with_offline_solution("input.mp4")
+//!     .expect("Failed to build offline prepass");
 //! // Use analyzer and renderer in your processing loop...
 //! ```
 
@@ -48,15 +50,20 @@
 // Deny unsafe code by default - explicit exceptions required
 #![deny(unsafe_code)]
 
+pub mod camera;
 pub mod detection;
 pub mod discovery;
 pub mod error;
+pub mod face;
 pub mod mode;
+pub mod observation;
 pub mod pipeline;
 pub mod reid;
 pub mod rendering;
 pub mod runtime;
+pub mod solver;
 pub mod tracking;
+pub mod tracklet;
 pub mod video;
 
 // Re-export error types

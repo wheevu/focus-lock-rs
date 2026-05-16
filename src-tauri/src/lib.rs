@@ -13,7 +13,7 @@ pub struct CancelFlag(pub Arc<AtomicBool>);
 /// Cancel flag shared with active identity scan jobs.
 pub struct ScanCancelFlag(pub Arc<AtomicBool>);
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RenderJobState {
     pub running: bool,
     pub cancelling: bool,
@@ -31,15 +31,6 @@ impl Default for CancelFlag {
 impl Default for ScanCancelFlag {
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
-    }
-}
-
-impl Default for RenderJobState {
-    fn default() -> Self {
-        Self {
-            running: false,
-            cancelling: false,
-        }
     }
 }
 

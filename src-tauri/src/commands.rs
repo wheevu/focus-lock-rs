@@ -16,7 +16,7 @@ use fancam_core::{
     detection::DEFAULT_IDENTITY_MARGIN_THRESHOLD,
     discovery::{DiscoveryConfig, DiscoveryEngine},
     mode::ProcessingMode,
-    pipeline::Pipeline,
+    pipeline::{OfflinePrepassProgress, Pipeline},
     runtime::OrtConfig,
     video::{total_frames, transcode_with_progress_staged_mode},
 };
@@ -42,6 +42,8 @@ pub struct FancamArgs {
     pub output: String,
     pub yolo_model: String,
     pub face_model: String,
+    #[serde(default)]
+    pub identity_model: Option<String>,
     pub threshold: f32,
     pub scan_id: Option<String>,
     pub selected_identity_id: Option<usize>,
@@ -78,6 +80,10 @@ pub struct IdentityScanArgs {
     pub video: String,
     pub yolo_model: String,
     pub face_model: String,
+    #[serde(default)]
+    pub identity_model: Option<String>,
+    #[serde(default)]
+    pub body_reid_model: Option<String>,
     pub expected_member_count: Option<u32>,
     pub processing_mode: Option<String>,
     pub client_run_id: Option<String>,
@@ -92,9 +98,19 @@ pub struct IdentityCandidatePayload {
     pub last_frame: u64,
     pub anchor_x: f32,
     pub anchor_y: f32,
+    #[serde(default)]
+    pub anchor_x_norm: Option<f32>,
+    #[serde(default)]
+    pub anchor_y_norm: Option<f32>,
     pub thumbnail_data_url: String,
     #[serde(default)]
     pub embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    pub body_embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    pub preview_score: Option<f32>,
+    #[serde(default)]
+    pub preview_observations: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -109,6 +125,8 @@ pub struct IdentityScanCache {
     pub video: String,
     pub yolo_model: String,
     pub face_model: String,
+    #[serde(default)]
+    pub identity_model: Option<String>,
     pub processing_mode: String,
     pub expected_count: Option<u32>,
     pub candidates: Vec<IdentityCandidatePayload>,
@@ -203,6 +221,7 @@ pub struct IdentityScanResult {
     pub rejected_embeddings: u64,
     pub suppressed_clusters: usize,
     pub merged_clusters: usize,
+    pub provisional_tracklets: usize,
     pub candidates: Vec<IdentityCandidatePayload>,
     pub duplicates: Vec<DuplicatePairPayload>,
 }
@@ -243,6 +262,8 @@ pub struct EnqueueDiscoveryJobArgs {
     pub video: String,
     pub yolo_model: String,
     pub face_model: String,
+    #[serde(default)]
+    pub identity_model: Option<String>,
     pub expected_member_count: Option<u32>,
     pub processing_mode: Option<String>,
     pub idempotency_key: Option<String>,
@@ -556,12 +577,15 @@ pub async fn scan_identities(
     let app_for_scan = app.clone();
     let cancel_flag = Arc::clone(&scan_cancel.0);
     let yolo_model = args.yolo_model.clone();
-    let face_model = args.face_model.clone();
+    let identity_model =
+        effective_identity_model(&args.face_model, args.identity_model.as_deref()).to_string();
     let progress_run_id = run_id.clone();
     let scan_result = task::spawn_blocking(move || {
         run_identity_scan_with_hooks(
             IdentityScanArgs {
+                identity_model: args.identity_model.clone(),
                 processing_mode: sanitize_processing_mode(args.processing_mode.as_deref()),
+                body_reid_model: args.body_reid_model.clone(),
                 ..args
             },
             move |progress| {
@@ -606,6 +630,7 @@ pub async fn scan_identities(
         rejected_embeddings = scan_result.rejected_embeddings,
         suppressed_clusters = scan_result.suppressed_clusters,
         merged_clusters = scan_result.merged_clusters,
+        provisional_tracklets = scan_result.provisional_tracklets,
         mode = %scan_result.processing_mode,
         "identity discovery stats"
     );
@@ -620,7 +645,7 @@ pub async fn scan_identities(
             &scan_id,
             &scan_result,
             &yolo_model,
-            &face_model,
+            &identity_model,
         );
         let snapshot = snapshot_scan_entry(&lock, &scan_id)?;
         (scan_id, snapshot)
@@ -655,6 +680,7 @@ fn strip_candidate_embeddings(
         .cloned()
         .map(|mut candidate| {
             candidate.embedding = None;
+            candidate.body_embedding = None;
             candidate
         })
         .collect()
@@ -665,7 +691,7 @@ fn upsert_scan_cache(
     scan_id: &str,
     scan_result: &IdentityScanResult,
     yolo_model: &str,
-    face_model: &str,
+    identity_model: &str,
 ) {
     let now = epoch_ms();
     let mut events = Vec::new();
@@ -687,7 +713,8 @@ fn upsert_scan_cache(
         IdentityScanCache {
             video: scan_result.video.clone(),
             yolo_model: yolo_model.to_string(),
-            face_model: face_model.to_string(),
+            face_model: identity_model.to_string(),
+            identity_model: Some(identity_model.to_string()),
             processing_mode: scan_result.processing_mode.clone(),
             expected_count: scan_result.expected_count,
             candidates: scan_result.candidates.clone(),
@@ -766,11 +793,17 @@ fn status_from_db(value: &str) -> ScanSessionStatus {
 }
 
 fn scan_to_row(scan_id: &str, scan: &IdentityScanCache) -> Result<storage::ScanSessionRow, String> {
+    let identity_model = scan
+        .identity_model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&scan.face_model)
+        .to_string();
     Ok(storage::ScanSessionRow {
         scan_id: scan_id.to_string(),
         video: scan.video.clone(),
         yolo_model: scan.yolo_model.clone(),
-        face_model: scan.face_model.clone(),
+        identity_model,
         status: status_to_db(&scan.status).to_string(),
         expected_count: scan.expected_count.map(|v| v as i64),
         review_ready: scan.review_ready,
@@ -817,7 +850,8 @@ fn row_to_scan(
     Ok(IdentityScanCache {
         video: row.video.clone(),
         yolo_model: row.yolo_model.clone(),
-        face_model: row.face_model.clone(),
+        face_model: row.identity_model.clone(),
+        identity_model: Some(row.identity_model.clone()),
         processing_mode: "fast".to_string(),
         expected_count: row.expected_count.map(|v| v as u32),
         candidates: serde_json::from_str(&row.candidates_json)
@@ -1114,8 +1148,23 @@ where
     OrtConfig::ensure_initialized()
         .map_err(|e| format!("failed to initialize ONNX Runtime: {e}"))?;
 
-    let mut engine = DiscoveryEngine::load(&args.yolo_model, &args.face_model)
-        .map_err(|e| format!("failed to initialize discovery engine: {e}"))?;
+    let identity_model =
+        effective_identity_model(&args.face_model, args.identity_model.as_deref()).to_string();
+
+    let body_reid_model_path = args
+        .body_reid_model
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| resolve_default_body_reid_model(&identity_model));
+
+    let mut engine = DiscoveryEngine::load_with_body_reid(
+        &args.yolo_model,
+        &identity_model,
+        body_reid_model_path.as_deref(),
+    )
+    .map_err(|e| format!("failed to initialize discovery engine: {e}"))?;
 
     let mode = processing_mode_from_option(args.processing_mode.as_deref());
     let mode_label = mode.as_str().to_string();
@@ -1147,7 +1196,10 @@ where
     let mut rescan_performed = false;
 
     let has_duplicates = !report.duplicates.is_empty();
-    let low_confidence = report.candidates.iter().any(|c| c.confidence < 0.6);
+    let low_confidence_or_weak_preview = report
+        .candidates
+        .iter()
+        .any(|c| c.confidence < 0.6 || c.preview_score < 0.58);
 
     if let Some(expected) = args.expected_member_count
         && report.candidates.len() as u32 > expected
@@ -1163,7 +1215,7 @@ where
 
     if should_under_count_rescan
         || (has_duplicates && mode != ProcessingMode::Fast)
-        || low_confidence
+        || low_confidence_or_weak_preview
     {
         rescan_performed = true;
         pass_total = 2;
@@ -1212,13 +1264,18 @@ where
         .is_some_and(|k| report.candidates.len() as u32 != k);
     let duplicate_blocker = !report.duplicates.is_empty();
     let confidence_blocker = report.candidates.iter().any(|c| c.confidence < 0.55);
-    let needs_review = count_blocker || duplicate_blocker || confidence_blocker;
+    let preview_blocker = report
+        .candidates
+        .iter()
+        .any(|c| c.preview_score < 0.58 || c.preview_observations < 2);
+    let needs_review = count_blocker || duplicate_blocker || confidence_blocker || preview_blocker;
 
     let sampled_frames = report.sampled_frames;
     let total_decoded_frames = report.total_decoded_frames;
     let rejected_embeddings = report.rejected_embeddings;
     let suppressed_clusters = report.suppressed_clusters;
     let merged_clusters = report.merged_clusters;
+    let provisional_tracklets = report.provisional_tracklets;
     let discovered = report.candidates;
     let duplicate_rows = report.duplicates;
 
@@ -1232,8 +1289,13 @@ where
             last_frame: c.last_frame,
             anchor_x: c.anchor_x,
             anchor_y: c.anchor_y,
+            anchor_x_norm: Some(c.anchor_x_norm),
+            anchor_y_norm: Some(c.anchor_y_norm),
             thumbnail_data_url: format!("data:image/jpeg;base64,{}", B64.encode(c.thumbnail_jpeg)),
             embedding: Some(c.embedding),
+            body_embedding: c.body_embedding,
+            preview_score: Some(c.preview_score),
+            preview_observations: Some(c.preview_observations),
         })
         .collect::<Vec<_>>();
 
@@ -1278,6 +1340,7 @@ where
         rejected_embeddings,
         suppressed_clusters,
         merged_clusters,
+        provisional_tracklets,
         candidates,
         duplicates,
     })
@@ -1303,9 +1366,7 @@ fn fraction(current: u64, total: u64) -> f64 {
 }
 
 fn processing_mode_from_option(value: Option<&str>) -> ProcessingMode {
-    value
-        .map(ProcessingMode::from_str)
-        .unwrap_or_else(ProcessingMode::default)
+    value.map(ProcessingMode::from_str).unwrap_or_default()
 }
 
 fn processing_mode_string(value: Option<&str>) -> String {
@@ -1331,13 +1392,33 @@ fn tighten_to_expected(
     }
 
     report.candidates.sort_unstable_by(|a, b| {
-        b.observations.cmp(&a.observations).then_with(|| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        b.preview_score
+            .partial_cmp(&a.preview_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.preview_observations.cmp(&a.preview_observations))
+            .then_with(|| b.observations.cmp(&a.observations))
+            .then_with(|| {
+                let a_span = a.last_frame.saturating_sub(a.first_frame);
+                let b_span = b.last_frame.saturating_sub(b.first_frame);
+                b_span.cmp(&a_span)
+            })
     });
-    report.candidates.truncate(expected.saturating_add(2));
+
+    let keep = expected.saturating_add(1);
+    report.candidates.truncate(keep);
+    let keep_ids = report
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id)
+        .collect::<HashSet<_>>();
+    report
+        .duplicates
+        .retain(|pair| keep_ids.contains(&pair.a) && keep_ids.contains(&pair.b));
     report
 }
 
@@ -1401,6 +1482,8 @@ fn compute_review(
     struct ActiveCandidate {
         id: usize,
         confidence: f32,
+        preview_score: f32,
+        preview_observations: u32,
         anchor_x: f32,
         anchor_y: f32,
     }
@@ -1421,6 +1504,8 @@ fn compute_review(
         .map(|candidate| ActiveCandidate {
             id: candidate.id,
             confidence: candidate.confidence,
+            preview_score: candidate.preview_score.unwrap_or_default(),
+            preview_observations: candidate.preview_observations.unwrap_or_default(),
             anchor_x: candidate.anchor_x,
             anchor_y: candidate.anchor_y,
         })
@@ -1469,6 +1554,19 @@ fn compute_review(
     if unresolved_low_confidence > 0 {
         blockers.push(format!(
             "unconfirmed low-confidence identities: {unresolved_low_confidence}"
+        ));
+    }
+
+    let unresolved_weak_preview = active_candidates
+        .iter()
+        .filter(|candidate| {
+            (candidate.preview_score < 0.58 || candidate.preview_observations < 2)
+                && !accepted_low_confidence.contains(&candidate.id)
+        })
+        .count();
+    if unresolved_weak_preview > 0 {
+        blockers.push(format!(
+            "unconfirmed weak-preview identities: {unresolved_weak_preview}"
         ));
     }
 
@@ -1573,42 +1671,33 @@ fn build_runtime_embedding_galleries(
 }
 
 fn build_runtime_body_reid_gallery(scan: &IdentityScanCache, selected_id: usize) -> Vec<Vec<f32>> {
-    let selected = scan
-        .candidates
-        .iter()
-        .find(|candidate| candidate.id == selected_id)
-        .and_then(|candidate| candidate.embedding.clone())
-        .filter(|emb| !emb.is_empty());
-    let Some(selected_embedding) = selected else {
-        return Vec::new();
-    };
-
-    let normalized_target = l2_normalize(&selected_embedding);
-    if normalized_target.is_empty() {
-        return Vec::new();
+    let mut selected_aliases = HashSet::from([selected_id]);
+    for resolution in &scan.resolved_duplicates {
+        if resolution.keep == selected_id {
+            let alias = if resolution.a == selected_id {
+                resolution.b
+            } else {
+                resolution.a
+            };
+            selected_aliases.insert(alias);
+        }
     }
 
-    let mut distances = scan
+    let mut gallery = scan
         .candidates
         .iter()
-        .filter(|candidate| candidate.id != selected_id)
-        .filter_map(|candidate| {
-            let emb = candidate.embedding.as_ref()?;
-            if emb.len() != normalized_target.len() || emb.is_empty() {
-                return None;
-            }
-            let normalized = l2_normalize(emb);
-            let similarity = embedding_cosine_similarity(&normalized_target, &normalized);
-            Some((similarity, normalized))
-        })
+        .filter(|candidate| selected_aliases.contains(&candidate.id))
+        .filter_map(|candidate| candidate.body_embedding.as_ref())
+        .filter(|embedding| !embedding.is_empty())
+        .map(|embedding| l2_normalize(embedding))
+        .filter(|embedding| !embedding.is_empty())
         .collect::<Vec<_>>();
 
-    distances.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut gallery = vec![normalized_target];
-    for (_, emb) in distances.into_iter().take(2) {
-        gallery.push(emb);
+    if !gallery.is_empty() {
+        gallery.sort_by(|a, b| b.len().cmp(&a.len()));
+        gallery.truncate(6);
     }
+
     gallery
 }
 
@@ -1620,10 +1709,6 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / norm).collect()
 }
 
-fn embedding_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
 fn resolve_default_body_reid_model(face_model_path: &str) -> Option<String> {
     let face_path = PathBuf::from(face_model_path);
     let models_dir = face_path.parent()?;
@@ -1632,6 +1717,13 @@ fn resolve_default_body_reid_model(face_model_path: &str) -> Option<String> {
         return Some(preferred.to_string_lossy().into_owned());
     }
     None
+}
+
+fn effective_identity_model<'a>(face_model: &'a str, identity_model: Option<&'a str>) -> &'a str {
+    identity_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(face_model)
 }
 
 #[tauri::command]
@@ -2290,7 +2382,8 @@ pub async fn enqueue_discovery_job(
         scan_id: args.scan_id,
         video: args.video,
         yolo_model: args.yolo_model,
-        face_model: args.face_model,
+        identity_model: effective_identity_model(&args.face_model, args.identity_model.as_deref())
+            .to_string(),
         expected_member_count: args.expected_member_count,
         processing_mode: sanitize_processing_mode(args.processing_mode.as_deref()),
     };
@@ -2316,10 +2409,16 @@ pub async fn enqueue_split_rescan_job(
         let Some(scan) = scans.scans.get(&scan_id) else {
             return Err("scan session not found".to_string());
         };
+        let identity_model = scan
+            .identity_model
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&scan.face_model)
+            .to_string();
         (
             scan.video.clone(),
             scan.yolo_model.clone(),
-            scan.face_model.clone(),
+            identity_model,
             scan.pending_split_ids.clone(),
             scan.selected_identity_id,
             Some(scan.processing_mode.clone()),
@@ -2356,7 +2455,7 @@ pub async fn enqueue_split_rescan_job(
         scan_id: scan_id.clone(),
         video: scan_snapshot.0,
         yolo_model: scan_snapshot.1,
-        face_model: scan_snapshot.2,
+        identity_model: scan_snapshot.2,
         split_identity_ids: scan_snapshot.3,
         processing_mode: sanitize_processing_mode(args.processing_mode.as_deref())
             .or(scan_snapshot.5),
@@ -2448,7 +2547,7 @@ async fn process_next_discovery_job_core(
         let envelope = msg.envelope;
         let payload = envelope.payload.clone();
         let yolo_model = payload.yolo_model.clone();
-        let face_model = payload.face_model.clone();
+        let identity_model = payload.identity_model.clone();
         let app_for_scan = app.clone();
         let queue_run_id = client_run_id.clone();
         let run_result = task::spawn_blocking(move || {
@@ -2456,7 +2555,9 @@ async fn process_next_discovery_job_core(
                 IdentityScanArgs {
                     video: payload.video,
                     yolo_model: payload.yolo_model,
-                    face_model: payload.face_model,
+                    face_model: identity_model.clone(),
+                    identity_model: Some(identity_model),
+                    body_reid_model: None,
                     expected_member_count: payload.expected_member_count,
                     processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
                     client_run_id: queue_run_id,
@@ -2479,7 +2580,7 @@ async fn process_next_discovery_job_core(
                         &envelope.payload.scan_id,
                         &scan_result,
                         &yolo_model,
-                        &face_model,
+                        &payload.identity_model,
                     );
                     snapshot_scan_entry(&scans, &envelope.payload.scan_id)?
                 };
@@ -2560,7 +2661,7 @@ async fn process_next_discovery_job_core(
     let envelope = dequeued.envelope;
     let payload = envelope.payload.clone();
     let yolo_model = payload.yolo_model.clone();
-    let face_model = payload.face_model.clone();
+    let identity_model = payload.identity_model.clone();
     let app_for_scan = app.clone();
     let queue_run_id = client_run_id.clone();
     let run_result = task::spawn_blocking(move || {
@@ -2568,7 +2669,9 @@ async fn process_next_discovery_job_core(
             IdentityScanArgs {
                 video: payload.video,
                 yolo_model: payload.yolo_model,
-                face_model: payload.face_model,
+                face_model: identity_model.clone(),
+                identity_model: Some(identity_model),
+                body_reid_model: None,
                 expected_member_count: payload.expected_member_count,
                 processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
                 client_run_id: queue_run_id,
@@ -2590,7 +2693,7 @@ async fn process_next_discovery_job_core(
                     &payload.scan_id,
                     &scan_result,
                     &yolo_model,
-                    &face_model,
+                    &payload.identity_model,
                 );
                 snapshot_scan_entry(&scans, &payload.scan_id)?
             };
@@ -2690,7 +2793,7 @@ async fn process_next_rescan_job_core(
         let envelope = msg.envelope;
         let payload = envelope.payload.clone();
         let yolo_model = payload.yolo_model.clone();
-        let face_model = payload.face_model.clone();
+        let identity_model = payload.identity_model.clone();
         let video = payload.video.clone();
         let app_for_scan = app.clone();
         let queue_run_id = client_run_id.clone();
@@ -2699,7 +2802,9 @@ async fn process_next_rescan_job_core(
                 IdentityScanArgs {
                     video,
                     yolo_model,
-                    face_model,
+                    face_model: identity_model.clone(),
+                    identity_model: Some(identity_model),
+                    body_reid_model: None,
                     expected_member_count: None,
                     processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
                     client_run_id: queue_run_id,
@@ -2820,7 +2925,9 @@ async fn process_next_rescan_job_core(
                 IdentityScanArgs {
                     video: payload.video,
                     yolo_model: payload.yolo_model,
-                    face_model: payload.face_model,
+                    face_model: payload.identity_model.clone(),
+                    identity_model: Some(payload.identity_model),
+                    body_reid_model: None,
                     expected_member_count: None,
                     processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
                     client_run_id: queue_run_id,
@@ -3351,6 +3458,10 @@ pub async fn run_fancam(
                 .validated_threshold
                 .unwrap_or(args.threshold)
                 .clamp(0.0, 1.0);
+            args.identity_model = scan
+                .identity_model
+                .clone()
+                .or_else(|| Some(scan.face_model.clone()));
             args.selected_identity_id = scan.selected_identity_id;
             args.target_anchor_x = scan.selected_anchor_x;
             args.target_anchor_y = scan.selected_anchor_y;
@@ -3370,7 +3481,12 @@ pub async fn run_fancam(
                     args.identity_margin_threshold
                         .get_or_insert(DEFAULT_IDENTITY_MARGIN_THRESHOLD);
                     if args.body_reid_model.is_none() {
-                        args.body_reid_model = resolve_default_body_reid_model(&scan.face_model);
+                        let identity_model = scan
+                            .identity_model
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or(&scan.face_model);
+                        args.body_reid_model = resolve_default_body_reid_model(identity_model);
                     }
                 }
             }
@@ -3500,7 +3616,8 @@ fn validate_fancam_paths(args: &FancamArgs) -> Result<(), String> {
     let video_path = PathBuf::from(args.video.trim());
     let output_path = PathBuf::from(args.output.trim());
     let yolo_model = PathBuf::from(args.yolo_model.trim());
-    let face_model = PathBuf::from(args.face_model.trim());
+    let identity_model = effective_identity_model(&args.face_model, args.identity_model.as_deref());
+    let face_model = PathBuf::from(identity_model);
 
     if !video_path.is_file() {
         return Err(format!(
@@ -3546,7 +3663,7 @@ fn validate_fancam_paths(args: &FancamArgs) -> Result<(), String> {
         .target_embeddings
         .as_ref()
         .is_some_and(|gallery| gallery.iter().any(|row| !row.is_empty()))
-        && resolve_default_body_reid_model(&args.face_model).is_none()
+        && resolve_default_body_reid_model(identity_model).is_none()
     {
         return Err(
             "body reid model not found: expected models/osnet_x0_25_msmt17.onnx for identity-locked runs"
@@ -3598,7 +3715,8 @@ fn validate_fancam_paths(args: &FancamArgs) -> Result<(), String> {
 fn validate_identity_scan_paths(args: &IdentityScanArgs) -> Result<(), String> {
     let video_path = PathBuf::from(args.video.trim());
     let yolo_model = PathBuf::from(args.yolo_model.trim());
-    let face_model = PathBuf::from(args.face_model.trim());
+    let identity_model = effective_identity_model(&args.face_model, args.identity_model.as_deref());
+    let face_model = PathBuf::from(identity_model);
 
     if !video_path.is_file() {
         return Err(format!(
@@ -3617,6 +3735,29 @@ fn validate_identity_scan_paths(args: &IdentityScanArgs) -> Result<(), String> {
             "face model not found: {}",
             face_model.to_string_lossy()
         ));
+    }
+    if let Some(body_reid_model) = args
+        .body_reid_model
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        let body_model = PathBuf::from(body_reid_model);
+        if !body_model.is_file() {
+            return Err(format!(
+                "body reid model not found: {}",
+                body_model.to_string_lossy()
+            ));
+        }
+    }
+    if args
+        .body_reid_model
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+        && let Some(default_path) = resolve_default_body_reid_model(identity_model)
+        && !PathBuf::from(&default_path).is_file()
+    {
+        return Err(format!("body reid model not found: {default_path}"));
     }
 
     OrtConfig::ensure_initialized()
@@ -3642,6 +3783,9 @@ fn run_pipeline(
 
     OrtConfig::ensure_initialized().map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
+    let identity_model =
+        effective_identity_model(&args.face_model, args.identity_model.as_deref()).to_string();
+
     let initial_hint = match (args.target_anchor_x, args.target_anchor_y) {
         (Some(x), Some(y)) => Some((x.max(0.0), y.max(0.0))),
         _ => None,
@@ -3653,7 +3797,7 @@ fn run_pipeline(
     let body_reid_model = args
         .body_reid_model
         .clone()
-        .or_else(|| resolve_default_body_reid_model(&args.face_model));
+        .or_else(|| resolve_default_body_reid_model(&identity_model));
 
     let target_gallery = args
         .target_embeddings
@@ -3689,7 +3833,7 @@ fn run_pipeline(
     let pipeline = if !target_gallery.is_empty() {
         Pipeline::load_with_hint_galleries(
             &args.yolo_model,
-            &args.face_model,
+            &identity_model,
             body_reid_model.as_deref(),
             target_gallery,
             body_target_gallery,
@@ -3702,7 +3846,7 @@ fn run_pipeline(
     } else if let Some(embedding) = args.target_embedding.as_ref().filter(|v| !v.is_empty()) {
         Pipeline::load_with_hint_embedding(
             &args.yolo_model,
-            &args.face_model,
+            &identity_model,
             embedding.clone(),
             threshold,
             initial_hint,
@@ -3711,14 +3855,43 @@ fn run_pipeline(
     } else {
         Pipeline::load_with_hint_mode(
             &args.yolo_model,
-            &args.face_model,
+            &identity_model,
             &args.bias,
             threshold,
             initial_hint,
             mode,
         )?
     };
-    let (mut analyzer, mut renderer) = pipeline.into_parts();
+    let total_for_prepass = total.max(1);
+    let prepass_run_id = run_id.clone();
+    let mut prepass_last_emit = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let (mut analyzer, mut renderer) = pipeline.into_parts_with_offline_solution_with_hooks(
+        &video_path,
+        |progress: OfflinePrepassProgress| {
+            let now = Instant::now();
+            let should_emit = progress.decoded_frames <= 1
+                || now.duration_since(prepass_last_emit) >= Duration::from_millis(180);
+            if !should_emit {
+                return;
+            }
+            prepass_last_emit = now;
+
+            let decoded = progress.decoded_frames.min(total_for_prepass);
+            let fraction = 0.5 * (decoded as f64 / total_for_prepass as f64);
+            let _ = app.emit(
+                "fancam://progress",
+                ProgressPayload {
+                    run_id: prepass_run_id.clone(),
+                    current: decoded,
+                    total: total_for_prepass,
+                    fraction,
+                },
+            );
+        },
+        || cancel.load(Ordering::Relaxed),
+    )?;
 
     let cancel_analyze = Arc::clone(&cancel);
     let cancel_render = Arc::clone(&cancel);
@@ -3757,9 +3930,9 @@ fn run_pipeline(
             }
             last_progress_emit = now;
             let fraction = if total > 0 {
-                current as f64 / total as f64
+                0.5 + 0.5 * (current as f64 / total as f64)
             } else {
-                0.0
+                0.5
             };
             let _ = app.emit(
                 "fancam://progress",
@@ -4000,7 +4173,7 @@ mod tests {
                         scan_id: "scan-a".to_string(),
                         video: "a.mp4".to_string(),
                         yolo_model: "y.onnx".to_string(),
-                        face_model: "f.onnx".to_string(),
+                        identity_model: "f.onnx".to_string(),
                         status: "validated".to_string(),
                         expected_count: Some(3),
                         review_ready: true,
@@ -4022,7 +4195,7 @@ mod tests {
                         scan_id: "scan-b".to_string(),
                         video: "b.mp4".to_string(),
                         yolo_model: "y.onnx".to_string(),
-                        face_model: "f.onnx".to_string(),
+                        identity_model: "f.onnx".to_string(),
                         status: "proposed".to_string(),
                         expected_count: None,
                         review_ready: false,
@@ -4044,7 +4217,7 @@ mod tests {
                         scan_id: "scan-c".to_string(),
                         video: "c.mp4".to_string(),
                         yolo_model: "y.onnx".to_string(),
-                        face_model: "f.onnx".to_string(),
+                        identity_model: "f.onnx".to_string(),
                         status: "failed".to_string(),
                         expected_count: None,
                         review_ready: false,
@@ -4124,7 +4297,7 @@ mod tests {
                     scan_id: "scan-events".to_string(),
                     video: "events.mp4".to_string(),
                     yolo_model: "y.onnx".to_string(),
-                    face_model: "f.onnx".to_string(),
+                    identity_model: "f.onnx".to_string(),
                     status: "tracking".to_string(),
                     expected_count: None,
                     review_ready: true,
@@ -4235,6 +4408,7 @@ mod tests {
                 output: video.to_string_lossy().into_owned(),
                 yolo_model: yolo.to_string_lossy().into_owned(),
                 face_model: face.to_string_lossy().into_owned(),
+                identity_model: None,
                 threshold: 0.6,
                 processing_mode: None,
                 body_reid_model: None,
@@ -4278,6 +4452,7 @@ mod tests {
                 output: output.to_string_lossy().into_owned(),
                 yolo_model: yolo.to_string_lossy().into_owned(),
                 face_model: face.to_string_lossy().into_owned(),
+                identity_model: None,
                 threshold: 0.6,
                 processing_mode: None,
                 body_reid_model: None,

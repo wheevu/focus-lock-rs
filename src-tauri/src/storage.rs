@@ -2,14 +2,14 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct ScanSessionRow {
     pub scan_id: String,
     pub video: String,
     pub yolo_model: String,
-    pub face_model: String,
+    pub identity_model: String,
     pub status: String,
     pub expected_count: Option<i64>,
     pub review_ready: bool,
@@ -140,7 +140,7 @@ pub fn load_scan_rows(db_path: &Path) -> Result<Option<ScanStoreRows>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT
-               scan_id, video, yolo_model, face_model, status, expected_count,
+               scan_id, video, yolo_model, COALESCE(identity_model, face_model) AS identity_model, status, expected_count,
                review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
                validated_threshold, updated_at_ms, candidates_json, duplicates_json,
                excluded_identity_ids_json, accepted_low_confidence_ids_json,
@@ -156,7 +156,7 @@ pub fn load_scan_rows(db_path: &Path) -> Result<Option<ScanStoreRows>, String> {
                 scan_id: row.get(0)?,
                 video: row.get(1)?,
                 yolo_model: row.get(2)?,
-                face_model: row.get(3)?,
+                identity_model: row.get(3)?,
                 status: row.get(4)?,
                 expected_count: row.get(5)?,
                 review_ready: row.get::<_, i64>(6)? != 0,
@@ -224,18 +224,19 @@ pub fn save_scan_rows(db_path: &Path, rows: &ScanStoreRows) -> Result<(), String
     for session in &rows.sessions {
         tx.execute(
             "INSERT INTO scan_sessions (
-               scan_id, video, yolo_model, face_model, status, expected_count,
+               scan_id, video, yolo_model, face_model, identity_model, status, expected_count,
                review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
                validated_threshold, updated_at_ms, candidates_json, duplicates_json,
                excluded_identity_ids_json, accepted_low_confidence_ids_json,
                resolved_duplicate_keys_json, pending_split_ids_json,
                pending_split_count, last_blockers_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 session.scan_id,
                 session.video,
                 session.yolo_model,
-                session.face_model,
+                session.identity_model,
+                session.identity_model,
                 session.status,
                 session.expected_count,
                 if session.review_ready { 1_i64 } else { 0_i64 },
@@ -285,18 +286,19 @@ pub fn save_scan_row(
 
     tx.execute(
         "INSERT INTO scan_sessions (
-           scan_id, video, yolo_model, face_model, status, expected_count,
+           scan_id, video, yolo_model, face_model, identity_model, status, expected_count,
            review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
            validated_threshold, updated_at_ms, candidates_json, duplicates_json,
            excluded_identity_ids_json, accepted_low_confidence_ids_json,
            resolved_duplicate_keys_json, pending_split_ids_json,
            pending_split_count, last_blockers_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
          ON CONFLICT(scan_id) DO UPDATE SET
            video = excluded.video,
-           yolo_model = excluded.yolo_model,
-           face_model = excluded.face_model,
-           status = excluded.status,
+            yolo_model = excluded.yolo_model,
+            face_model = excluded.face_model,
+            identity_model = excluded.identity_model,
+            status = excluded.status,
            expected_count = excluded.expected_count,
            review_ready = excluded.review_ready,
            selected_identity_id = excluded.selected_identity_id,
@@ -316,7 +318,8 @@ pub fn save_scan_row(
             session.scan_id,
             session.video,
             session.yolo_model,
-            session.face_model,
+            session.identity_model,
+            session.identity_model,
             session.status,
             session.expected_count,
             if session.review_ready { 1_i64 } else { 0_i64 },
@@ -848,6 +851,27 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("failed to set user_version v4: {e}"))?;
     }
 
+    if version < 5 {
+        let alter_result = conn.execute(
+            "ALTER TABLE scan_sessions ADD COLUMN identity_model TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        if let Err(e) = alter_result
+            && !e.to_string().contains("duplicate column name")
+        {
+            return Err(format!("failed migration v5 alter: {e}"));
+        }
+        conn.execute(
+            "UPDATE scan_sessions
+             SET identity_model = face_model
+             WHERE identity_model IS NULL OR identity_model = ''",
+            [],
+        )
+        .map_err(|e| format!("failed migration v5 backfill: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 5;")
+            .map_err(|e| format!("failed to set user_version v5: {e}"))?;
+    }
+
     let final_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|e| format!("failed to re-read sqlite user_version: {e}"))?;
@@ -909,7 +933,7 @@ mod tests {
                     scan_id: "scan-1".to_string(),
                     video: "a.mp4".to_string(),
                     yolo_model: "y.onnx".to_string(),
-                    face_model: "f.onnx".to_string(),
+                    identity_model: "f.onnx".to_string(),
                     status: "proposed".to_string(),
                     expected_count: Some(5),
                     review_ready: false,
@@ -931,7 +955,7 @@ mod tests {
                     scan_id: "scan-2".to_string(),
                     video: "b.mp4".to_string(),
                     yolo_model: "y.onnx".to_string(),
-                    face_model: "f.onnx".to_string(),
+                    identity_model: "f.onnx".to_string(),
                     status: "validated".to_string(),
                     expected_count: Some(5),
                     review_ready: true,

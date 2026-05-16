@@ -1,4 +1,4 @@
-//! video — FFmpeg bridge
+//! video — `FFmpeg` bridge
 //!
 //! Phase 1 deliverable: open a video, iterate decoded frames, re-encode with
 //! an arbitrary per-frame transform applied, and mux the result back to disk.
@@ -6,11 +6,14 @@
 //! The design intentionally keeps the frame callback generic (`FnMut`) so later
 //! phases can slot in detection + crop logic without changing this module.
 //!
-//! Performance: uses a 3-thread pipeline —
-//!   Thread A  decode:     demux → YUV decode → RGB convert → video_raw channel
+//! Performance: online path uses a 3-thread pipeline —
+//!   Thread A  decode:     demux → YUV decode → RGB convert → `video_raw` channel
 //!   Thread B1 analysis:   detect/identify/tracking → analyzed channel
-//!   Thread B2 rendering:  apply render closure → video_xfm channel
+//!   Thread B2 rendering:  apply render closure → `video_xfm` channel
 //!   Main      encode:     receive xfm frames, lazy-init encoder, RGB→YUV, write
+//!
+//! Offline two-pass workflows can additionally call [`decode_all_rgb_frames`]
+//! to build solved camera plans before final render.
 
 use anyhow::{Context, Result};
 use ffmpeg_next as ffmpeg;
@@ -28,7 +31,7 @@ use tracing::{debug, info, warn};
 
 use crate::{mode::ProcessingMode, tracking::CameraState};
 
-/// Output pixel format for the encoder (YUV420p is universally compatible).
+/// Output pixel format for the encoder (`YUV420p` is universally compatible).
 const ENCODE_FORMAT: format::Pixel = format::Pixel::YUV420P;
 /// Scaling flags — fast bilinear is sufficient for the decode→encode path.
 const SCALE_FLAGS: scaling::Flags = scaling::Flags::FAST_BILINEAR;
@@ -56,13 +59,13 @@ pub struct RgbFrame {
 }
 
 /// Plain-data audio packet — owns its bytes so it can cross thread boundaries
-/// without holding FFmpeg types.
+/// without holding `FFmpeg` types.
 struct AudioPacket {
     data: Vec<u8>,
     pts: Option<i64>,
     dts: Option<i64>,
     /// Raw duration from the source packet; 0 when the source reports
-    /// AV_NOPTS_VALUE (i64::MIN) to avoid overflow in rescale_ts.
+    /// `AV_NOPTS_VALUE` (`i64::MIN`) to avoid overflow in `rescale_ts`.
     duration: i64,
     out_stream_index: usize,
     src_time_base: Rational,
@@ -483,10 +486,10 @@ where
         loop {
             match audio_rx.try_recv() {
                 Ok(ap) => {
-                    if !header_written {
-                        audio_buffer.push(ap);
-                    } else {
+                    if header_written {
                         write_audio_packet(octx, &ap)?;
+                    } else {
+                        audio_buffer.push(ap);
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -518,7 +521,7 @@ where
         }
         if let Err(err) = drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written) {
             cancel_flag.store(true, Ordering::Relaxed);
-            pipeline_error = Some(err.into());
+            pipeline_error = Some(err);
             break;
         }
 
@@ -599,7 +602,7 @@ where
             // Drain any audio that arrived during header setup
             if let Err(err) = drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written) {
                 cancel_flag.store(true, Ordering::Relaxed);
-                pipeline_error = Some(err.into());
+                pipeline_error = Some(err);
                 break;
             }
 
@@ -812,7 +815,7 @@ pub fn total_frames<P: AsRef<Path>>(input_path: P) -> u64 {
     };
     let fps = stream.avg_frame_rate();
     let fps_f = if fps.numerator() > 0 && fps.denominator() > 0 {
-        fps.numerator() as f64 / fps.denominator() as f64
+        f64::from(fps.numerator()) / f64::from(fps.denominator())
     } else {
         0.0
     };
@@ -827,7 +830,7 @@ pub fn total_frames<P: AsRef<Path>>(input_path: P) -> u64 {
     let dur = stream.duration();
     let tb = stream.time_base();
     if dur > 0 && tb.denominator() > 0 && fps_f > 0.0 {
-        let seconds = dur as f64 * tb.numerator() as f64 / tb.denominator() as f64;
+        let seconds = dur as f64 * f64::from(tb.numerator()) / f64::from(tb.denominator());
         return (seconds * fps_f).round() as u64;
     }
 
@@ -844,8 +847,8 @@ pub fn total_frames<P: AsRef<Path>>(input_path: P) -> u64 {
 
 /// Open an input file while hinting hardware decode when available.
 ///
-/// This attempts to open with macOS VideoToolbox first and falls back to
-/// default FFmpeg input opening when the hint cannot be applied.
+/// This attempts to open with macOS `VideoToolbox` first and falls back to
+/// default `FFmpeg` input opening when the hint cannot be applied.
 pub fn open_input_with_hwaccel<P: AsRef<Path>>(input_path: P) -> Result<format::context::Input> {
     let dict = ffmpeg_next::Dictionary::from_iter([("hwaccel", "videotoolbox")]);
     match format::input_with_dictionary(&input_path, dict) {
@@ -863,12 +866,135 @@ pub fn open_input_with_hwaccel<P: AsRef<Path>>(input_path: P) -> Result<format::
     }
 }
 
+/// Decode all video frames to RGB in source order.
+///
+/// This helper is used by offline two-pass workflows that need a first pass
+/// over the full frame sequence before rendering.
+///
+/// # Errors
+///
+/// Returns an error when `FFmpeg` initialization, decode, or scaling fails.
+pub fn decode_all_rgb_frames<P: AsRef<Path>>(input_path: P) -> Result<Vec<(u64, RgbFrame)>> {
+    let mut rows = Vec::<(u64, RgbFrame)>::new();
+
+    for_each_rgb_frame(input_path, |_, frame| {
+        let pts = frame.pts.max(0) as u64;
+        rows.push((pts, frame.clone()));
+        Ok(false)
+    })?;
+
+    Ok(rows)
+}
+
+/// Decode video frames to RGB and invoke a callback for each frame.
+///
+/// The callback receives `(frame_index, &RgbFrame)` and returns `Ok(true)` to
+/// stop early or `Ok(false)` to continue.
+///
+/// # Errors
+///
+/// Returns an error when `FFmpeg` initialization, decode, scaling, or callback
+/// execution fails.
+pub fn for_each_rgb_frame<P, F>(input_path: P, mut on_frame: F) -> Result<()>
+where
+    P: AsRef<Path>,
+    F: FnMut(u64, &RgbFrame) -> Result<bool>,
+{
+    ffmpeg::init().context("failed to initialise FFmpeg")?;
+    let mut ictx = open_input_with_hwaccel(&input_path)?;
+
+    let video_stream_index = ictx
+        .streams()
+        .best(media::Type::Video)
+        .context("no video stream found in input")?
+        .index();
+
+    let input_video_stream = ictx.stream(video_stream_index).unwrap();
+    let decoder_ctx = codec::context::Context::from_parameters(input_video_stream.parameters())
+        .context("failed to build decoder context")?;
+    let mut decoder = decoder_ctx
+        .decoder()
+        .video()
+        .context("failed to open video decoder")?;
+
+    let src_width = decoder.width();
+    let src_height = decoder.height();
+    let src_pixel_fmt = decoder.format();
+
+    let mut to_rgb = scaling::Context::get(
+        src_pixel_fmt,
+        src_width,
+        src_height,
+        format::Pixel::RGB24,
+        src_width,
+        src_height,
+        SCALE_FLAGS,
+    )
+    .context("failed to create to-RGB scaler")?;
+
+    let mut decoded_frame = frame::Video::empty();
+    let mut rgb_frame = frame::Video::empty();
+    let mut frame_index = 0u64;
+    let frame_len = (src_width * src_height * 3) as usize;
+
+    let mut process =
+        |decoded: &frame::Video, rgb: &mut frame::Video, frame_index: &mut u64| -> Result<bool> {
+            to_rgb.run(decoded, rgb).context("to-RGB scaling failed")?;
+
+            let stride = rgb.stride(0);
+            let raw = rgb.data(0);
+            let row_bytes = src_width as usize * 3;
+            let mut rgb_data = vec![0u8; frame_len];
+            for row in 0..src_height as usize {
+                let src_start = row * stride;
+                let dst_start = row * row_bytes;
+                rgb_data[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(&raw[src_start..src_start + row_bytes]);
+            }
+
+            *frame_index = frame_index.saturating_add(1);
+            let pts = decoded.pts().unwrap_or(*frame_index as i64).max(0);
+            let rgb_row = RgbFrame {
+                data: rgb_data,
+                width: src_width,
+                height: src_height,
+                pts,
+            };
+            on_frame(*frame_index, &rgb_row)
+        };
+
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != video_stream_index {
+            continue;
+        }
+        decoder
+            .send_packet(&packet)
+            .context("decoder send_packet")?;
+        while decoder.receive_frame(&mut decoded_frame).is_ok() {
+            if process(&decoded_frame, &mut rgb_frame, &mut frame_index)? {
+                return Ok(());
+            }
+        }
+    }
+
+    decoder.send_eof().ok();
+    while decoder.receive_frame(&mut decoded_frame).is_ok() {
+        if process(&decoded_frame, &mut rgb_frame, &mut frame_index)? {
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
 /// Convenience: convert a frame to grayscale in-place (Phase 1 smoke-test).
 pub fn to_grayscale(frame: &mut RgbFrame) {
     for chunk in frame.data.chunks_exact_mut(3) {
         // BT.601 luminance
-        let luma =
-            (0.299 * chunk[0] as f32 + 0.587 * chunk[1] as f32 + 0.114 * chunk[2] as f32) as u8;
+        let luma = 0.114f32.mul_add(
+            f32::from(chunk[2]),
+            0.299f32.mul_add(f32::from(chunk[0]), 0.587 * f32::from(chunk[1])),
+        ) as u8;
         chunk[0] = luma;
         chunk[1] = luma;
         chunk[2] = luma;

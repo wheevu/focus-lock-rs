@@ -597,6 +597,8 @@ dependencies = [
  "anyhow",
  "clap",
  "fancam-core",
+ "ffmpeg-next",
+ "image",
  "indicatif",
  "tracing",
  "tracing-subscriber",

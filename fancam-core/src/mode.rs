@@ -4,9 +4,10 @@
 //! fast local iteration or higher quality output.
 
 /// Processing mode used across discovery and render/export paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessingMode {
     /// Prioritize iteration speed (default).
+    #[default]
     Fast,
     /// Balanced mode between speed and quality.
     Balanced,
@@ -33,11 +34,5 @@ impl ProcessingMode {
             Self::Balanced => "balanced",
             Self::Quality => "quality",
         }
-    }
-}
-
-impl Default for ProcessingMode {
-    fn default() -> Self {
-        Self::Fast
     }
 }

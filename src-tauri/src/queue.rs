@@ -21,7 +21,7 @@ pub struct DiscoveryJobPayload {
     pub scan_id: String,
     pub video: String,
     pub yolo_model: String,
-    pub face_model: String,
+    pub identity_model: String,
     pub expected_member_count: Option<u32>,
     pub processing_mode: Option<String>,
 }
@@ -31,7 +31,7 @@ pub struct RescanJobPayload {
     pub scan_id: String,
     pub video: String,
     pub yolo_model: String,
-    pub face_model: String,
+    pub identity_model: String,
     pub split_identity_ids: Vec<usize>,
     pub processing_mode: Option<String>,
 }
@@ -756,7 +756,7 @@ mod tests {
             scan_id: scan_id.to_string(),
             video: "video.mp4".to_string(),
             yolo_model: "yolo.onnx".to_string(),
-            face_model: "face.onnx".to_string(),
+            identity_model: "face.onnx".to_string(),
             expected_member_count: Some(5),
             processing_mode: Some("fast".to_string()),
         }

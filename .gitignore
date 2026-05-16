@@ -19,3 +19,5 @@ ui/.svelte-kit
 
 .DS_Store
 .DS_Store
+tmp/
+terminal-log.txt

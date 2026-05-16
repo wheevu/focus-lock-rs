@@ -6,6 +6,7 @@
 use nalgebra::{Matrix2, Matrix2x4, Matrix4, Matrix4x2, Vector2, Vector4};
 
 use crate::detection::{BBox, FaceObservation};
+use crate::observation::IdentityObservation;
 
 /// Process noise — how much we trust the motion model.
 const PROCESS_NOISE: f32 = 4.0;
@@ -30,13 +31,13 @@ const MAX_PREDICTED_MISSES: u32 = 6;
 /// Maximum frozen frames to emit before returning `None` while still lost.
 const MAX_FROZEN_MISSES: u32 = 24;
 
-/// IoU below this is treated as a hard jump candidate.
+/// `IoU` below this is treated as a hard jump candidate.
 const HARD_JUMP_IOU: f32 = 0.03;
 /// Minimum score gap required when a hard jump is proposed.
 const HARD_JUMP_SCORE_GAP: f32 = 0.04;
 /// Consecutive frames needed before accepting a weak hard jump.
 const HARD_JUMP_CONFIRM_FRAMES: u32 = 2;
-/// Contribution of optional body ReID score to candidate ranking.
+/// Contribution of optional body `ReID` score to candidate ranking.
 const BODY_SIMILARITY_WEIGHT: f32 = 0.12;
 
 /// Origin of the camera state for the current frame.
@@ -162,13 +163,13 @@ pub struct TargetTracker {
 impl TargetTracker {
     /// Create tracker without bootstrap hint.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self::new_with_hint(None)
     }
 
     /// Create tracker with optional initial search hint.
     #[must_use]
-    pub fn new_with_hint(bootstrap_hint: Option<(f32, f32)>) -> Self {
+    pub const fn new_with_hint(bootstrap_hint: Option<(f32, f32)>) -> Self {
         Self {
             kalman: None,
             half_size: 0.0,
@@ -221,7 +222,7 @@ impl TargetTracker {
 
     /// Last bbox confirmed by identity observation.
     #[must_use]
-    pub fn last_confirmed_bbox(&self) -> Option<BBox> {
+    pub const fn last_confirmed_bbox(&self) -> Option<BBox> {
         self.last_confirmed_bbox
     }
 
@@ -248,6 +249,29 @@ impl TargetTracker {
         self.on_miss()
     }
 
+    /// Update tracker using generic identity observations.
+    ///
+    /// This is the preferred API for offline two-pass and cue-fusion callers.
+    #[must_use]
+    pub fn update_identity_observations(
+        &mut self,
+        observations: &[IdentityObservation],
+        similarity_threshold: f32,
+        margin_threshold: f32,
+    ) -> Option<CameraState> {
+        let legacy = observations
+            .iter()
+            .map(|obs| FaceObservation {
+                bbox: obs.bbox,
+                similarity: obs.similarity,
+                impostor_similarity: obs.impostor_similarity,
+                margin: obs.margin,
+                body_similarity: obs.body_similarity,
+            })
+            .collect::<Vec<_>>();
+        self.update(&legacy, similarity_threshold, margin_threshold)
+    }
+
     /// Advance tracker using person detections when identity recognition is skipped.
     ///
     /// This keeps motion tethered to nearby person boxes without granting a
@@ -263,21 +287,18 @@ impl TargetTracker {
         let cy = supporting_bbox.center_y();
         let hs = (supporting_bbox.width().max(supporting_bbox.height())) / 2.0;
 
-        match self.kalman.as_mut() {
-            Some(k) => {
-                k.predict();
-                k.update(cx, cy);
-            }
-            None => {
-                self.kalman = Some(Kalman2D::new(cx, cy));
-                self.half_size = hs;
-            }
+        if let Some(k) = self.kalman.as_mut() {
+            k.predict();
+            k.update(cx, cy);
+        } else {
+            self.kalman = Some(Kalman2D::new(cx, cy));
+            self.half_size = hs;
         }
 
         if self.half_size <= f32::EPSILON {
             self.half_size = hs;
         } else {
-            self.half_size = 0.94 * self.half_size + 0.06 * hs;
+            self.half_size = 0.94f32.mul_add(self.half_size, 0.06 * hs);
         }
 
         self.last_bbox = Some(supporting_bbox);
@@ -300,7 +321,7 @@ impl TargetTracker {
     }
 
     /// Reset all tracker state.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.kalman = None;
         self.half_size = 0.0;
         self.misses = 0;
@@ -339,20 +360,17 @@ impl TargetTracker {
             .map(|obs| {
                 let dx = obs.bbox.center_x() - hx;
                 let dy = obs.bbox.center_y() - hy;
-                let distance = (dx * dx + dy * dy).sqrt();
+                let distance = dx.hypot(dy);
                 let distance_norm = (obs.bbox.width().max(obs.bbox.height()) * 8.0).max(1.0);
                 let proximity = 1.0 - (distance / distance_norm).clamp(0.0, 1.0);
                 let continuity = self
                     .last_bbox
-                    .map(|last| obs.bbox.iou(&last))
-                    .unwrap_or(0.0)
+                    .map_or(0.0, |last| obs.bbox.iou(&last))
                     .clamp(0.0, 1.0);
                 let body_score = obs
                     .body_similarity
-                    .map(|sim| ((sim + 1.0) * 0.5).clamp(0.0, 1.0))
-                    .unwrap_or(0.0);
-                let score = obs.similarity
-                    + obs.margin * 0.20
+                    .map_or(0.0, |sim| ((sim + 1.0) * 0.5).clamp(0.0, 1.0));
+                let score = obs.margin.mul_add(0.20, obs.similarity)
                     + proximity * 0.16
                     + continuity * 0.16
                     + body_score * BODY_SIMILARITY_WEIGHT;
@@ -375,10 +393,11 @@ impl TargetTracker {
             let iou = best_obs.bbox.iou(&last_bbox);
             let second_score = scored.get(1).map(|row| row.0);
             let hard_jump = iou < HARD_JUMP_IOU;
-            let weak_gap = second_score
-                .map(|score| best_score - score < HARD_JUMP_SCORE_GAP)
-                .unwrap_or(true);
-            let body_score = best_obs.body_similarity.map(|sim| ((sim + 1.0) * 0.5).clamp(0.0, 1.0));
+            let weak_gap =
+                second_score.is_none_or(|score| best_score - score < HARD_JUMP_SCORE_GAP);
+            let body_score = best_obs
+                .body_similarity
+                .map(|sim| ((sim + 1.0) * 0.5).clamp(0.0, 1.0));
             let weak_confidence = best_obs.similarity < similarity_threshold + 0.06
                 || best_obs.margin < margin_threshold + 0.02
                 || body_score.is_some_and(|score| score < 0.58);
@@ -396,40 +415,38 @@ impl TargetTracker {
     }
 
     fn confirm_hard_jump(&mut self, bbox: BBox) -> bool {
-        match self.pending_hard_jump {
-            Some(mut pending) => {
-                let continuity = pending.bbox.iou(&bbox);
-                let near_enough = continuity >= 0.20 || {
-                    let dx = pending.bbox.center_x() - bbox.center_x();
-                    let dy = pending.bbox.center_y() - bbox.center_y();
-                    let distance = (dx * dx + dy * dy).sqrt();
-                    let scale = pending
-                        .bbox
-                        .width()
-                        .max(pending.bbox.height())
-                        .max(bbox.width().max(bbox.height()));
-                    distance <= scale * 1.6
-                };
-                if near_enough {
-                    pending.votes = pending.votes.saturating_add(1);
-                } else {
-                    pending = PendingHardJump { bbox, votes: 1 };
-                }
-                let confirmed = pending.votes >= HARD_JUMP_CONFIRM_FRAMES;
-                self.pending_hard_jump = Some(pending);
-                confirmed
+        if let Some(mut pending) = self.pending_hard_jump {
+            let continuity = pending.bbox.iou(&bbox);
+            let near_enough = continuity >= 0.20 || {
+                let dx = pending.bbox.center_x() - bbox.center_x();
+                let dy = pending.bbox.center_y() - bbox.center_y();
+                let distance = dx.hypot(dy);
+                let scale = pending
+                    .bbox
+                    .width()
+                    .max(pending.bbox.height())
+                    .max(bbox.width().max(bbox.height()));
+                distance <= scale * 1.6
+            };
+            if near_enough {
+                pending.votes = pending.votes.saturating_add(1);
+            } else {
+                pending = PendingHardJump { bbox, votes: 1 };
             }
-            None => {
-                self.pending_hard_jump = Some(PendingHardJump { bbox, votes: 1 });
-                false
-            }
+            let confirmed = pending.votes >= HARD_JUMP_CONFIRM_FRAMES;
+            self.pending_hard_jump = Some(pending);
+            confirmed
+        } else {
+            self.pending_hard_jump = Some(PendingHardJump { bbox, votes: 1 });
+            false
         }
     }
 
     fn on_observation(&mut self, obs: FaceObservation) {
         self.misses = 0;
         self.stable_hits = self.stable_hits.saturating_add(1);
-        self.similarity_ema = 0.85 * self.similarity_ema + 0.15 * obs.similarity.clamp(0.0, 1.0);
+        self.similarity_ema =
+            0.85f32.mul_add(self.similarity_ema, 0.15 * obs.similarity.clamp(0.0, 1.0));
         self.predicted_misses = 0;
         self.frozen_misses = 0;
         self.pending_hard_jump = None;
@@ -439,21 +456,18 @@ impl TargetTracker {
         let cy = bbox.center_y();
         let hs = (bbox.width().max(bbox.height())) / 2.0;
 
-        match self.kalman.as_mut() {
-            Some(k) => {
-                k.predict();
-                k.update(cx, cy);
-            }
-            None => {
-                self.kalman = Some(Kalman2D::new(cx, cy));
-                self.half_size = hs;
-            }
+        if let Some(k) = self.kalman.as_mut() {
+            k.predict();
+            k.update(cx, cy);
+        } else {
+            self.kalman = Some(Kalman2D::new(cx, cy));
+            self.half_size = hs;
         }
 
         if self.half_size <= f32::EPSILON {
             self.half_size = hs;
         } else {
-            self.half_size = 0.88 * self.half_size + 0.12 * hs;
+            self.half_size = 0.88f32.mul_add(self.half_size, 0.12 * hs);
         }
 
         self.bootstrap_hint = None;
@@ -484,14 +498,13 @@ impl TargetTracker {
                 let proximity = {
                     let dx = bbox.center_x() - hx;
                     let dy = bbox.center_y() - hy;
-                    let distance = (dx * dx + dy * dy).sqrt();
+                    let distance = dx.hypot(dy);
                     let norm = (bbox.width().max(bbox.height()) * 6.0).max(1.0);
                     1.0 - (distance / norm).clamp(0.0, 1.0)
                 };
                 let continuity = self
                     .last_bbox
-                    .map(|last| last.iou(&bbox))
-                    .unwrap_or(0.0)
+                    .map_or(0.0, |last| last.iou(&bbox))
                     .clamp(0.0, 1.0);
                 let score = proximity * 0.35 + continuity * 0.65;
                 (score, bbox, proximity, continuity)
@@ -513,7 +526,7 @@ impl TargetTracker {
         {
             let dx = best.center_x() - last_bbox.center_x();
             let dy = best.center_y() - last_bbox.center_y();
-            let distance = (dx * dx + dy * dy).sqrt();
+            let distance = dx.hypot(dy);
             let scale = last_bbox
                 .width()
                 .max(last_bbox.height())
@@ -534,9 +547,7 @@ impl TargetTracker {
 
         match self.state {
             TrackingState::Searching => {
-                if self.kalman.is_none() {
-                    return None;
-                }
+                self.kalman.as_ref()?;
             }
             TrackingState::Locked => {
                 self.state = TrackingState::Recovering;

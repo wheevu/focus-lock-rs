@@ -1,4 +1,4 @@
-//! detection — YOLOv8-Nano person detection + ArcFace face identification
+//! detection — YOLOv8-Nano person detection + `ArcFace` face identification
 //!
 //! Phase 2: load yolov8n.onnx, run inference on a 640×640 frame, return
 //!          bounding boxes for the "person" class after NMS.
@@ -20,25 +20,26 @@ use std::path::Path;
 use std::sync::Mutex;
 use tracing::debug;
 
+use crate::observation::IdentityObservation;
 use crate::video::RgbFrame;
 use crate::{PoisonExt, Result};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// YOLOv8 input size (square).
+/// `YOLOv8` input size (square).
 const YOLO_SIZE: u32 = 640;
 /// COCO class index for "person".
 const PERSON_CLASS: usize = 0;
 /// Confidence threshold for person detection.
 const CONF_THRESHOLD: f32 = 0.45;
-/// IoU threshold for NMS.
+/// `IoU` threshold for NMS.
 const IOU_THRESHOLD: f32 = 0.45;
 
-/// ArcFace input size.
+/// `ArcFace` input size.
 const FACE_SIZE: u32 = 112;
 /// Cosine similarity threshold for identity match.
 pub const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.6;
-/// Maximum number of person candidates to run ArcFace on per frame.
+/// Maximum number of person candidates to run `ArcFace` on per frame.
 /// In concert scenes with 10-20 detections, this caps inference cost.
 const MAX_FACE_CANDIDATES: usize = 8;
 /// Recovery-mode candidate budget to avoid starvation under occlusion.
@@ -92,17 +93,17 @@ impl BBox {
     }
     /// Returns the center X coordinate.
     #[must_use]
-    pub fn center_x(&self) -> f32 {
-        (self.x1 + self.x2) / 2.0
+    pub const fn center_x(&self) -> f32 {
+        f32::midpoint(self.x1, self.x2)
     }
     /// Returns the center Y coordinate.
     #[must_use]
-    pub fn center_y(&self) -> f32 {
-        (self.y1 + self.y2) / 2.0
+    pub const fn center_y(&self) -> f32 {
+        f32::midpoint(self.y1, self.y2)
     }
-    /// IoU (intersection over union) with another box.
+    /// `IoU` (intersection over union) with another box.
     #[must_use]
-    pub fn iou(&self, other: &BBox) -> f32 {
+    pub fn iou(&self, other: &Self) -> f32 {
         let ix1 = self.x1.max(other.x1);
         let iy1 = self.y1.max(other.y1);
         let ix2 = self.x2.min(other.x2);
@@ -111,7 +112,10 @@ impl BBox {
         if inter == 0.0 {
             return 0.0;
         }
-        let union = self.width() * self.height() + other.width() * other.height() - inter;
+        let union = self
+            .width()
+            .mul_add(self.height(), other.width() * other.height())
+            - inter;
         inter / union
     }
 }
@@ -160,8 +164,40 @@ pub struct FaceObservation {
     pub body_similarity: Option<f32>,
 }
 
+impl FaceObservation {
+    /// Convert face-first observation into generic identity observation.
+    #[must_use]
+    pub fn into_identity_observation(self) -> IdentityObservation {
+        IdentityObservation::from_face_scores(
+            self.bbox,
+            self.similarity,
+            self.impostor_similarity,
+            self.margin,
+            self.body_similarity,
+        )
+    }
+}
+
+impl From<FaceObservation> for IdentityObservation {
+    fn from(value: FaceObservation) -> Self {
+        value.into_identity_observation()
+    }
+}
+
+impl From<IdentityObservation> for FaceObservation {
+    fn from(value: IdentityObservation) -> Self {
+        Self {
+            bbox: value.bbox,
+            similarity: value.similarity,
+            impostor_similarity: value.impostor_similarity,
+            margin: value.margin,
+            body_similarity: value.body_similarity,
+        }
+    }
+}
+
 impl Detector {
-    /// Load a YOLOv8n ONNX model from `model_path`.
+    /// Load a `YOLOv8n` ONNX model from `model_path`.
     ///
     /// # Errors
     ///
@@ -344,7 +380,7 @@ impl Detector {
                 r_plane
                     .par_iter_mut()
                     .enumerate()
-                    .for_each(|(idx, out)| *out = raw[idx * 3] as f32 / 255.0)
+                    .for_each(|(idx, out)| *out = f32::from(raw[idx * 3]) / 255.0);
             },
             || {
                 rayon::join(
@@ -352,13 +388,13 @@ impl Detector {
                         g_plane
                             .par_iter_mut()
                             .enumerate()
-                            .for_each(|(idx, out)| *out = raw[idx * 3 + 1] as f32 / 255.0)
+                            .for_each(|(idx, out)| *out = f32::from(raw[idx * 3 + 1]) / 255.0);
                     },
                     || {
                         b_plane
                             .par_iter_mut()
                             .enumerate()
-                            .for_each(|(idx, out)| *out = raw[idx * 3 + 2] as f32 / 255.0)
+                            .for_each(|(idx, out)| *out = f32::from(raw[idx * 3 + 2]) / 255.0);
                     },
                 )
             },
@@ -366,7 +402,7 @@ impl Detector {
 
         let shape = [1usize, 3, YOLO_SIZE as usize, YOLO_SIZE as usize];
         Tensor::from_array((shape, tensor_data.into_boxed_slice()))
-            .map(|t| t.into_dyn())
+            .map(ort::value::Value::into_dyn)
             .map_err(|e| {
                 crate::FancamError::inference(format!("Failed to create YOLO input tensor: {e}"))
             })
@@ -430,7 +466,7 @@ impl Detector {
 
 // ── Face identifier ──────────────────────────────────────────────────────────
 
-/// Wraps the ArcFace ONNX session and the reference embedding.
+/// Wraps the `ArcFace` ONNX session and the reference embedding.
 #[derive(Debug)]
 pub struct FaceIdentifier {
     sessions: Vec<Mutex<Session>>,
@@ -440,7 +476,7 @@ pub struct FaceIdentifier {
     margin_threshold: f32,
 }
 
-/// ArcFace embedding helper that does not require a reference image.
+/// `ArcFace` embedding helper that does not require a reference image.
 ///
 /// Used by identity discovery passes to build candidate clusters before the user
 /// chooses which member to track.
@@ -449,14 +485,14 @@ pub struct FaceEmbedder {
     sessions: Vec<Mutex<Session>>,
 }
 
-/// Number of ArcFace sessions used by discovery embedding.
+/// Number of `ArcFace` sessions used by discovery embedding.
 ///
 /// A small pool improves throughput on crowded sampled frames without creating
 /// excessive memory pressure in local development.
 const DISCOVERY_EMBEDDER_POOL: usize = 4;
 
 impl FaceEmbedder {
-    /// Load an ArcFace model for embedding extraction.
+    /// Load an `ArcFace` model for embedding extraction.
     ///
     /// # Errors
     ///
@@ -484,7 +520,7 @@ impl FaceEmbedder {
 
     /// Extract embeddings for many candidate bounding boxes.
     ///
-    /// Work is parallelized across a small ArcFace session pool to improve
+    /// Work is parallelized across a small `ArcFace` session pool to improve
     /// discovery throughput on crowded scenes.
     ///
     /// # Errors
@@ -631,7 +667,7 @@ impl FaceIdentifier {
         Ok(self)
     }
 
-    /// Load an ArcFace ONNX model and embed `reference_image_path` as the
+    /// Load an `ArcFace` ONNX model and embed `reference_image_path` as the
     /// target identity.
     ///
     /// # Errors
@@ -684,7 +720,7 @@ impl FaceIdentifier {
         })
     }
 
-    /// Load an ArcFace ONNX model with an already-computed reference embedding.
+    /// Load an `ArcFace` ONNX model with an already-computed reference embedding.
     ///
     /// # Errors
     ///
@@ -697,7 +733,7 @@ impl FaceIdentifier {
         Self::from_reference_embedding(model_path, reference_embedding, similarity_threshold)
     }
 
-    /// Load ArcFace with explicit positive and negative identity galleries.
+    /// Load `ArcFace` with explicit positive and negative identity galleries.
     ///
     /// # Errors
     ///
@@ -882,7 +918,7 @@ impl FaceIdentifier {
 
 // ── Pre/post-processing helpers ──────────────────────────────────────────────
 
-/// Crop the approximate head region from a person BBox, resize to 112×112,
+/// Crop the approximate head region from a person `BBox`, resize to 112×112,
 /// normalise to [-1, 1], return as an ORT `Tensor`.
 fn preprocess_face(img: &RgbImage) -> Result<ort::value::DynValue> {
     let tensor_data = preprocess_face_data(img)?;
@@ -942,9 +978,9 @@ fn preprocess_face_data_from_raw(width: u32, height: u32, raw_rgb: &[u8]) -> Res
 
             *resize_buf = dst.into_vec();
             for idx in 0..size {
-                tensor_data[idx] = (resize_buf[idx * 3] as f32 - 127.5) / 128.0;
-                tensor_data[size + idx] = (resize_buf[idx * 3 + 1] as f32 - 127.5) / 128.0;
-                tensor_data[2 * size + idx] = (resize_buf[idx * 3 + 2] as f32 - 127.5) / 128.0;
+                tensor_data[idx] = (f32::from(resize_buf[idx * 3]) - 127.5) / 128.0;
+                tensor_data[size + idx] = (f32::from(resize_buf[idx * 3 + 1]) - 127.5) / 128.0;
+                tensor_data[2 * size + idx] = (f32::from(resize_buf[idx * 3 + 2]) - 127.5) / 128.0;
             }
             Ok(())
         })
@@ -982,7 +1018,7 @@ fn preprocess_face_from_bbox(frame: &RgbFrame, bbox: BBox) -> Result<Vec<f32>> {
 fn face_tensor_from_data(tensor_data: Vec<f32>) -> Result<ort::value::DynValue> {
     let shape = [1usize, 3, FACE_SIZE as usize, FACE_SIZE as usize];
     Tensor::from_array((shape, tensor_data.into_boxed_slice()))
-        .map(|t| t.into_dyn())
+        .map(ort::value::Value::into_dyn)
         .map_err(|e| {
             crate::FancamError::inference(format!("Failed to create face input tensor: {e}"))
         })
@@ -1043,8 +1079,9 @@ fn face_crop_region(frame: &RgbFrame, bbox: BBox) -> (u32, u32, u32, u32) {
     let aspect = (bw / bh).clamp(0.2, 2.5);
 
     // Wider boxes likely include shoulders/background; reduce head fraction.
-    let mut head_fraction =
-        (0.30 - (aspect - 0.5) * 0.06).clamp(MIN_HEAD_FRACTION, MAX_HEAD_FRACTION);
+    let mut head_fraction = (aspect - 0.5)
+        .mul_add(-0.06, 0.30)
+        .clamp(MIN_HEAD_FRACTION, MAX_HEAD_FRACTION);
     if bh < 170.0 {
         // Distant subjects need a taller crop to preserve enough face pixels.
         head_fraction = (head_fraction + 0.04).clamp(MIN_HEAD_FRACTION, MAX_HEAD_FRACTION);
@@ -1073,22 +1110,30 @@ pub fn face_crop_region_for_bbox(frame: &RgbFrame, bbox: BBox) -> (u32, u32, u32
     face_crop_region(frame, bbox)
 }
 
-/// Estimates whether the upper-body crop contains a valid frontal/near-frontal face.
-///
-/// This is a lightweight image heuristic used during discovery to suppress
-/// obvious non-face clusters (for example backs of heads, shoulders, or torso-only
-/// detections) before embedding + clustering.
-#[must_use]
-pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
+#[derive(Debug, Clone, Copy)]
+struct FaceCropHeuristics {
+    min_dim: f32,
+    texture_score: f32,
+    edge_score: f32,
+    center_focus_score: f32,
+    symmetry_score: f32,
+    upper_lower_score: f32,
+    eye_band_contrast_score: f32,
+    eye_band_symmetry_score: f32,
+    top_heaviness: f32,
+    lower_detail_ratio: f32,
+}
+
+fn face_crop_heuristics(frame: &RgbFrame, bbox: BBox) -> Option<FaceCropHeuristics> {
     let (x1, y1, w, h) = face_crop_region(frame, bbox);
     if w < 12 || h < 12 {
-        return 0.0;
+        return None;
     }
 
     let step_x = (w / 26).max(1) as usize;
     let step_y = (h / 26).max(1) as usize;
-    let cols = ((w as usize + step_x - 1) / step_x).max(2);
-    let rows = ((h as usize + step_y - 1) / step_y).max(2);
+    let cols = (w as usize).div_ceil(step_x).max(2);
+    let rows = (h as usize).div_ceil(step_y).max(2);
 
     let stride = frame.width as usize * 3;
     let mut luma = vec![0.0f32; rows * cols];
@@ -1098,11 +1143,10 @@ pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
         for col in 0..cols {
             let sample_x = x1 as usize + (col * step_x).min(w as usize - 1);
             let idx = sample_y * stride + sample_x * 3;
-            let r = frame.data[idx] as f32;
-            let g = frame.data[idx + 1] as f32;
-            let b = frame.data[idx + 2] as f32;
-            // Rec.709 luma approximation in [0, 255]
-            luma[row * cols + col] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let r = f32::from(frame.data[idx]);
+            let g = f32::from(frame.data[idx + 1]);
+            let b = f32::from(frame.data[idx + 2]);
+            luma[row * cols + col] = 0.0722f32.mul_add(b, 0.2126f32.mul_add(r, 0.7152 * g));
         }
     }
 
@@ -1110,9 +1154,9 @@ pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
     let mean = luma.iter().sum::<f32>() / total.max(1.0);
     let variance = luma
         .iter()
-        .map(|v| {
-            let d = *v - mean;
-            d * d
+        .map(|value| {
+            let delta = *value - mean;
+            delta * delta
         })
         .sum::<f32>()
         / total.max(1.0);
@@ -1122,12 +1166,19 @@ pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
     let mut edge_sum = 0.0f32;
     let mut edge_count = 0usize;
     let mut center_edge_sum = 0.0f32;
+    let mut top_edge_sum = 0.0f32;
+    let mut bottom_edge_sum = 0.0f32;
+    let mut top_edge_count = 0usize;
+    let mut bottom_edge_count = 0usize;
+    let eye_start = rows / 4;
+    let eye_end = (rows * 11) / 20;
+
     for row in 0..(rows - 1) {
         for col in 0..(cols - 1) {
-            let c = luma[row * cols + col];
+            let current = luma[row * cols + col];
             let right = luma[row * cols + (col + 1)];
             let down = luma[(row + 1) * cols + col];
-            let edge = (c - right).abs() + (c - down).abs();
+            let edge = (current - right).abs() + (current - down).abs();
             edge_sum += edge;
             edge_count += 1;
 
@@ -1136,8 +1187,16 @@ pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
             if center_row && center_col {
                 center_edge_sum += edge;
             }
+            if row <= eye_start {
+                top_edge_sum += edge;
+                top_edge_count += 1;
+            } else if row >= eye_end {
+                bottom_edge_sum += edge;
+                bottom_edge_count += 1;
+            }
         }
     }
+
     let edge_mean = edge_sum / edge_count.max(1) as f32;
     let edge_score = ((edge_mean - 7.0) / 26.0).clamp(0.0, 1.0);
     let outer_edge = (edge_sum - center_edge_sum).max(0.0);
@@ -1146,21 +1205,33 @@ pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
 
     let mut symmetry_diff = 0.0f32;
     let mut symmetry_count = 0usize;
+    let mut eye_symmetry_diff = 0.0f32;
+    let mut eye_symmetry_count = 0usize;
     for row in 0..rows {
         for col in 0..(cols / 2) {
             let left = luma[row * cols + col];
             let right = luma[row * cols + (cols - 1 - col)];
-            symmetry_diff += (left - right).abs();
+            let delta = (left - right).abs();
+            symmetry_diff += delta;
             symmetry_count += 1;
+            if row >= eye_start && row <= eye_end {
+                eye_symmetry_diff += delta;
+                eye_symmetry_count += 1;
+            }
         }
     }
     let symmetry_mean = symmetry_diff / symmetry_count.max(1) as f32;
     let symmetry_score = (1.0 - symmetry_mean / 58.0).clamp(0.0, 1.0);
+    let eye_symmetry_mean = eye_symmetry_diff / eye_symmetry_count.max(1) as f32;
+    let eye_band_symmetry_score = (1.0 - eye_symmetry_mean / 52.0).clamp(0.0, 1.0);
 
     let mut upper_sum = 0.0f32;
     let mut upper_count = 0usize;
     let mut lower_sum = 0.0f32;
     let mut lower_count = 0usize;
+    let mut eye_sum = 0.0f32;
+    let mut eye_count = 0usize;
+    let mut eye_sq_sum = 0.0f32;
     for row in 0..rows {
         for col in 0..cols {
             let value = luma[row * cols + col];
@@ -1171,6 +1242,11 @@ pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
                 lower_sum += value;
                 lower_count += 1;
             }
+            if row >= eye_start && row <= eye_end {
+                eye_sum += value;
+                eye_sq_sum += value * value;
+                eye_count += 1;
+            }
         }
     }
     let upper_mean = upper_sum / upper_count.max(1) as f32;
@@ -1178,11 +1254,96 @@ pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
     let upper_lower_diff = (upper_mean - lower_mean).abs();
     let upper_lower_score = ((upper_lower_diff - 10.0) / 42.0).clamp(0.0, 1.0);
 
-    (texture_score * 0.24
-        + edge_score * 0.22
-        + symmetry_score * 0.20
-        + center_focus_score * 0.22
-        + upper_lower_score * 0.12)
+    let eye_mean = eye_sum / eye_count.max(1) as f32;
+    let eye_variance = (eye_sq_sum / eye_count.max(1) as f32 - eye_mean * eye_mean).max(0.0);
+    let eye_std_dev = eye_variance.sqrt();
+    let eye_band_contrast_score = ((eye_std_dev - 9.0) / 34.0).clamp(0.0, 1.0);
+
+    let top_edge_mean = top_edge_sum / top_edge_count.max(1) as f32;
+    let bottom_edge_mean = bottom_edge_sum / bottom_edge_count.max(1) as f32;
+    let top_heaviness = ((top_edge_mean - bottom_edge_mean) / 24.0).clamp(-1.0, 1.0);
+    let lower_detail_ratio = (bottom_edge_mean / top_edge_mean.max(1e-3)).clamp(0.0, 2.0);
+
+    Some(FaceCropHeuristics {
+        min_dim: w.min(h) as f32,
+        texture_score,
+        edge_score,
+        center_focus_score,
+        symmetry_score,
+        upper_lower_score,
+        eye_band_contrast_score,
+        eye_band_symmetry_score,
+        top_heaviness,
+        lower_detail_ratio,
+    })
+}
+
+/// Estimates whether the upper-body crop contains a valid frontal/near-frontal face.
+///
+/// This is a lightweight image heuristic used during discovery to suppress
+/// obvious non-face clusters (for example backs of heads, shoulders, or torso-only
+/// detections) before embedding + clustering.
+#[must_use]
+pub fn face_presence_score(frame: &RgbFrame, bbox: BBox) -> f32 {
+    let Some(heuristics) = face_crop_heuristics(frame, bbox) else {
+        return 0.0;
+    };
+
+    heuristics
+        .eye_band_contrast_score
+        .mul_add(
+            0.04,
+            heuristics.upper_lower_score.mul_add(
+                0.10,
+                heuristics.center_focus_score.mul_add(
+                    0.20,
+                    heuristics.symmetry_score.mul_add(
+                        0.20,
+                        heuristics
+                            .texture_score
+                            .mul_add(0.24, heuristics.edge_score * 0.22),
+                    ),
+                ),
+            ),
+        )
+        .clamp(0.0, 1.0)
+}
+
+/// Estimates whether the detected head crop is suitable for identity preview cards.
+///
+/// This is intentionally stricter than [`face_presence_score`] and prioritizes
+/// near-frontal, face-structured observations over top-down, back-of-head, or
+/// torso-like crops.
+#[must_use]
+pub fn face_preview_score(frame: &RgbFrame, bbox: BBox) -> f32 {
+    let Some(heuristics) = face_crop_heuristics(frame, bbox) else {
+        return 0.0;
+    };
+
+    let structure = heuristics.upper_lower_score.mul_add(
+        0.06,
+        heuristics.texture_score.mul_add(
+            0.10,
+            heuristics.center_focus_score.mul_add(
+                0.16,
+                heuristics.eye_band_contrast_score.mul_add(
+                    0.20,
+                    heuristics
+                        .symmetry_score
+                        .mul_add(0.30, heuristics.eye_band_symmetry_score * 0.18),
+                ),
+            ),
+        ),
+    );
+
+    let top_down_penalty = ((heuristics.top_heaviness - 0.20) / 0.55).clamp(0.0, 1.0) * 0.35;
+    let lower_detail_penalty =
+        ((0.55 - heuristics.lower_detail_ratio) / 0.55).clamp(0.0, 1.0) * 0.30;
+    let weak_eye_penalty =
+        ((0.40 - heuristics.eye_band_contrast_score) / 0.40).clamp(0.0, 1.0) * 0.22;
+    let size_penalty = ((46.0 - heuristics.min_dim) / 46.0).clamp(0.0, 1.0) * 0.18;
+
+    (structure - top_down_penalty - lower_detail_penalty - weak_eye_penalty - size_penalty)
         .clamp(0.0, 1.0)
 }
 
@@ -1191,7 +1352,7 @@ fn rank_candidate(bbox: BBox, search_hint: Option<(f32, f32)>) -> f32 {
     if let Some((hx, hy)) = search_hint {
         let dx = bbox.center_x() - hx;
         let dy = bbox.center_y() - hy;
-        let distance = (dx * dx + dy * dy).sqrt();
+        let distance = dx.hypot(dy);
         let norm = (bbox.width().max(bbox.height()) * 4.0).max(1.0);
         let proximity = 1.0 - (distance / norm).clamp(0.0, 1.0);
         score += proximity * 0.35;
@@ -1210,7 +1371,7 @@ fn apply_search_gate(candidates: Vec<BBox>, search_hint: Option<(f32, f32)>) -> 
         .filter(|bbox| {
             let dx = bbox.center_x() - hx;
             let dy = bbox.center_y() - hy;
-            let distance = (dx * dx + dy * dy).sqrt();
+            let distance = dx.hypot(dy);
             let scale = bbox.width().max(bbox.height()).max(1.0);
             let gate =
                 (scale * SEARCH_GATE_SCALE).clamp(SEARCH_GATE_MIN_RADIUS, SEARCH_GATE_MAX_RADIUS);
@@ -1443,5 +1604,83 @@ mod tests {
 
         let face_like_score = face_presence_score(&frame, bbox);
         assert!(face_like_score > flat_score);
+    }
+
+    #[test]
+    fn face_preview_prefers_frontal_like_over_top_heavy_pattern() {
+        let mut frame = frame(220, 220);
+        for px in frame.data.chunks_mut(3) {
+            px[0] = 110;
+            px[1] = 110;
+            px[2] = 110;
+        }
+
+        let bbox = BBox {
+            x1: 40.0,
+            y1: 20.0,
+            x2: 180.0,
+            y2: 210.0,
+            confidence: 0.92,
+        };
+
+        for y in 42..136 {
+            for x in 58..162 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 205;
+                frame.data[idx + 1] = 172;
+                frame.data[idx + 2] = 155;
+            }
+        }
+        for y in 70..82 {
+            for x in 78..96 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 34;
+                frame.data[idx + 1] = 34;
+                frame.data[idx + 2] = 34;
+            }
+            for x in 124..142 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 34;
+                frame.data[idx + 1] = 34;
+                frame.data[idx + 2] = 34;
+            }
+        }
+        for y in 88..110 {
+            let idx = (y as usize * frame.width as usize + 110) * 3;
+            frame.data[idx] = 84;
+            frame.data[idx + 1] = 70;
+            frame.data[idx + 2] = 65;
+        }
+        for y in 112..118 {
+            for x in 88..132 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 78;
+                frame.data[idx + 1] = 42;
+                frame.data[idx + 2] = 42;
+            }
+        }
+
+        let frontal_score = face_preview_score(&frame, bbox);
+
+        for y in 42..130 {
+            for x in 58..162 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 55;
+                frame.data[idx + 1] = 55;
+                frame.data[idx + 2] = 55;
+            }
+        }
+        for y in 130..158 {
+            for x in 72..148 {
+                let idx = (y as usize * frame.width as usize + x as usize) * 3;
+                frame.data[idx] = 170;
+                frame.data[idx + 1] = 152;
+                frame.data[idx + 2] = 145;
+            }
+        }
+
+        let top_heavy_score = face_preview_score(&frame, bbox);
+        assert!(frontal_score > top_heavy_score);
+        assert!(frontal_score > 0.45);
     }
 }

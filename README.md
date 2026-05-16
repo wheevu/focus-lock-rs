@@ -16,7 +16,8 @@ It features a modular Rust core for high-speed video processing, a CLI for batch
 ## Features
 
 - **Person detection + identity lock** — YOLOv8 for detection, ArcFace for target matching
-- **Smooth tracking** — Kalman-filtered motion for less jitter and more stable framing
+- **Offline two-pass render path** — first pass builds tracklets, second pass solves identity/camera before final encode
+- **Smooth tracking** — online Kalman path retained for compatibility and fallback workflows
 - **Identity discovery (GUI)** — candidate scan and manual validation before render
 - **Performance-first pipeline** — threaded video pipeline with optimized preprocessing and rendering
 - **Smart output** — automatic 1080x1920 crop with fallback handling for occlusion or target loss
@@ -31,6 +32,16 @@ This project is organized as a Cargo workspace:
 - **`src-tauri/` + `ui/`** — Tauri desktop app with a Svelte frontend
 
 ##  Logic Flow
+
+### Offline two-pass (default render path)
+
+1. **Decode pass** source frames with FFmpeg
+2. **Detect + score** identities and build short-term tracklets
+3. **Solve globally** across tracklets to stabilize identity assignment
+4. **Plan camera path** from the selected solved identity observations
+5. **Render pass** writes stabilized vertical H.264 output
+
+### Online fallback (legacy-compatible path)
 
 1. **Decode** video frames with FFmpeg
 2. **Detect** people with YOLOv8
@@ -88,6 +99,9 @@ cargo run --release -p cli -- fancam \
   --face-model "models/w600k_mbf.onnx" \
   --threshold 0.6
 ```
+
+Note: render runs a mandatory offline prepass (tracklet build + global solve)
+before final encode, so startup may be slower on long videos.
 
 ## License
 MIT
@@ -149,7 +163,9 @@ If the subject becomes occluded, the filter predicts the next likely position ba
 
 ## Performance pipeline
 
-The core processing path is built around a **3-thread decode / inference / encode pipeline** with bounded channels.
+The online processing path is built around a **3-thread decode / inference / encode pipeline** with bounded channels.
+
+The offline render path adds a first pre-render pass to build tracklets and a solved camera plan before the final encode pass.
 
 Performance-oriented behavior includes:
 
