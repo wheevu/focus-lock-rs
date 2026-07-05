@@ -12,7 +12,7 @@ use thiserror::Error;
 /// model inference, and pipeline execution.
 #[derive(Error, Debug)]
 pub enum FancamError {
-    /// Error loading an ML model (`YOLOv8`, `ArcFace`, etc.)
+    /// Error loading an ML model (YOLOv8, ArcFace, etc.)
     #[error("Failed to load model at {path}: {source}")]
     ModelLoad {
         /// Path to the model file
@@ -25,34 +25,9 @@ pub enum FancamError {
     #[error("Inference failed: {0}")]
     Inference(String),
 
-    /// Error opening or reading a video file
-    #[error("Video error for {path}: {source}")]
-    Video {
-        /// Path to the video file
-        path: PathBuf,
-        /// Source error
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    /// Error during video decoding
-    #[error("Decode error: {0}")]
-    Decode(String),
-
-    /// Error during video encoding
-    #[error("Encode error: {0}")]
-    Encode(String),
-
-    /// Error during person detection
-    #[error("Detection failed: {0}")]
-    Detection(String),
-
     /// Error during face identification
     #[error("Face identification failed: {0}")]
     FaceIdentification(String),
-
-    /// Target identity not found in frame
-    #[error("Identity not found")]
-    IdentityNotFound,
 
     /// Invalid frame dimensions or format
     #[error("Invalid frame: {0}")]
@@ -62,15 +37,7 @@ pub enum FancamError {
     #[error("Image processing error: {0}")]
     ImageProcessing(String),
 
-    /// Thread communication error
-    #[error("Channel closed: {0}")]
-    ChannelClosed(String),
-
-    /// Thread panic or join error
-    #[error("Thread error: {0}")]
-    Thread(String),
-
-    /// Lock poisoned (mutex/rwlock)
+    /// Lock poisoned (mutex)
     #[error("Lock poisoned: {0}")]
     LockPoisoned(String),
 
@@ -86,7 +53,7 @@ pub enum FancamError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Catch-all for unexpected errors
+    /// Catch-all for unexpected errors (used by `From<anyhow::Error>`)
     #[error("Unexpected error: {0}")]
     Unexpected(String),
 }
@@ -103,80 +70,32 @@ impl FancamError {
         }
     }
 
-    /// Create a video error
-    pub fn video<E>(path: impl Into<PathBuf>, source: E) -> Self
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        Self::Video {
-            path: path.into(),
-            source: Box::new(source),
-        }
-    }
-
-    /// Create a decode error
-    pub fn decode(msg: impl Into<String>) -> Self {
-        Self::Decode(msg.into())
-    }
-
-    /// Create an encode error
-    pub fn encode(msg: impl Into<String>) -> Self {
-        Self::Encode(msg.into())
-    }
-
-    /// Create an inference error
     pub fn inference(msg: impl Into<String>) -> Self {
         Self::Inference(msg.into())
     }
 
-    /// Create a detection error
-    pub fn detection(msg: impl Into<String>) -> Self {
-        Self::Detection(msg.into())
-    }
-
-    /// Create a face identification error
     pub fn face_id(msg: impl Into<String>) -> Self {
         Self::FaceIdentification(msg.into())
     }
 
-    /// Create an image processing error
     pub fn image_processing(msg: impl Into<String>) -> Self {
         Self::ImageProcessing(msg.into())
     }
 
-    /// Create an invalid frame error
     pub fn invalid_frame(msg: impl Into<String>) -> Self {
         Self::InvalidFrame(msg.into())
     }
 
-    /// Create a channel closed error
-    pub fn channel_closed(msg: impl Into<String>) -> Self {
-        Self::ChannelClosed(msg.into())
-    }
-
-    /// Create a thread error
-    pub fn thread(msg: impl Into<String>) -> Self {
-        Self::Thread(msg.into())
-    }
-
-    /// Create a lock poisoned error
     pub fn lock_poisoned(msg: impl Into<String>) -> Self {
         Self::LockPoisoned(msg.into())
     }
 
-    /// Create an ORT config error
     pub fn ort_config(msg: impl Into<String>) -> Self {
         Self::OrtConfig(msg.into())
     }
 
-    /// Create an invalid config error
     pub fn invalid_config(msg: impl Into<String>) -> Self {
         Self::InvalidConfig(msg.into())
-    }
-
-    /// Create an unexpected error
-    pub fn unexpected(msg: impl Into<String>) -> Self {
-        Self::Unexpected(msg.into())
     }
 }
 
@@ -192,7 +111,6 @@ impl From<anyhow::Error> for FancamError {
 
 /// Helper trait for converting poison errors
 pub trait PoisonExt<T> {
-    /// Convert a poison error to `FancamError`
     fn to_fancam_err(self, context: &str) -> Result<T>;
 }
 
@@ -208,8 +126,8 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = FancamError::decode("test error");
-        assert_eq!(err.to_string(), "Decode error: test error");
+        let err = FancamError::inference("test error");
+        assert_eq!(err.to_string(), "Inference failed: test error");
     }
 
     #[test]

@@ -16,13 +16,14 @@ pub enum ProcessingMode {
 }
 
 impl ProcessingMode {
-    /// Parse from a user-supplied string.
+    /// Parse from a user-supplied string. Returns `None` for unknown values.
     #[must_use]
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "quality" | "hq" => Self::Quality,
-            "balanced" | "balance" | "normal" => Self::Balanced,
-            _ => Self::Fast,
+            "fast" | "faster" => Some(Self::Fast),
+            "balanced" | "balance" | "normal" => Some(Self::Balanced),
+            "quality" | "hq" | "thorough" => Some(Self::Quality),
+            _ => None,
         }
     }
 

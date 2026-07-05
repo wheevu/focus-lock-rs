@@ -83,133 +83,117 @@ impl CameraCursor {
     }
 }
 
-/// Naive camera planner that emits one keyframe per tracklet observation.
-#[derive(Debug, Default)]
-pub struct CameraPlanner;
+/// Build camera path for one solved identity from tracklets and assignments.
+#[must_use]
+pub fn plan_camera_for_identity(
+    tracklets: &[Tracklet],
+    assignments: &[(usize, usize)],
+    identity_id: usize,
+) -> CameraPath {
+    let by_id = tracklets
+        .iter()
+        .map(|tracklet| (tracklet.id, tracklet))
+        .collect::<HashMap<_, _>>();
 
-impl CameraPlanner {
-    /// Build a basic camera path from solved target tracklets.
-    #[must_use]
-    pub fn plan_from_tracklets(tracklets: &[Tracklet]) -> CameraPath {
-        let assignments = tracklets
-            .iter()
-            .map(|tracklet| (tracklet.id, 0_usize))
-            .collect::<Vec<_>>();
-        Self::plan_for_identity(tracklets, &assignments, 0)
+    let mut scored_keyframes = Vec::<(u64, CameraState, f32)>::new();
+    for (tracklet_id, assigned_identity) in assignments {
+        if *assigned_identity != identity_id {
+            continue;
+        }
+        let Some(tracklet) = by_id.get(tracklet_id) else {
+            continue;
+        };
+        for obs in &tracklet.observations {
+            let hs = (obs.bbox.width().max(obs.bbox.height()) * 0.5).max(1.0);
+            scored_keyframes.push((
+                obs.frame_index,
+                CameraState {
+                    cx: obs.bbox.center_x(),
+                    cy: obs.bbox.center_y(),
+                    half_size: hs,
+                    source: CameraSource::Observed,
+                    miss_count: 0,
+                },
+                obs.observation.composite_score(),
+            ));
+        }
     }
 
-    /// Build camera path for one solved identity.
-    #[must_use]
-    pub fn plan_for_identity(
-        tracklets: &[Tracklet],
-        assignments: &[(usize, usize)],
-        identity_id: usize,
-    ) -> CameraPath {
-        let by_id = tracklets
-            .iter()
-            .map(|tracklet| (tracklet.id, tracklet))
-            .collect::<HashMap<_, _>>();
+    if scored_keyframes.is_empty() {
+        return CameraPath::default();
+    }
 
-        let mut scored_keyframes = Vec::<(u64, CameraState, f32)>::new();
-        for (tracklet_id, assigned_identity) in assignments {
-            if *assigned_identity != identity_id {
-                continue;
-            }
-            let Some(tracklet) = by_id.get(tracklet_id) else {
-                continue;
-            };
-            for obs in &tracklet.observations {
-                let hs = (obs.bbox.width().max(obs.bbox.height()) * 0.5).max(1.0);
-                scored_keyframes.push((
-                    obs.frame_index,
-                    CameraState {
-                        cx: obs.bbox.center_x(),
-                        cy: obs.bbox.center_y(),
-                        half_size: hs,
+    scored_keyframes.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    // Keep only the best-scoring state per frame.
+    let mut keyframes = Vec::<CameraKeyframe>::new();
+    for (frame_index, state, _) in scored_keyframes {
+        if keyframes
+            .last()
+            .is_some_and(|keyframe| keyframe.frame_index == frame_index)
+        {
+            continue;
+        }
+        keyframes.push(CameraKeyframe { frame_index, state });
+    }
+
+    // Smooth neighboring keyframes to reduce jitter.
+    let mut smoothed = Vec::<CameraKeyframe>::with_capacity(keyframes.len());
+    for keyframe in keyframes {
+        if let Some(previous) = smoothed.last().copied() {
+            let gap = keyframe.frame_index.saturating_sub(previous.frame_index);
+            if gap <= 12 {
+                smoothed.push(CameraKeyframe {
+                    frame_index: keyframe.frame_index,
+                    state: CameraState {
+                        cx: previous.state.cx.mul_add(0.68, keyframe.state.cx * 0.32),
+                        cy: previous.state.cy.mul_add(0.68, keyframe.state.cy * 0.32),
+                        half_size: previous
+                            .state
+                            .half_size
+                            .mul_add(0.74, keyframe.state.half_size * 0.26),
                         source: CameraSource::Observed,
                         miss_count: 0,
                     },
-                    obs.observation.composite_score(),
-                ));
-            }
-        }
-
-        if scored_keyframes.is_empty() {
-            return CameraPath::default();
-        }
-
-        scored_keyframes.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-        });
-
-        // Keep only the best-scoring state per frame.
-        let mut keyframes = Vec::<CameraKeyframe>::new();
-        for (frame_index, state, _) in scored_keyframes {
-            if keyframes
-                .last()
-                .is_some_and(|keyframe| keyframe.frame_index == frame_index)
-            {
-                continue;
-            }
-            keyframes.push(CameraKeyframe { frame_index, state });
-        }
-
-        // Smooth neighboring keyframes to reduce jitter.
-        let mut smoothed = Vec::<CameraKeyframe>::with_capacity(keyframes.len());
-        for keyframe in keyframes {
-            if let Some(previous) = smoothed.last().copied() {
-                let gap = keyframe.frame_index.saturating_sub(previous.frame_index);
-                if gap <= 12 {
-                    smoothed.push(CameraKeyframe {
-                        frame_index: keyframe.frame_index,
-                        state: CameraState {
-                            cx: previous.state.cx.mul_add(0.68, keyframe.state.cx * 0.32),
-                            cy: previous.state.cy.mul_add(0.68, keyframe.state.cy * 0.32),
-                            half_size: previous
-                                .state
-                                .half_size
-                                .mul_add(0.74, keyframe.state.half_size * 0.26),
-                            source: CameraSource::Observed,
-                            miss_count: 0,
-                        },
-                    });
-                } else {
-                    smoothed.push(keyframe);
-                }
+                });
             } else {
                 smoothed.push(keyframe);
             }
+        } else {
+            smoothed.push(keyframe);
         }
-
-        // Densify short gaps with linear interpolation.
-        let mut keyframes = Vec::new();
-        if let Some(first) = smoothed.first().copied() {
-            keyframes.push(first);
-        }
-        for window in smoothed.windows(2) {
-            let [left, right] = [window[0], window[1]];
-            let gap = right.frame_index.saturating_sub(left.frame_index);
-            if gap > 1 && gap <= 12 {
-                for offset in 1..gap {
-                    let t = offset as f32 / gap as f32;
-                    keyframes.push(CameraKeyframe {
-                        frame_index: left.frame_index + offset,
-                        state: CameraState {
-                            cx: (right.state.cx - left.state.cx).mul_add(t, left.state.cx),
-                            cy: (right.state.cy - left.state.cy).mul_add(t, left.state.cy),
-                            half_size: (right.state.half_size - left.state.half_size)
-                                .mul_add(t, left.state.half_size),
-                            source: CameraSource::Predicted,
-                            miss_count: offset.min(u64::from(u32::MAX)) as u32,
-                        },
-                    });
-                }
-            }
-            keyframes.push(right);
-        }
-
-        keyframes.sort_unstable_by_key(|k| k.frame_index);
-        CameraPath { keyframes }
     }
+
+    // Densify short gaps with linear interpolation.
+    let mut keyframes = Vec::new();
+    if let Some(first) = smoothed.first().copied() {
+        keyframes.push(first);
+    }
+    for window in smoothed.windows(2) {
+        let [left, right] = [window[0], window[1]];
+        let gap = right.frame_index.saturating_sub(left.frame_index);
+        if gap > 1 && gap <= 12 {
+            for offset in 1..gap {
+                let t = offset as f32 / gap as f32;
+                keyframes.push(CameraKeyframe {
+                    frame_index: left.frame_index + offset,
+                    state: CameraState {
+                        cx: (right.state.cx - left.state.cx).mul_add(t, left.state.cx),
+                        cy: (right.state.cy - left.state.cy).mul_add(t, left.state.cy),
+                        half_size: (right.state.half_size - left.state.half_size)
+                            .mul_add(t, left.state.half_size),
+                        source: CameraSource::Predicted,
+                        miss_count: offset.min(u64::from(u32::MAX)) as u32,
+                    },
+                });
+            }
+        }
+        keyframes.push(right);
+    }
+
+    keyframes.sort_unstable_by_key(|k| k.frame_index);
+    CameraPath { keyframes }
 }

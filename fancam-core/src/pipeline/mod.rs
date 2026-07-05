@@ -33,7 +33,7 @@ use crate::detection::{BBox, Detector, FaceIdentifier};
 use crate::mode::ProcessingMode;
 use crate::reid::BodyReidentifier;
 use crate::rendering::FrameRenderer;
-use crate::solver::{IdentitySolver, SolverResult};
+use crate::solver::{self, SolverResult};
 use crate::tracking::{CameraState, TargetTracker, TrackingState};
 use crate::tracklet::Tracklet;
 use crate::video;
@@ -214,7 +214,7 @@ impl Analyzer {
 
     /// Enable offline solved camera mode from prebuilt tracklets.
     pub fn enable_offline_from_tracklets(&mut self, tracklets: &[Tracklet]) {
-        let solved = IdentitySolver::solve(tracklets);
+        let solved = solver::solve(tracklets);
         self.enable_offline_from_solver_result(solved);
     }
 
@@ -449,7 +449,7 @@ impl Analyzer {
     /// Pass-2 helper: run global identity solving on tracklets.
     #[must_use]
     pub fn solve_tracklets(&self, tracklets: &[Tracklet]) -> SolverResult {
-        IdentitySolver::solve(tracklets)
+        solver::solve(tracklets)
     }
 }
 

@@ -236,14 +236,6 @@ impl OrtConfig {
     }
 }
 
-impl Default for OrtConfig {
-    fn default() -> Self {
-        // Panic in default is acceptable for application code,
-        // but library code should use discover() explicitly
-        Self::discover().expect("ORT library not found")
-    }
-}
-
 /// Legacy compatibility: Configure ORT by setting environment variable.
 ///
 /// # Deprecated

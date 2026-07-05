@@ -21,3 +21,6 @@ ui/.svelte-kit
 .DS_Store
 tmp/
 terminal-log.txt
+ui-legacy/
+terminal-log.txt
+tmp/

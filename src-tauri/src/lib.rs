@@ -10,16 +10,13 @@ use std::{
 /// Cancel flag shared with the active fancam job.
 pub struct CancelFlag(pub Arc<AtomicBool>);
 
-/// Cancel flag shared with active identity scan jobs.
-pub struct ScanCancelFlag(pub Arc<AtomicBool>);
-
 #[derive(Debug, Default)]
 pub struct RenderJobState {
     pub running: bool,
     pub cancelling: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct RenderJobStore(pub Arc<Mutex<RenderJobState>>);
 
 impl Default for CancelFlag {
@@ -28,11 +25,15 @@ impl Default for CancelFlag {
     }
 }
 
-impl Default for ScanCancelFlag {
-    fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
+#[derive(Debug, Default)]
+pub struct ScanJobState {
+    pub running: bool,
+    pub cancelling: bool,
+    pub cancel: Arc<AtomicBool>,
 }
+
+#[derive(Debug, Default)]
+pub struct ScanJobStore(pub Arc<Mutex<ScanJobState>>);
 
 #[derive(Debug, Default)]
 pub struct IdentityScanState {
@@ -138,8 +139,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .manage(CancelFlag::default())
-        .manage(ScanCancelFlag::default())
         .manage(RenderJobStore::default())
+        .manage(ScanJobStore::default())
         .manage(IdentityScanStore::default())
         .manage(QueueStore::default())
         .manage(QueueWorkerStore::default())
@@ -159,10 +160,6 @@ pub fn run() {
             commands::run_scan_storage_maintenance,
             commands::export_diagnostics_bundle,
             commands::list_diagnostics_bundles,
-            commands::prune_diagnostics_bundles,
-            commands::read_diagnostics_bundle,
-            commands::verify_diagnostics_bundle,
-            commands::delete_diagnostics_bundle,
             commands::storage_worker_start,
             commands::storage_worker_stop,
             commands::storage_worker_status,

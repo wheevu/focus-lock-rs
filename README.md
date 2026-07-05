@@ -1,6 +1,6 @@
 # focus-lock-rs
 
-![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust)
+![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust)
 ![Tauri](https://img.shields.io/badge/Tauri-2.0-blue?logo=tauri)
 ![Svelte](https://img.shields.io/badge/Svelte-5-red?logo=svelte)
 ![License](https://img.shields.io/badge/License-MIT-green)

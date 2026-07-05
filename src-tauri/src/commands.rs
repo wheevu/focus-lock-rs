@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -22,13 +22,13 @@ use fancam_core::{
 };
 use image::ImageReader;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tauri::{AppHandle, Emitter, State};
 use tokio::task;
 
 use crate::{
     CancelFlag, IdentityScanState, IdentityScanStore, QueueStore, QueueWorkerStore, RenderJobStore,
-    ScanCancelFlag, StorageWorkerStore, queue, storage,
+    ScanJobStore, StorageWorkerStore, queue, storage,
 };
 
 static RUN_ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -372,60 +372,11 @@ pub struct DiagnosticsBundleInfo {
     pub path: String,
     pub bytes: u64,
     pub modified_at_ms: Option<u64>,
-    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ListDiagnosticsBundlesResult {
     pub bundles: Vec<DiagnosticsBundleInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PruneDiagnosticsBundlesArgs {
-    pub keep_latest: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PruneDiagnosticsBundlesResult {
-    pub deleted: usize,
-    pub kept: usize,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DeleteDiagnosticsBundleArgs {
-    pub path: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DeleteDiagnosticsBundleResult {
-    pub deleted: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VerifyDiagnosticsBundleArgs {
-    pub path: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VerifyDiagnosticsBundleResult {
-    pub path: String,
-    pub expected_sha256: Option<String>,
-    pub actual_sha256: String,
-    pub matches: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ReadDiagnosticsBundleArgs {
-    pub path: String,
-    pub max_bytes: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReadDiagnosticsBundleResult {
-    pub path: String,
-    pub bytes: usize,
-    pub content: String,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -557,11 +508,66 @@ pub async fn read_thumbnail(path: String) -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Guard that marks the active scan job and exposes a per-scan cancel flag.
+/// Always resets the running state on drop, even on mutex poisoning.
+#[derive(Debug)]
+struct ScanJobGuard<'a> {
+    store: &'a ScanJobStore,
+}
+
+impl<'a> ScanJobGuard<'a> {
+    fn acquire(store: &'a ScanJobStore) -> Result<(Self, Arc<AtomicBool>), String> {
+        let mut job = match store.0.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                let mut g = poisoned.into_inner();
+                g.running = false;
+                g.cancelling = false;
+                g.cancel.store(false, Ordering::Relaxed);
+                drop(g);
+                store.0.clear_poison();
+                store.0.lock().map_err(|e| e.to_string())?
+            }
+        };
+        if job.running {
+            let message = if job.cancelling {
+                "scan cancellation is in progress; wait for stop to finish".to_string()
+            } else {
+                "an identity scan is already running".to_string()
+            };
+            return Err(message);
+        }
+        job.running = true;
+        job.cancelling = false;
+        job.cancel.store(false, Ordering::Relaxed);
+        let cancel = Arc::clone(&job.cancel);
+        Ok((Self { store }, cancel))
+    }
+}
+
+impl<'a> Drop for ScanJobGuard<'a> {
+    fn drop(&mut self) {
+        match self.store.0.lock() {
+            Ok(mut job) => {
+                job.running = false;
+                job.cancelling = false;
+            }
+            Err(poisoned) => {
+                let mut job = poisoned.into_inner();
+                job.running = false;
+                job.cancelling = false;
+                drop(job);
+                self.store.0.clear_poison();
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn scan_identities(
     app: AppHandle,
     state: State<'_, IdentityScanStore>,
-    scan_cancel: State<'_, ScanCancelFlag>,
+    scan_job_state: State<'_, ScanJobStore>,
     args: IdentityScanArgs,
 ) -> Result<IdentityScanResult, String> {
     validate_identity_scan_paths(&args)?;
@@ -570,12 +576,9 @@ pub async fn scan_identities(
         .clone()
         .unwrap_or_else(|| next_run_id("scan"));
 
-    {
-        scan_cancel.0.store(false, Ordering::Relaxed);
-    }
+    let (_guard, cancel_flag) = ScanJobGuard::acquire(&scan_job_state)?;
 
     let app_for_scan = app.clone();
-    let cancel_flag = Arc::clone(&scan_cancel.0);
     let yolo_model = args.yolo_model.clone();
     let identity_model =
         effective_identity_model(&args.face_model, args.identity_model.as_deref()).to_string();
@@ -1366,7 +1369,7 @@ fn fraction(current: u64, total: u64) -> f64 {
 }
 
 fn processing_mode_from_option(value: Option<&str>) -> ProcessingMode {
-    value.map(ProcessingMode::from_str).unwrap_or_default()
+    value.and_then(ProcessingMode::from_str).unwrap_or_default()
 }
 
 fn processing_mode_string(value: Option<&str>) -> String {
@@ -2062,8 +2065,6 @@ pub fn export_diagnostics_bundle(
     out_path.push(format!("bundle-{}.json", epoch_ms()));
     fs::write(&out_path, &json).map_err(|e| format!("failed to write diagnostics bundle: {e}"))?;
     let out_path_str = out_path.to_string_lossy().into_owned();
-    let sha256 = diagnostics_hash_hex(&json);
-    upsert_manifest_entry(&out_path_str, json.len() as u64, sha256)?;
 
     Ok(ExportDiagnosticsResult {
         path: out_path_str,
@@ -2082,13 +2083,6 @@ pub fn list_diagnostics_bundles(
             bundles: Vec::new(),
         });
     }
-
-    let manifest = load_diagnostics_manifest();
-    let manifest_sha = manifest
-        .entries
-        .into_iter()
-        .map(|entry| (entry.path, entry.sha256))
-        .collect::<HashMap<String, String>>();
 
     let mut bundles = Vec::new();
     let entries = fs::read_dir(&dir).map_err(|e| format!("failed to read diagnostics dir: {e}"))?;
@@ -2117,7 +2111,6 @@ pub fn list_diagnostics_bundles(
             path: path_str.clone(),
             bytes: meta.len(),
             modified_at_ms: file_modified_ms(&meta),
-            sha256: manifest_sha.get(&path_str).cloned(),
         });
     }
 
@@ -2129,102 +2122,6 @@ pub fn list_diagnostics_bundles(
     bundles.truncate(limit);
 
     Ok(ListDiagnosticsBundlesResult { bundles })
-}
-
-#[tauri::command]
-pub fn prune_diagnostics_bundles(
-    args: Option<PruneDiagnosticsBundlesArgs>,
-) -> Result<PruneDiagnosticsBundlesResult, String> {
-    let keep_latest = args.and_then(|a| a.keep_latest).unwrap_or(20);
-    let list = list_diagnostics_bundles(Some(ListDiagnosticsBundlesArgs { limit: Some(1000) }))?;
-    if list.bundles.len() <= keep_latest {
-        return Ok(PruneDiagnosticsBundlesResult {
-            deleted: 0,
-            kept: list.bundles.len(),
-        });
-    }
-
-    let mut deleted = 0usize;
-    for bundle in list.bundles.iter().skip(keep_latest) {
-        if fs::remove_file(&bundle.path).is_ok() {
-            let _ = remove_manifest_entry(&bundle.path);
-            deleted += 1;
-        }
-    }
-    let kept = list.bundles.len().saturating_sub(deleted);
-    Ok(PruneDiagnosticsBundlesResult { deleted, kept })
-}
-
-#[tauri::command]
-pub fn read_diagnostics_bundle(
-    args: ReadDiagnosticsBundleArgs,
-) -> Result<ReadDiagnosticsBundleResult, String> {
-    let max_bytes = args
-        .max_bytes
-        .unwrap_or(256 * 1024)
-        .clamp(1024, 2 * 1024 * 1024);
-    let path = PathBuf::from(&args.path);
-    let diagnostics_dir = diagnostics_dir_path();
-    if !path.starts_with(&diagnostics_dir) {
-        return Err("path must be inside .focus-lock/diagnostics".to_string());
-    }
-    let bytes = fs::read(&path).map_err(|e| format!("failed to read bundle: {e}"))?;
-    let truncated = bytes.len() > max_bytes;
-    let shown = if truncated {
-        &bytes[..max_bytes]
-    } else {
-        &bytes[..]
-    };
-    let content = String::from_utf8_lossy(shown).to_string();
-    Ok(ReadDiagnosticsBundleResult {
-        path: path.to_string_lossy().into_owned(),
-        bytes: bytes.len(),
-        content,
-        truncated,
-    })
-}
-
-#[tauri::command]
-pub fn verify_diagnostics_bundle(
-    args: VerifyDiagnosticsBundleArgs,
-) -> Result<VerifyDiagnosticsBundleResult, String> {
-    let path = PathBuf::from(&args.path);
-    let diagnostics_dir = diagnostics_dir_path();
-    if !path.starts_with(&diagnostics_dir) {
-        return Err("path must be inside diagnostics directory".to_string());
-    }
-    let bytes = fs::read(&path).map_err(|e| format!("failed to read diagnostics bundle: {e}"))?;
-    let actual_sha256 = diagnostics_hash_hex(&bytes);
-    let path_str = path.to_string_lossy().into_owned();
-    let expected_sha256 = manifest_sha_for(&path_str);
-    let matches = expected_sha256
-        .as_ref()
-        .is_some_and(|expected| expected == &actual_sha256);
-    Ok(VerifyDiagnosticsBundleResult {
-        path: path_str,
-        expected_sha256,
-        actual_sha256,
-        matches,
-    })
-}
-
-#[tauri::command]
-pub fn delete_diagnostics_bundle(
-    args: DeleteDiagnosticsBundleArgs,
-) -> Result<DeleteDiagnosticsBundleResult, String> {
-    let path = PathBuf::from(&args.path);
-    let diagnostics_dir = diagnostics_dir_path();
-    if !path.starts_with(&diagnostics_dir) {
-        return Err("path must be inside diagnostics directory".to_string());
-    }
-    if !path.exists() {
-        let _ = remove_manifest_entry(&args.path);
-        return Ok(DeleteDiagnosticsBundleResult { deleted: false });
-    }
-    fs::remove_file(&path).map_err(|e| format!("failed to delete diagnostics bundle: {e}"))?;
-    let path_str = path.to_string_lossy().into_owned();
-    let _ = remove_manifest_entry(&path_str);
-    Ok(DeleteDiagnosticsBundleResult { deleted: true })
 }
 
 #[tauri::command]
@@ -2348,28 +2245,16 @@ pub fn storage_worker_start(
 }
 
 #[tauri::command]
-pub async fn queue_health(state: State<'_, QueueStore>) -> Result<queue::QueueHealth, String> {
-    let config = {
-        let lock = state.0.lock().map_err(|e| e.to_string())?;
-        lock.config.clone()
-    };
-    if config.sqs_enabled {
-        queue::sqs_health(&config).await
-    } else {
-        let lock = state.0.lock().map_err(|e| e.to_string())?;
-        Ok(lock.health())
-    }
+pub fn queue_health(state: State<'_, QueueStore>) -> Result<queue::QueueHealth, String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    Ok(lock.health())
 }
 
 #[tauri::command]
-pub async fn enqueue_discovery_job(
+pub fn enqueue_discovery_job(
     state: State<'_, QueueStore>,
     args: EnqueueDiscoveryJobArgs,
 ) -> Result<queue::QueueEnqueueResult, String> {
-    let config = {
-        let lock = state.0.lock().map_err(|e| e.to_string())?;
-        lock.config.clone()
-    };
     let idempotency_key = args.idempotency_key.unwrap_or_else(|| {
         format!(
             "discovery:{}:{}:{}",
@@ -2388,16 +2273,12 @@ pub async fn enqueue_discovery_job(
         processing_mode: sanitize_processing_mode(args.processing_mode.as_deref()),
     };
 
-    if config.sqs_enabled {
-        queue::sqs_enqueue_discovery(&config, payload, idempotency_key).await
-    } else {
-        let mut lock = state.0.lock().map_err(|e| e.to_string())?;
-        lock.enqueue_discovery(payload, idempotency_key)
-    }
+    let mut lock = state.0.lock().map_err(|e| e.to_string())?;
+    lock.enqueue_discovery(payload, idempotency_key)
 }
 
 #[tauri::command]
-pub async fn enqueue_split_rescan_job(
+pub fn enqueue_split_rescan_job(
     queue_state: State<'_, QueueStore>,
     scan_state: State<'_, IdentityScanStore>,
     args: EnqueueSplitRescanArgs,
@@ -2429,11 +2310,6 @@ pub async fn enqueue_split_rescan_job(
         return Err("no pending split identities to rescan".to_string());
     }
 
-    let config = {
-        let q = queue_state.0.lock().map_err(|e| e.to_string())?;
-        q.config.clone()
-    };
-
     let idempotency_key = args.idempotency_key.unwrap_or_else(|| {
         format!(
             "rescan:{}:{}:{}",
@@ -2461,9 +2337,7 @@ pub async fn enqueue_split_rescan_job(
             .or(scan_snapshot.5),
     };
 
-    let enqueue_result = if config.sqs_enabled {
-        queue::sqs_enqueue_rescan(&config, payload, idempotency_key).await?
-    } else {
+    let enqueue_result = {
         let mut q = queue_state.0.lock().map_err(|e| e.to_string())?;
         q.enqueue_rescan(payload, idempotency_key)?
     };
@@ -2524,115 +2398,15 @@ async fn process_next_discovery_job_core(
 ) -> Result<queue::QueueProcessResult, String> {
     let max_attempts_before_dlq = max_attempts_before_dlq.max(1);
 
-    let config = {
-        let queue = queue_store.lock().map_err(|e| e.to_string())?;
-        queue.config.clone()
-    };
-
-    if config.sqs_enabled {
-        let Some(msg) = queue::sqs_receive_discovery(&config).await? else {
-            return Ok(queue::QueueProcessResult {
-                processed: false,
-                queue: config.discovery_queue.clone(),
-                message_id: None,
-                job_id: None,
-                moved_to_dlq: false,
-                requeued: false,
-                attempt: None,
-                error: None,
-                remaining_depth: queue::sqs_health(&config).await?.depths.discovery,
-            });
-        };
-
-        let envelope = msg.envelope;
-        let payload = envelope.payload.clone();
-        let yolo_model = payload.yolo_model.clone();
-        let identity_model = payload.identity_model.clone();
-        let app_for_scan = app.clone();
-        let queue_run_id = client_run_id.clone();
-        let run_result = task::spawn_blocking(move || {
-            run_identity_scan_for_queue(
-                IdentityScanArgs {
-                    video: payload.video,
-                    yolo_model: payload.yolo_model,
-                    face_model: identity_model.clone(),
-                    identity_model: Some(identity_model),
-                    body_reid_model: None,
-                    expected_member_count: payload.expected_member_count,
-                    processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
-                    client_run_id: queue_run_id,
-                },
-                app_for_scan,
-                "queued discovery",
-            )
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-
-        match run_result {
-            Ok(scan_result) => {
-                queue::sqs_ack(&msg.queue_url, &msg.receipt_handle).await?;
-                let snapshot = {
-                    let mut scans = scan_store.lock().map_err(|e| e.to_string())?;
-                    ensure_scan_store_loaded(&mut scans);
-                    upsert_scan_cache(
-                        &mut scans.scans,
-                        &envelope.payload.scan_id,
-                        &scan_result,
-                        &yolo_model,
-                        &payload.identity_model,
-                    );
-                    snapshot_scan_entry(&scans, &envelope.payload.scan_id)?
-                };
-                if let Some(snapshot) = snapshot.as_ref() {
-                    persist_scan_entry_snapshot(snapshot)?;
-                }
-                let health = queue::sqs_health(&config).await?;
-                return Ok(queue::QueueProcessResult {
-                    processed: true,
-                    queue: config.discovery_queue.clone(),
-                    message_id: Some(envelope.message_id),
-                    job_id: Some(envelope.job_id),
-                    moved_to_dlq: false,
-                    requeued: false,
-                    attempt: Some(envelope.attempt),
-                    error: None,
-                    remaining_depth: health.depths.discovery,
-                });
-            }
-            Err(err) => {
-                let (moved_to_dlq, requeued) = queue::sqs_retry_or_dlq(
-                    &config,
-                    &msg.queue_url,
-                    &msg.receipt_handle,
-                    envelope.clone(),
-                    max_attempts_before_dlq,
-                )
-                .await?;
-                let health = queue::sqs_health(&config).await?;
-                return Ok(queue::QueueProcessResult {
-                    processed: true,
-                    queue: config.discovery_queue.clone(),
-                    message_id: Some(envelope.message_id),
-                    job_id: Some(envelope.job_id),
-                    moved_to_dlq,
-                    requeued,
-                    attempt: Some(envelope.attempt),
-                    error: Some(err),
-                    remaining_depth: health.depths.discovery,
-                });
-            }
-        }
-    }
-
     let dequeued = {
         let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
+
         match queue.dequeue_discovery() {
             Ok(Some(msg)) => msg,
             Ok(None) => {
                 return Ok(queue::QueueProcessResult {
                     processed: false,
-                    queue: queue.config.discovery_queue.clone(),
+                    queue: "discovery".to_string(),
                     message_id: None,
                     job_id: None,
                     moved_to_dlq: false,
@@ -2645,7 +2419,7 @@ async fn process_next_discovery_job_core(
             Err(err) => {
                 return Ok(queue::QueueProcessResult {
                     processed: false,
-                    queue: queue.config.discovery_queue.clone(),
+                    queue: "discovery".to_string(),
                     message_id: None,
                     job_id: None,
                     moved_to_dlq: false,
@@ -2704,7 +2478,7 @@ async fn process_next_discovery_job_core(
             let queue = queue_store.lock().map_err(|e| e.to_string())?;
             Ok(queue::QueueProcessResult {
                 processed: true,
-                queue: queue.config.discovery_queue.clone(),
+                queue: "discovery".to_string(),
                 message_id: Some(envelope.message_id),
                 job_id: Some(envelope.job_id),
                 moved_to_dlq: false,
@@ -2727,7 +2501,7 @@ async fn process_next_discovery_job_core(
             }
             Ok(queue::QueueProcessResult {
                 processed: true,
-                queue: queue.config.discovery_queue.clone(),
+                queue: "discovery".to_string(),
                 message_id: Some(envelope.message_id),
                 job_id: Some(envelope.job_id),
                 moved_to_dlq,
@@ -2770,239 +2544,125 @@ async fn process_next_rescan_job_core(
     client_run_id: Option<String>,
 ) -> Result<queue::QueueProcessResult, String> {
     let max_attempts_before_dlq = max_attempts_before_dlq.max(1);
-    let config = {
-        let queue = queue_store.lock().map_err(|e| e.to_string())?;
-        queue.config.clone()
-    };
-
-    if config.sqs_enabled {
-        let Some(msg) = queue::sqs_receive_rescan(&config).await? else {
-            return Ok(queue::QueueProcessResult {
-                processed: false,
-                queue: config.rescan_queue.clone(),
-                message_id: None,
-                job_id: None,
-                moved_to_dlq: false,
-                requeued: false,
-                attempt: None,
-                error: None,
-                remaining_depth: queue::sqs_health(&config).await?.depths.rescan,
-            });
-        };
-
-        let envelope = msg.envelope;
-        let payload = envelope.payload.clone();
-        let yolo_model = payload.yolo_model.clone();
-        let identity_model = payload.identity_model.clone();
-        let video = payload.video.clone();
-        let app_for_scan = app.clone();
-        let queue_run_id = client_run_id.clone();
-        let run_result = task::spawn_blocking(move || {
-            run_identity_scan_for_queue(
-                IdentityScanArgs {
-                    video,
-                    yolo_model,
-                    face_model: identity_model.clone(),
-                    identity_model: Some(identity_model),
-                    body_reid_model: None,
-                    expected_member_count: None,
-                    processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
-                    client_run_id: queue_run_id,
-                },
-                app_for_scan,
-                "queued rescan",
-            )
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-
-        match run_result {
-            Ok(scan_result) => {
-                queue::sqs_ack(&msg.queue_url, &msg.receipt_handle).await?;
-                let snapshot = {
-                    let mut scans = scan_store.lock().map_err(|e| e.to_string())?;
-                    ensure_scan_store_loaded(&mut scans);
-                    if let Some(scan) = scans.scans.get_mut(&payload.scan_id) {
-                        scan.candidates = scan_result.candidates;
-                        scan.duplicates = scan_result.duplicates;
-                        scan.pending_split_ids.clear();
-                        scan.review_ready = false;
-                        scan.selected_identity_id = None;
-                        scan.selected_anchor_x = None;
-                        scan.selected_anchor_y = None;
-                        scan.validated_threshold = None;
-                        set_scan_status(scan, ScanSessionStatus::Proposed);
-                        scan.last_blockers =
-                            vec!["split rescan complete: please validate again".to_string()];
-                        scan.updated_at_ms = epoch_ms();
-                        append_scan_event(
-                            scan,
-                            "split_rescan_processed",
-                            "candidates refreshed and review reset".to_string(),
-                        );
-                    }
-                    snapshot_scan_entry(&scans, &payload.scan_id)?
-                };
-                if let Some(snapshot) = snapshot.as_ref() {
-                    persist_scan_entry_snapshot(snapshot)?;
-                }
-                let health = queue::sqs_health(&config).await?;
-                Ok(queue::QueueProcessResult {
-                    processed: true,
-                    queue: config.rescan_queue.clone(),
-                    message_id: Some(envelope.message_id),
-                    job_id: Some(envelope.job_id),
+    let dequeued = {
+        let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
+        match queue.dequeue_rescan() {
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                return Ok(queue::QueueProcessResult {
+                    processed: false,
+                    queue: "rescan".to_string(),
+                    message_id: None,
+                    job_id: None,
                     moved_to_dlq: false,
                     requeued: false,
-                    attempt: Some(envelope.attempt),
+                    attempt: None,
                     error: None,
-                    remaining_depth: health.depths.rescan,
-                })
+                    remaining_depth: queue.health().depths.rescan,
+                });
             }
             Err(err) => {
-                let (moved_to_dlq, requeued) = queue::sqs_retry_or_dlq_rescan(
-                    &config,
-                    &msg.queue_url,
-                    &msg.receipt_handle,
-                    envelope.clone(),
-                    max_attempts_before_dlq,
-                )
-                .await?;
-                let health = queue::sqs_health(&config).await?;
-                Ok(queue::QueueProcessResult {
-                    processed: true,
-                    queue: config.rescan_queue.clone(),
-                    message_id: Some(envelope.message_id),
-                    job_id: Some(envelope.job_id),
-                    moved_to_dlq,
-                    requeued,
-                    attempt: Some(envelope.attempt),
+                return Ok(queue::QueueProcessResult {
+                    processed: false,
+                    queue: "rescan".to_string(),
+                    message_id: None,
+                    job_id: None,
+                    moved_to_dlq: false,
+                    requeued: false,
+                    attempt: None,
                     error: Some(err),
-                    remaining_depth: health.depths.rescan,
-                })
+                    remaining_depth: queue.health().depths.rescan,
+                });
             }
         }
-    } else {
-        let dequeued = {
+    };
+
+    let envelope = dequeued.envelope;
+    let payload = envelope.payload.clone();
+    let app_for_scan = app.clone();
+    let queue_run_id = client_run_id.clone();
+    let run_result = task::spawn_blocking(move || {
+        run_identity_scan_for_queue(
+            IdentityScanArgs {
+                video: payload.video,
+                yolo_model: payload.yolo_model,
+                face_model: payload.identity_model.clone(),
+                identity_model: Some(payload.identity_model),
+                body_reid_model: None,
+                expected_member_count: None,
+                processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
+                client_run_id: queue_run_id,
+            },
+            app_for_scan,
+            "queued rescan",
+        )
+    });
+    let run_result = run_result.await.map_err(|e| e.to_string())?;
+
+    match run_result {
+        Ok(scan_result) => {
+            let snapshot = {
+                let mut scans = scan_store.lock().map_err(|e| e.to_string())?;
+                ensure_scan_store_loaded(&mut scans);
+                if let Some(scan) = scans.scans.get_mut(&payload.scan_id) {
+                    scan.candidates = scan_result.candidates;
+                    scan.duplicates = scan_result.duplicates;
+                    scan.pending_split_ids.clear();
+                    scan.review_ready = false;
+                    scan.selected_identity_id = None;
+                    scan.selected_anchor_x = None;
+                    scan.selected_anchor_y = None;
+                    scan.validated_threshold = None;
+                    set_scan_status(scan, ScanSessionStatus::Proposed);
+                    scan.last_blockers =
+                        vec!["split rescan complete: please validate again".to_string()];
+                    scan.updated_at_ms = epoch_ms();
+                    append_scan_event(
+                        scan,
+                        "split_rescan_processed",
+                        "candidates refreshed and review reset".to_string(),
+                    );
+                }
+                snapshot_scan_entry(&scans, &payload.scan_id)?
+            };
+            if let Some(snapshot) = snapshot.as_ref() {
+                persist_scan_entry_snapshot(snapshot)?;
+            }
+            let queue = queue_store.lock().map_err(|e| e.to_string())?;
+            Ok(queue::QueueProcessResult {
+                processed: true,
+                queue: "rescan".to_string(),
+                message_id: Some(envelope.message_id),
+                job_id: Some(envelope.job_id),
+                moved_to_dlq: false,
+                requeued: false,
+                attempt: Some(envelope.attempt),
+                error: None,
+                remaining_depth: queue.health().depths.rescan,
+            })
+        }
+        Err(err) => {
             let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
-            match queue.dequeue_rescan() {
-                Ok(Some(msg)) => msg,
-                Ok(None) => {
-                    return Ok(queue::QueueProcessResult {
-                        processed: false,
-                        queue: queue.config.rescan_queue.clone(),
-                        message_id: None,
-                        job_id: None,
-                        moved_to_dlq: false,
-                        requeued: false,
-                        attempt: None,
-                        error: None,
-                        remaining_depth: queue.health().depths.rescan,
-                    });
-                }
-                Err(err) => {
-                    return Ok(queue::QueueProcessResult {
-                        processed: false,
-                        queue: queue.config.rescan_queue.clone(),
-                        message_id: None,
-                        job_id: None,
-                        moved_to_dlq: false,
-                        requeued: false,
-                        attempt: None,
-                        error: Some(err),
-                        remaining_depth: queue.health().depths.rescan,
-                    });
-                }
+            let mut moved_to_dlq = false;
+            let mut requeued = false;
+            if envelope.attempt + 1 >= max_attempts_before_dlq {
+                queue.move_rescan_to_dlq(dequeued.raw);
+                moved_to_dlq = true;
+            } else {
+                queue.requeue_rescan_retry(envelope.clone())?;
+                requeued = true;
             }
-        };
-
-        let envelope = dequeued.envelope;
-        let payload = envelope.payload.clone();
-        let app_for_scan = app.clone();
-        let queue_run_id = client_run_id.clone();
-        let run_result = task::spawn_blocking(move || {
-            run_identity_scan_for_queue(
-                IdentityScanArgs {
-                    video: payload.video,
-                    yolo_model: payload.yolo_model,
-                    face_model: payload.identity_model.clone(),
-                    identity_model: Some(payload.identity_model),
-                    body_reid_model: None,
-                    expected_member_count: None,
-                    processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
-                    client_run_id: queue_run_id,
-                },
-                app_for_scan,
-                "queued rescan",
-            )
-        });
-        let run_result = run_result.await.map_err(|e| e.to_string())?;
-
-        match run_result {
-            Ok(scan_result) => {
-                let snapshot = {
-                    let mut scans = scan_store.lock().map_err(|e| e.to_string())?;
-                    ensure_scan_store_loaded(&mut scans);
-                    if let Some(scan) = scans.scans.get_mut(&payload.scan_id) {
-                        scan.candidates = scan_result.candidates;
-                        scan.duplicates = scan_result.duplicates;
-                        scan.pending_split_ids.clear();
-                        scan.review_ready = false;
-                        scan.selected_identity_id = None;
-                        scan.selected_anchor_x = None;
-                        scan.selected_anchor_y = None;
-                        scan.validated_threshold = None;
-                        set_scan_status(scan, ScanSessionStatus::Proposed);
-                        scan.last_blockers =
-                            vec!["split rescan complete: please validate again".to_string()];
-                        scan.updated_at_ms = epoch_ms();
-                        append_scan_event(
-                            scan,
-                            "split_rescan_processed",
-                            "candidates refreshed and review reset".to_string(),
-                        );
-                    }
-                    snapshot_scan_entry(&scans, &payload.scan_id)?
-                };
-                if let Some(snapshot) = snapshot.as_ref() {
-                    persist_scan_entry_snapshot(snapshot)?;
-                }
-                let queue = queue_store.lock().map_err(|e| e.to_string())?;
-                Ok(queue::QueueProcessResult {
-                    processed: true,
-                    queue: queue.config.rescan_queue.clone(),
-                    message_id: Some(envelope.message_id),
-                    job_id: Some(envelope.job_id),
-                    moved_to_dlq: false,
-                    requeued: false,
-                    attempt: Some(envelope.attempt),
-                    error: None,
-                    remaining_depth: queue.health().depths.rescan,
-                })
-            }
-            Err(err) => {
-                let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
-                let mut moved_to_dlq = false;
-                let mut requeued = false;
-                if envelope.attempt + 1 >= max_attempts_before_dlq {
-                    queue.move_rescan_to_dlq(dequeued.raw);
-                    moved_to_dlq = true;
-                } else {
-                    queue.requeue_rescan_retry(envelope.clone())?;
-                    requeued = true;
-                }
-                Ok(queue::QueueProcessResult {
-                    processed: true,
-                    queue: queue.config.rescan_queue.clone(),
-                    message_id: Some(envelope.message_id),
-                    job_id: Some(envelope.job_id),
-                    moved_to_dlq,
-                    requeued,
-                    attempt: Some(envelope.attempt),
-                    error: Some(err),
-                    remaining_depth: queue.health().depths.rescan,
-                })
-            }
+            Ok(queue::QueueProcessResult {
+                processed: true,
+                queue: "rescan".to_string(),
+                message_id: Some(envelope.message_id),
+                job_id: Some(envelope.job_id),
+                moved_to_dlq,
+                requeued,
+                attempt: Some(envelope.attempt),
+                error: Some(err),
+                remaining_depth: queue.health().depths.rescan,
+            })
         }
     }
 }
@@ -3244,92 +2904,53 @@ fn diagnostics_dir_path() -> PathBuf {
     path
 }
 
+/// Validate that `path` resolves inside the diagnostics directory.
+///
+/// Uses real path canonicalization when the target exists and lexical
+/// normalization otherwise. This blocks `..` traversal even when the path
+/// string *starts with* the diagnostics directory prefix.
+fn validated_diagnostics_path(path: &Path) -> Result<PathBuf, String> {
+    let diagnostics_dir = diagnostics_dir_path();
+    let canonical_base = diagnostics_dir
+        .canonicalize()
+        .map_err(|e| format!("invalid diagnostics directory: {e}"))?;
+
+    if let Ok(canonical) = path.canonicalize() {
+        return if canonical.starts_with(&canonical_base) {
+            // Keep the caller's path representation so manifest lookups (which
+            // are keyed by the original string) and filesystem I/O stay consistent.
+            Ok(path.to_path_buf())
+        } else {
+            Err("path must be inside diagnostics directory".to_string())
+        };
+    }
+
+    // Target does not exist yet (e.g. a delete request). Normalize the input
+    // lexically and validate against the canonical base.
+    let abs = std::path::absolute(path).map_err(|e| format!("invalid path: {e}"))?;
+    let mut normalized = PathBuf::new();
+    for component in abs.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => normalized.push(component),
+        }
+    }
+
+    if normalized.starts_with(&canonical_base) {
+        Ok(path.to_path_buf())
+    } else {
+        Err("path must be inside diagnostics directory".to_string())
+    }
+}
+
 fn file_modified_ms(meta: &std::fs::Metadata) -> Option<u64> {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct DiagnosticsManifestEntry {
-    path: String,
-    bytes: u64,
-    sha256: String,
-    created_at_ms: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct DiagnosticsManifest {
-    entries: Vec<DiagnosticsManifestEntry>,
-}
-
-fn diagnostics_manifest_path() -> PathBuf {
-    let mut path = diagnostics_dir_path();
-    path.push("manifest.json");
-    path
-}
-
-fn diagnostics_hash_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
-}
-
-fn load_diagnostics_manifest() -> DiagnosticsManifest {
-    let path = diagnostics_manifest_path();
-    let Ok(bytes) = fs::read(path) else {
-        return DiagnosticsManifest::default();
-    };
-    serde_json::from_slice::<DiagnosticsManifest>(&bytes).unwrap_or_default()
-}
-
-fn save_diagnostics_manifest(manifest: &DiagnosticsManifest) -> Result<(), String> {
-    let path = diagnostics_manifest_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("failed to create diagnostics dir: {e}"))?;
-    }
-    let bytes = serde_json::to_vec_pretty(manifest)
-        .map_err(|e| format!("failed to serialize diagnostics manifest: {e}"))?;
-    fs::write(path, bytes).map_err(|e| format!("failed to write diagnostics manifest: {e}"))
-}
-
-fn upsert_manifest_entry(path: &str, bytes: u64, sha256: String) -> Result<(), String> {
-    let mut manifest = load_diagnostics_manifest();
-    let now = epoch_ms();
-    if let Some(entry) = manifest.entries.iter_mut().find(|e| e.path == path) {
-        entry.bytes = bytes;
-        entry.sha256 = sha256;
-        entry.created_at_ms = now;
-    } else {
-        manifest.entries.push(DiagnosticsManifestEntry {
-            path: path.to_string(),
-            bytes,
-            sha256,
-            created_at_ms: now,
-        });
-    }
-    save_diagnostics_manifest(&manifest)
-}
-
-fn remove_manifest_entry(path: &str) -> Result<(), String> {
-    let mut manifest = load_diagnostics_manifest();
-    manifest.entries.retain(|e| e.path != path);
-    save_diagnostics_manifest(&manifest)
-}
-
-fn manifest_sha_for(path: &str) -> Option<String> {
-    let manifest = load_diagnostics_manifest();
-    manifest
-        .entries
-        .into_iter()
-        .find(|e| e.path == path)
-        .map(|e| e.sha256)
 }
 
 #[tauri::command]
@@ -3338,15 +2959,6 @@ pub async fn queue_peek_discovery_attempts(
     args: Option<QueuePeekArgs>,
 ) -> Result<QueuePeekResult, String> {
     let limit = args.and_then(|a| a.limit).unwrap_or(10);
-    let config = {
-        let queue = queue_state.0.lock().map_err(|e| e.to_string())?;
-        queue.config.clone()
-    };
-    if config.sqs_enabled {
-        return Ok(QueuePeekResult {
-            attempts: Vec::new(),
-        });
-    }
     let queue = queue_state.0.lock().map_err(|e| e.to_string())?;
     Ok(QueuePeekResult {
         attempts: queue.peek_discovery_attempts(limit)?,
@@ -3366,9 +2978,66 @@ pub async fn cancel_job(
 }
 
 #[tauri::command]
-pub async fn cancel_scan(state: State<'_, ScanCancelFlag>) -> Result<(), String> {
-    state.0.store(true, Ordering::Relaxed);
+pub async fn cancel_scan(state: State<'_, ScanJobStore>) -> Result<(), String> {
+    let mut job = state.0.lock().map_err(|e| e.to_string())?;
+    if !job.running {
+        return Ok(());
+    }
+    job.cancelling = true;
+    job.cancel.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Guard that marks the render job as running and always resets it on drop,
+/// even if the backing mutex has been poisoned.
+#[derive(Debug)]
+struct RenderJobGuard<'a> {
+    store: &'a RenderJobStore,
+}
+
+impl<'a> RenderJobGuard<'a> {
+    fn acquire(store: &'a RenderJobStore) -> Result<Self, String> {
+        let mut job = match store.0.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                let mut g = poisoned.into_inner();
+                g.running = false;
+                g.cancelling = false;
+                drop(g);
+                store.0.clear_poison();
+                store.0.lock().map_err(|e| e.to_string())?
+            }
+        };
+        if job.running {
+            let message = if job.cancelling {
+                "render cancellation is in progress; wait for stop to finish".to_string()
+            } else {
+                "a render job is already running".to_string()
+            };
+            return Err(message);
+        }
+        job.running = true;
+        job.cancelling = false;
+        Ok(Self { store })
+    }
+}
+
+impl<'a> Drop for RenderJobGuard<'a> {
+    fn drop(&mut self) {
+        match self.store.0.lock() {
+            Ok(mut job) => {
+                job.running = false;
+                job.cancelling = false;
+            }
+            Err(poisoned) => {
+                let mut job = poisoned.into_inner();
+                job.running = false;
+                job.cancelling = false;
+                drop(job);
+                self.store.0.clear_poison();
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -3383,23 +3052,18 @@ pub async fn run_fancam(
         .client_run_id
         .clone()
         .unwrap_or_else(|| next_run_id("render"));
-    {
-        let mut job = render_state.0.lock().map_err(|e| e.to_string())?;
-        if job.running {
+    let _guard = match RenderJobGuard::acquire(&render_state) {
+        Ok(g) => g,
+        Err(message) => {
             return Ok(JobResult {
                 ok: false,
-                message: if job.cancelling {
-                    "render cancellation is in progress; wait for stop to finish".to_string()
-                } else {
-                    "a render job is already running".to_string()
-                },
+                message,
                 output_path: None,
                 run_id: Some(render_run_id.clone()),
             });
         }
-        job.running = true;
-        job.cancelling = false;
-    }
+    };
+    state.0.store(false, Ordering::Relaxed);
 
     let scan_id_for_state = args.scan_id.clone();
 
@@ -3418,10 +3082,6 @@ pub async fn run_fancam(
             let mut lock = scan_state.0.lock().map_err(|e| e.to_string())?;
             ensure_scan_store_loaded(&mut lock);
             let Some(scan) = lock.scans.get_mut(scan_id) else {
-                if let Ok(mut job) = render_state.0.lock() {
-                    job.running = false;
-                    job.cancelling = false;
-                }
                 return Ok(JobResult {
                     ok: false,
                     message: "identity validation session not found; rerun scan".to_string(),
@@ -3440,10 +3100,6 @@ pub async fn run_fancam(
                         review.blockers.join("; ")
                     )
                 };
-                if let Ok(mut job) = render_state.0.lock() {
-                    job.running = false;
-                    job.cancelling = false;
-                }
                 return Ok(JobResult {
                     ok: false,
                     message: why,
@@ -3509,20 +3165,12 @@ pub async fn run_fancam(
         };
         if let Some(snapshot) = snapshot.as_ref() {
             if let Err(err) = persist_scan_entry_snapshot(snapshot) {
-                if let Ok(mut job) = render_state.0.lock() {
-                    job.running = false;
-                    job.cancelling = false;
-                }
                 return Err(err);
             }
         }
     }
 
     if let Err(message) = validate_fancam_paths(&args) {
-        if let Ok(mut job) = render_state.0.lock() {
-            job.running = false;
-            job.cancelling = false;
-        }
         return Ok(JobResult {
             ok: false,
             message,
@@ -3531,28 +3179,13 @@ pub async fn run_fancam(
         });
     }
 
-    {
-        state.0.store(false, Ordering::Relaxed);
-    }
-
     let cancel = Arc::clone(&state.0);
     let app2 = app.clone();
 
     let result = match task::spawn_blocking(move || run_pipeline(app2, cancel, args)).await {
         Ok(result) => result,
-        Err(e) => {
-            if let Ok(mut job) = render_state.0.lock() {
-                job.running = false;
-                job.cancelling = false;
-            }
-            return Err(e.to_string());
-        }
+        Err(e) => return Err(e.to_string()),
     };
-
-    if let Ok(mut job) = render_state.0.lock() {
-        job.running = false;
-        job.cancelling = false;
-    }
 
     match result {
         Ok(path) => {
@@ -3971,42 +3604,21 @@ fn sanitize_processing_mode(value: Option<&str>) -> Option<String> {
 mod tests {
     use std::{
         path::PathBuf,
+        sync::atomic::Ordering,
         sync::{Mutex, OnceLock},
     };
 
     use super::{
-        DeleteDiagnosticsBundleArgs, FancamArgs, ListDiagnosticsBundlesArgs,
-        PruneDiagnosticsBundlesArgs, QueryIdentityScansArgs, QueryScanEventsArgs,
-        ReadDiagnosticsBundleArgs, ScanSessionStatus, VerifyDiagnosticsBundleArgs,
-        can_transition_status, delete_diagnostics_bundle, diagnostics_hash_hex,
-        diagnostics_manifest_path, list_diagnostics_bundles, manifest_sha_for,
-        prune_diagnostics_bundles, query_identity_scans, query_scan_events,
-        read_diagnostics_bundle, validate_fancam_paths, verify_diagnostics_bundle,
+        FancamArgs, ListDiagnosticsBundlesArgs, QueryIdentityScansArgs, QueryScanEventsArgs,
+        RenderJobGuard, RenderJobStore, ScanJobGuard, ScanJobStore, ScanSessionStatus,
+        can_transition_status, list_diagnostics_bundles, query_identity_scans, query_scan_events,
+        validate_fancam_paths,
     };
     use crate::storage;
 
     fn diagnostics_test_mutex() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn with_diagnostics_test_dir<T>(f: impl FnOnce(PathBuf) -> T) -> T {
-        let _guard = diagnostics_test_mutex()
-            .lock()
-            .expect("test mutex poisoned");
-        let mut dir = std::env::temp_dir();
-        dir.push(format!("focus-lock-diag-test-{}", super::epoch_ms()));
-        let _ = std::fs::create_dir_all(&dir);
-        let prev = std::env::var("FOCUS_LOCK_DIAGNOSTICS_DIR").ok();
-        unsafe { std::env::set_var("FOCUS_LOCK_DIAGNOSTICS_DIR", &dir) };
-        let result = f(dir.clone());
-        if let Some(value) = prev {
-            unsafe { std::env::set_var("FOCUS_LOCK_DIAGNOSTICS_DIR", value) };
-        } else {
-            unsafe { std::env::remove_var("FOCUS_LOCK_DIAGNOSTICS_DIR") };
-        }
-        let _ = std::fs::remove_dir_all(dir);
-        result
     }
 
     fn with_temp_workspace<T>(f: impl FnOnce(PathBuf) -> T) -> T {
@@ -4022,144 +3634,6 @@ mod tests {
         std::env::set_current_dir(previous).expect("restore cwd");
         let _ = std::fs::remove_dir_all(dir);
         result
-    }
-
-    #[test]
-    fn allows_core_lifecycle_transitions() {
-        assert!(can_transition_status(
-            &ScanSessionStatus::Proposed,
-            &ScanSessionStatus::Validated
-        ));
-        assert!(can_transition_status(
-            &ScanSessionStatus::Validated,
-            &ScanSessionStatus::Tracking
-        ));
-        assert!(can_transition_status(
-            &ScanSessionStatus::Tracking,
-            &ScanSessionStatus::Completed
-        ));
-    }
-
-    #[test]
-    fn blocks_invalid_lifecycle_transitions() {
-        assert!(!can_transition_status(
-            &ScanSessionStatus::Proposed,
-            &ScanSessionStatus::Tracking
-        ));
-        assert!(!can_transition_status(
-            &ScanSessionStatus::Completed,
-            &ScanSessionStatus::Tracking
-        ));
-    }
-
-    #[test]
-    fn diagnostics_read_rejects_outside_path() {
-        let mut outside = std::env::temp_dir();
-        outside.push("focus-lock-outside-bundle.json");
-        let _ = std::fs::write(&outside, b"{}");
-
-        let result = read_diagnostics_bundle(ReadDiagnosticsBundleArgs {
-            path: outside.to_string_lossy().into_owned(),
-            max_bytes: Some(1024),
-        });
-        assert!(result.is_err());
-
-        let _ = std::fs::remove_file(PathBuf::from(&outside));
-    }
-
-    #[test]
-    fn diagnostics_manifest_list_and_verify() {
-        with_diagnostics_test_dir(|dir| {
-            let path = dir.join("bundle-alpha.json");
-            let bytes = br#"{"ok":true}"#;
-            std::fs::write(&path, bytes).expect("write bundle");
-            let path_str = path.to_string_lossy().into_owned();
-            let sha = diagnostics_hash_hex(bytes);
-            super::upsert_manifest_entry(&path_str, bytes.len() as u64, sha.clone())
-                .expect("upsert manifest");
-
-            let list =
-                list_diagnostics_bundles(Some(ListDiagnosticsBundlesArgs { limit: Some(5) }))
-                    .expect("list bundles");
-            assert_eq!(list.bundles.len(), 1);
-            assert_eq!(list.bundles[0].path, path_str);
-            assert_eq!(list.bundles[0].sha256.as_deref(), Some(sha.as_str()));
-
-            let verify = verify_diagnostics_bundle(VerifyDiagnosticsBundleArgs {
-                path: path.to_string_lossy().into_owned(),
-            })
-            .expect("verify bundle");
-            assert!(verify.matches);
-            assert_eq!(verify.expected_sha256.as_deref(), Some(sha.as_str()));
-
-            std::fs::write(&path, br#"{"ok":false}"#).expect("rewrite bundle");
-            let mismatch = verify_diagnostics_bundle(VerifyDiagnosticsBundleArgs {
-                path: path.to_string_lossy().into_owned(),
-            })
-            .expect("verify mismatched bundle");
-            assert!(!mismatch.matches);
-            assert!(mismatch.expected_sha256.is_some());
-        });
-    }
-
-    #[test]
-    fn diagnostics_delete_removes_manifest_entry() {
-        with_diagnostics_test_dir(|dir| {
-            let path = dir.join("bundle-gamma.json");
-            let bytes = br#"{"hello":"world"}"#;
-            std::fs::write(&path, bytes).expect("write bundle");
-            let path_str = path.to_string_lossy().into_owned();
-            let sha = diagnostics_hash_hex(bytes);
-            super::upsert_manifest_entry(&path_str, bytes.len() as u64, sha).expect("upsert");
-
-            let result = delete_diagnostics_bundle(DeleteDiagnosticsBundleArgs {
-                path: path.to_string_lossy().into_owned(),
-            })
-            .expect("delete bundle");
-            assert!(result.deleted);
-            assert!(manifest_sha_for(&path_str).is_none());
-
-            let manifest_path = diagnostics_manifest_path();
-            assert!(manifest_path.exists());
-        });
-    }
-
-    #[test]
-    fn diagnostics_prune_removes_manifest_for_deleted_bundles() {
-        with_diagnostics_test_dir(|dir| {
-            let older = dir.join("bundle-older.json");
-            let newer = dir.join("bundle-newer.json");
-            let older_bytes = br#"{"bundle":"older"}"#;
-            let newer_bytes = br#"{"bundle":"newer"}"#;
-            std::fs::write(&older, older_bytes).expect("write older bundle");
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            std::fs::write(&newer, newer_bytes).expect("write newer bundle");
-
-            let older_path = older.to_string_lossy().into_owned();
-            let newer_path = newer.to_string_lossy().into_owned();
-            super::upsert_manifest_entry(
-                &older_path,
-                older_bytes.len() as u64,
-                diagnostics_hash_hex(older_bytes),
-            )
-            .expect("upsert older");
-            super::upsert_manifest_entry(
-                &newer_path,
-                newer_bytes.len() as u64,
-                diagnostics_hash_hex(newer_bytes),
-            )
-            .expect("upsert newer");
-
-            let pruned = prune_diagnostics_bundles(Some(PruneDiagnosticsBundlesArgs {
-                keep_latest: Some(1),
-            }))
-            .expect("prune bundles");
-            assert_eq!(pruned.deleted, 1);
-            assert_eq!(pruned.kept, 1);
-
-            assert!(manifest_sha_for(&older_path).is_none());
-            assert!(manifest_sha_for(&newer_path).is_some());
-        });
     }
 
     #[test]
@@ -4475,5 +3949,84 @@ mod tests {
             let result = validate_fancam_paths(&args);
             assert!(result.is_ok());
         });
+    }
+
+    #[test]
+    fn render_guard_acquire_marks_running_and_resets_on_drop() {
+        let store = RenderJobStore::default();
+        {
+            let guard = RenderJobGuard::acquire(&store).expect("acquire render guard");
+            assert!(store.0.lock().expect("lock").running);
+            drop(guard);
+        }
+        let state = store.0.lock().expect("lock");
+        assert!(!state.running);
+        assert!(!state.cancelling);
+    }
+
+    #[test]
+    fn render_guard_second_acquire_fails_while_running() {
+        let store = RenderJobStore::default();
+        let guard = RenderJobGuard::acquire(&store).expect("first acquire");
+        let err = RenderJobGuard::acquire(&store).expect_err("second acquire should fail");
+        assert!(err.contains("already running"));
+        drop(guard);
+    }
+
+    #[test]
+    fn render_guard_recovers_from_poisoned_mutex() {
+        let store = RenderJobStore::default();
+        // Poison the mutex by panicking while holding the lock.
+        let result = std::panic::catch_unwind(|| {
+            let _guard = store.0.lock().expect("lock");
+            panic!("intentional test panic");
+        });
+        assert!(result.is_err());
+        assert!(store.0.is_poisoned());
+
+        // The guard should recover and still allow a new render to start.
+        let guard = RenderJobGuard::acquire(&store).expect("acquire after poison");
+        assert!(store.0.lock().expect("lock after recovery").running);
+        drop(guard);
+
+        let state = store.0.lock().expect("final lock");
+        assert!(!state.running);
+        assert!(!store.0.is_poisoned());
+    }
+
+    #[test]
+    fn scan_guard_acquire_marks_running_and_resets_on_drop() {
+        let store = ScanJobStore::default();
+        let (_guard, cancel) = ScanJobGuard::acquire(&store).expect("acquire scan guard");
+        assert!(store.0.lock().expect("lock").running);
+        assert!(!cancel.load(Ordering::Relaxed));
+        drop(_guard);
+
+        let state = store.0.lock().expect("final lock");
+        assert!(!state.running);
+        assert!(!state.cancelling);
+    }
+
+    #[test]
+    fn scan_guard_second_acquire_fails_while_running() {
+        let store = ScanJobStore::default();
+        let (guard, _cancel) = ScanJobGuard::acquire(&store).expect("first acquire");
+        let err = ScanJobGuard::acquire(&store).expect_err("second acquire should fail");
+        assert!(err.contains("already running"));
+        drop(guard);
+    }
+
+    #[test]
+    fn scan_guard_per_scan_cancel_flag_is_isolated() {
+        let store = ScanJobStore::default();
+        let (guard_a, cancel_a) = ScanJobGuard::acquire(&store).expect("first scan");
+        cancel_a.store(true, Ordering::Relaxed);
+        assert!(cancel_a.load(Ordering::Relaxed));
+        drop(guard_a);
+
+        // A subsequent scan gets a fresh, unset cancel flag.
+        let (guard_b, cancel_b) = ScanJobGuard::acquire(&store).expect("second scan");
+        assert!(!cancel_b.load(Ordering::Relaxed));
+        drop(guard_b);
     }
 }

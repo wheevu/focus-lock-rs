@@ -12,8 +12,6 @@ pub enum CueType {
     Face,
     /// Body re-identification similarity.
     Body,
-    /// Additional model cue (pose/apparel/context), when present.
-    Auxiliary,
 }
 
 /// Weighted score contribution for one cue type.
@@ -92,7 +90,7 @@ impl IdentityObservation {
 
     /// Ensure cue list contains updated face/body entries.
     pub fn sync_default_cues(&mut self) {
-        self.cues.retain(|cue| cue.cue == CueType::Auxiliary);
+        self.cues.clear();
         self.cues.push(CueScore {
             cue: CueType::Face,
             similarity: self.similarity,

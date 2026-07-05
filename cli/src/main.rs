@@ -21,9 +21,7 @@ use fancam_core::{
     detection::{Detector, FaceIdentifier, draw_boxes},
     pipeline::Pipeline,
     runtime::OrtConfig,
-    video::{
-        RgbFrame, for_each_rgb_frame, to_grayscale, transcode, transcode_with_progress_staged,
-    },
+    video::{RgbFrame, for_each_rgb_frame, transcode, transcode_with_progress_staged},
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -42,18 +40,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Phase 1 smoke-test: read a video, convert to grayscale, save.
-    Gray {
-        /// Input video path
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Output video path
-        #[arg(short, long, default_value = "gray.mp4")]
-        output: PathBuf,
-    },
-
     /// Phase 2: draw bounding boxes around all detected persons.
+    #[command(hide = true)]
     Detect {
         /// Input video path
         #[arg(short, long)]
@@ -153,7 +141,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Gray { input, output } => cmd_gray(input, output),
         Commands::Detect {
             input,
             model,
@@ -203,26 +190,6 @@ fn main() -> Result<()> {
             threshold,
         ),
     }
-}
-
-// ── Phase 1: grayscale ────────────────────────────────────────────────────────
-
-fn cmd_gray(input: PathBuf, output: PathBuf) -> Result<()> {
-    info!("Phase 1 — grayscale conversion");
-    info!("  input  : {}", input.display());
-    info!("  output : {}", output.display());
-
-    let pb = spinner("Converting to grayscale…");
-    let pb2 = pb.clone();
-
-    transcode(input, &output, move |frame: &mut RgbFrame| {
-        to_grayscale(frame);
-        pb2.tick();
-    })
-    .context("grayscale transcode failed")?;
-
-    pb.finish_with_message("Done.");
-    Ok(())
 }
 
 // ── Phase 2: person detection ─────────────────────────────────────────────────
@@ -577,7 +544,7 @@ fn cmd_inspect_identity(
             let margin = summary.best_similarity - second;
             println!("    Margin over next candidate: {:.3}", margin);
         }
-        if !summary.reference_warning.is_none() {
+        if summary.reference_warning.is_some() {
             println!("    Note: Reference image may not contain a clear face.");
         }
     }
@@ -709,8 +676,7 @@ fn validate_reference_image(path: &Path) -> Option<String> {
         ));
     }
 
-    // Warn that no face detection is performed on reference
-    Some("no face detector available — ensure reference is a cropped face image".to_string())
+    None
 }
 
 fn print_identity_summary(s: &IdentityInspectSummary) {

@@ -10,7 +10,7 @@ resolver = "2"
 version      = "0.1.0"
 edition      = "2024"
 authors      = ["focus-lock-rs"]
-rust-version = "1.87"
+rust-version = "1.88"
 
 # Shared dependency versions — pin here, reference with workspace = true in members
 [workspace.dependencies]

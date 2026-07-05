@@ -7,11 +7,15 @@
     "core:default",
     "dialog:allow-open",
     "dialog:allow-save",
-    "shell:allow-open",
-    "fs:read-files",
-    "fs:write-files",
-    "fs:read-dirs",
-    "fs:allow-app-read-recursive",
-    "fs:allow-app-write-recursive"
+    {
+      "identifier": "shell:allow-open",
+      "allow": ["https://*", "http://*", "file://*"]
+    },
+    {
+      "identifier": "fs:allow-app-read-recursive"
+    },
+    {
+      "identifier": "fs:allow-app-write-recursive"
+    }
   ]
 }

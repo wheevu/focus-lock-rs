@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::camera::{CameraPath, CameraPlanner};
+use crate::camera::{CameraPath, plan_camera_for_identity};
 use crate::tracklet::Tracklet;
 
 const TRACKLET_LINK_THRESHOLD: f32 = 0.52;
@@ -31,19 +31,11 @@ pub struct SolverResult {
     pub camera_path: CameraPath,
 }
 
-/// Offline identity solver façade.
-#[derive(Debug, Default)]
-pub struct IdentitySolver;
-
-impl IdentitySolver {
-    /// Solve global identity assignments for tracklets.
-    ///
-    /// Current implementation is a minimal baseline assigning each tracklet to
-    /// itself; this keeps a stable API while we migrate to a full global solver.
-    #[must_use]
-    pub fn solve(tracklets: &[Tracklet]) -> SolverResult {
-        solve_global_assignments(tracklets)
-    }
+/// Solve global identity assignments across tracklets and pick the best
+/// identity for a camera target.
+#[must_use]
+pub fn solve(tracklets: &[Tracklet]) -> SolverResult {
+    solve_global_assignments(tracklets)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,9 +131,7 @@ fn solve_global_assignments(tracklets: &[Tracklet]) -> SolverResult {
         .map(|assignment| (assignment.tracklet_id, assignment.identity_id))
         .collect::<Vec<_>>();
     let camera_path = selected_identity_id
-        .map(|identity_id| {
-            CameraPlanner::plan_for_identity(tracklets, &assignment_rows, identity_id)
-        })
+        .map(|identity_id| plan_camera_for_identity(tracklets, &assignment_rows, identity_id))
         .unwrap_or_default();
 
     SolverResult {

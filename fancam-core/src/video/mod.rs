@@ -867,25 +867,6 @@ pub fn open_input_with_hwaccel<P: AsRef<Path>>(input_path: P) -> Result<format::
 }
 
 /// Decode all video frames to RGB in source order.
-///
-/// This helper is used by offline two-pass workflows that need a first pass
-/// over the full frame sequence before rendering.
-///
-/// # Errors
-///
-/// Returns an error when `FFmpeg` initialization, decode, or scaling fails.
-pub fn decode_all_rgb_frames<P: AsRef<Path>>(input_path: P) -> Result<Vec<(u64, RgbFrame)>> {
-    let mut rows = Vec::<(u64, RgbFrame)>::new();
-
-    for_each_rgb_frame(input_path, |_, frame| {
-        let pts = frame.pts.max(0) as u64;
-        rows.push((pts, frame.clone()));
-        Ok(false)
-    })?;
-
-    Ok(rows)
-}
-
 /// Decode video frames to RGB and invoke a callback for each frame.
 ///
 /// The callback receives `(frame_index, &RgbFrame)` and returns `Ok(true)` to
@@ -985,18 +966,4 @@ where
     }
 
     Ok(())
-}
-
-/// Convenience: convert a frame to grayscale in-place (Phase 1 smoke-test).
-pub fn to_grayscale(frame: &mut RgbFrame) {
-    for chunk in frame.data.chunks_exact_mut(3) {
-        // BT.601 luminance
-        let luma = 0.114f32.mul_add(
-            f32::from(chunk[2]),
-            0.299f32.mul_add(f32::from(chunk[0]), 0.587 * f32::from(chunk[1])),
-        ) as u8;
-        chunk[0] = luma;
-        chunk[1] = luma;
-        chunk[2] = luma;
-    }
 }
