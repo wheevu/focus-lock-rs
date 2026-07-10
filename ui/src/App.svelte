@@ -1931,13 +1931,13 @@
           class:active={settingsAutoRefresh}
           onclick={() => { settingsAutoRefresh = !settingsAutoRefresh; }}
         >{settingsAutoRefresh ? 'auto refresh: on' : 'auto refresh: off'}</button>
-        <button class="ghost-btn" onclick={refreshQueueHealth}>refresh queue</button>
-        <button class="ghost-btn" onclick={refreshScanSessionDetail}>refresh session</button>
-        <button class="ghost-btn" onclick={refreshScanSessionsList}>refresh sessions</button>
+        <button class="ghost-btn" onclick={() => refreshQueueHealth()}>refresh queue</button>
+        <button class="ghost-btn" onclick={() => refreshScanSessionDetail()}>refresh session</button>
+        <button class="ghost-btn" onclick={() => refreshScanSessionsList()}>refresh sessions</button>
         <button class="ghost-btn" onclick={cleanupOldScanSessions}>cleanup sessions</button>
         <button class="ghost-btn" onclick={runStorageMaintenance}>storage maintenance</button>
         <button class="ghost-btn" onclick={exportDiagnosticsBundle}>export diagnostics</button>
-        <button class="ghost-btn" onclick={refreshDiagnosticsBundles}>refresh bundles</button>
+        <button class="ghost-btn" onclick={() => refreshDiagnosticsBundles()}>refresh bundles</button>
         <input class="count-input" bind:value={diagnosticsKeepInput} placeholder="keep bundles" />
         <button class="ghost-btn" onclick={pruneDiagnosticsBundles}>prune bundles</button>
         <button class="ghost-btn" disabled={!scanId} onclick={enqueueCurrentScanJob}>enqueue discovery</button>
@@ -2074,7 +2074,7 @@
       {/if}
       <div class="queue-actions">
         <input class="count-input" bind:value={workerPollMsInput} placeholder="poll ms" />
-        <button class="ghost-btn" onclick={refreshWorkerStatus}>worker status</button>
+        <button class="ghost-btn" onclick={() => refreshWorkerStatus()}>worker status</button>
         <button class="ghost-btn" onclick={startWorker}>start worker</button>
         <button class="ghost-btn" onclick={stopWorker}>stop worker</button>
         <button class="ghost-btn" onclick={clearWorkerEvents}>clear events</button>

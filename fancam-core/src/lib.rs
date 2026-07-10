@@ -8,7 +8,9 @@
 //! The pipeline consists of several stages:
 //! - **Detection**: YOLOv8-based person detection
 //! - **Identification**: ArcFace-based face recognition
-//! - **Tracking**: Kalman filter for smooth camera movement
+//! - **Tracklet build**: short-term associations over identity observations
+//! - **Identity clustering**: heuristic linking across tracklets
+//! - **Camera planning/tracking**: offline path planning or online Kalman smoothing
 //! - **Rendering**: SIMD-accelerated crop and resize
 //! - **Discovery**: Multi-person identity clustering for group videos
 //!

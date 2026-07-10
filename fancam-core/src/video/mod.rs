@@ -12,8 +12,8 @@
 //!   Thread B2 rendering:  apply render closure → `video_xfm` channel
 //!   Main      encode:     receive xfm frames, lazy-init encoder, RGB→YUV, write
 //!
-//! Offline two-pass workflows can additionally call [`decode_all_rgb_frames`]
-//! to build solved camera plans before final render.
+//! Offline two-pass workflows can add a pre-render pass to build clustered
+//! camera plans before final render.
 
 use anyhow::{Context, Result};
 use ffmpeg_next as ffmpeg;

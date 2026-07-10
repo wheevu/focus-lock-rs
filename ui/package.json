@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port 1420 --strictPort",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "cd .. && npx --prefix ui tauri --config src-tauri/tauri.conf.json",
@@ -22,6 +23,7 @@
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
     "@tauri-apps/cli": "^2.10.0",
     "svelte": "^5.28.2",
+    "svelte-check": "^4.7.2",
     "typescript": "^5.8.3",
     "vite": "^6.3.3"
   }

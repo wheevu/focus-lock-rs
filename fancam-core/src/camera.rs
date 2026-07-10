@@ -83,7 +83,7 @@ impl CameraCursor {
     }
 }
 
-/// Build camera path for one solved identity from tracklets and assignments.
+/// Build camera path for one clustered identity from tracklets and assignments.
 #[must_use]
 pub fn plan_camera_for_identity(
     tracklets: &[Tracklet],

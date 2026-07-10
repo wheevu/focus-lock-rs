@@ -1,7 +1,7 @@
 //! observation — identity cue observations and scoring primitives.
 //!
 //! This module introduces architecture-neutral identity observations used by
-//! offline two-pass solving and online preview tracking.
+//! offline two-pass clustering and online preview tracking.
 
 use crate::detection::BBox;
 
@@ -40,7 +40,7 @@ pub struct IdentityObservation {
     pub margin: f32,
     /// Optional body similarity scored against target body gallery.
     pub body_similarity: Option<f32>,
-    /// Additional cue contributions used by offline/global solvers.
+    /// Additional cue contributions used by offline clustering.
     pub cues: Vec<CueScore>,
 }
 

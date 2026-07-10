@@ -212,13 +212,13 @@ impl Analyzer {
         camera
     }
 
-    /// Enable offline solved camera mode from prebuilt tracklets.
+    /// Enable offline clustered camera mode from prebuilt tracklets.
     pub fn enable_offline_from_tracklets(&mut self, tracklets: &[Tracklet]) {
         let solved = solver::solve(tracklets);
         self.enable_offline_from_solver_result(solved);
     }
 
-    /// Enable offline solved camera mode from an existing solver result.
+    /// Enable offline clustered camera mode from an existing solver result.
     pub fn enable_offline_from_solver_result(&mut self, solved: SolverResult) {
         if solved.camera_path.is_empty() {
             self.offline_cursor = None;
@@ -446,7 +446,7 @@ impl Analyzer {
         }
     }
 
-    /// Pass-2 helper: run global identity solving on tracklets.
+    /// Pass-2 helper: run heuristic identity clustering on tracklets.
     #[must_use]
     pub fn solve_tracklets(&self, tracklets: &[Tracklet]) -> SolverResult {
         solver::solve(tracklets)
@@ -841,7 +841,7 @@ impl Pipeline {
     /// Solve an offline camera path and consume the pipeline into parts.
     ///
     /// This runs a first pass to build short-term tracklets from the video,
-    /// then a second pass uses solved camera states for render-time framing.
+    /// then a second pass uses clustered camera states for render-time framing.
     ///
     /// # Errors
     ///

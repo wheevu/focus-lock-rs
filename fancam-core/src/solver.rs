@@ -1,4 +1,4 @@
-//! solver — global identity assignment across tracklets.
+//! solver — heuristic identity clustering across tracklets.
 
 use std::collections::HashMap;
 
@@ -9,18 +9,18 @@ const TRACKLET_LINK_THRESHOLD: f32 = 0.52;
 const TRACKLET_MAX_LINK_GAP: u64 = 540;
 const TRACKLET_OVERLAP_PENALTY: f32 = 0.22;
 
-/// Assignment of one tracklet to a global identity id.
+/// Assignment of one tracklet to a clustered identity id.
 #[derive(Debug, Clone, Copy)]
 pub struct TrackletAssignment {
     /// Local tracklet id.
     pub tracklet_id: usize,
-    /// Global identity id.
+    /// Clustered identity id.
     pub identity_id: usize,
     /// Confidence score for this assignment.
     pub confidence: f32,
 }
 
-/// Output of global identity solving.
+/// Output of heuristic identity clustering.
 #[derive(Debug, Clone, Default)]
 pub struct SolverResult {
     /// Final assignments.
@@ -31,8 +31,8 @@ pub struct SolverResult {
     pub camera_path: CameraPath,
 }
 
-/// Solve global identity assignments across tracklets and pick the best
-/// identity for a camera target.
+/// Cluster identity assignments across tracklets and pick the best identity for
+/// a camera target.
 #[must_use]
 pub fn solve(tracklets: &[Tracklet]) -> SolverResult {
     solve_global_assignments(tracklets)

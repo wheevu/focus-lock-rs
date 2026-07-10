@@ -5,9 +5,9 @@
 ![Svelte](https://img.shields.io/badge/Svelte-5-red?logo=svelte)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-Automated fancam generator. It takes a standard landscape video and a reference photo of a person (say, your bias), tracks them, and generates a stabilized, vertical (9:16) cropped video locked onto them. 
+Automated fancam generator. It takes a standard landscape video and a reference photo of a person (say, your bias), tracks them, and generates a stabilized, vertical (9:16) cropped video locked onto them.
 
-It features a modular Rust core for high-speed video processing, a CLI for batch operations, and a modern Tauri v2 desktop application for easy usage.
+It features a modular Rust core for video processing, a CLI for batch operations, and a modern Tauri v2 desktop application for easy usage.
 
 <p align=center>
 <img src="./src/ui.png" width=70%>
@@ -16,7 +16,7 @@ It features a modular Rust core for high-speed video processing, a CLI for batch
 ## Features
 
 - **Person detection + identity lock** — YOLOv8 for detection, ArcFace for target matching
-- **Offline two-pass render path** — first pass builds tracklets, second pass solves identity/camera before final encode
+- **Offline two-pass render path** — first pass builds tracklets, second pass clusters identity/camera observations before final encode
 - **Smooth tracking** — online Kalman path retained for compatibility and fallback workflows
 - **Identity discovery (GUI)** — candidate scan and manual validation before render
 - **Performance-first pipeline** — threaded video pipeline with optimized preprocessing and rendering
@@ -37,8 +37,8 @@ This project is organized as a Cargo workspace:
 
 1. **Decode pass** source frames with FFmpeg
 2. **Detect + score** identities and build short-term tracklets
-3. **Solve globally** across tracklets to stabilize identity assignment
-4. **Plan camera path** from the selected solved identity observations
+3. **Cluster tracklets heuristically** to stabilize identity assignment
+4. **Plan camera path** from the selected clustered identity observations
 5. **Render pass** writes stabilized vertical H.264 output
 
 ### Online fallback (legacy-compatible path)
@@ -73,7 +73,7 @@ Create a `models/` directory in the project root and add:
 - `w600k_mbf.onnx`
 - `osnet_x0_25_msmt17.onnx` *(optional but recommended for harder multi-person tracking / occlusion recovery)*
 
-For macOS, ensure a CoreML-enabled `libonnxruntime.dylib` is available at `models/onnxruntime/lib/` (or set `ORT_DYLIB_PATH`).
+Runtime note: the current ONNX Runtime setup requires a CoreML-capable `libonnxruntime.dylib`, so the supported development target is macOS. Place it at `models/onnxruntime/lib/` or set `ORT_DYLIB_PATH`.
 
 ## Desktop Application (GUI)
 
@@ -100,7 +100,7 @@ cargo run --release -p cli -- fancam \
   --threshold 0.6
 ```
 
-Note: render runs a mandatory offline prepass (tracklet build + global solve)
+Note: render runs a mandatory offline prepass (tracklet build + clustering)
 before final encode, so startup may be slower on long videos.
 
 ## License
@@ -163,9 +163,9 @@ If the subject becomes occluded, the filter predicts the next likely position ba
 
 ## Performance pipeline
 
-The online processing path is built around a **3-thread decode / inference / encode pipeline** with bounded channels.
+The online processing path uses bounded synchronous channels across three worker stages (decode, analysis, render) plus main-thread encode.
 
-The offline render path adds a first pre-render pass to build tracklets and a solved camera plan before the final encode pass.
+The offline render path adds a first pre-render pass to build tracklets and a clustered camera plan before the final encode pass.
 
 Performance-oriented behavior includes:
 
@@ -173,11 +173,13 @@ Performance-oriented behavior includes:
 - capping ArcFace checks to top-confidence person candidates per frame
 - detection downscale for faster large-video processing
 - parallel tensor preparation where possible
-- fast SIMD face preprocessing
+- SIMD face preprocessing where available
 - render buffer and resizer reuse to reduce per-frame allocations
 - periodic per-stage timing logs for `detect`, `identify`, and `render`
 
-These optimizations are aimed at keeping the pipeline responsive and practical for longer videos without turning the whole thing into a heater-core cosplay.
+These optimizations are aimed at keeping the pipeline responsive and practical for longer videos. No reproducible benchmark results are published yet.
+
+For a deterministic solver/camera smoke benchmark that does not require models or media, see `bench/README.md`.
 
 ## Rendering behavior
 
@@ -210,6 +212,6 @@ The CLI is better suited for:
 
 ## Cross-platform scope
 
-The project is designed to run across **Windows, macOS, and Linux**, with a shared Rust processing core and a Tauri-based desktop frontend.
+The project currently targets **macOS** because CoreML-enabled ONNX Runtime is required by the checked-in runtime configuration. Windows/Linux support would need a non-CoreML runtime path and CI coverage.
 
 </details>

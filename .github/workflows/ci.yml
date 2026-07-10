@@ -11,13 +11,18 @@ env:
 
 jobs:
   rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['1.88', stable]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -28,7 +33,37 @@ jobs:
       # Pedantic/nursery lints are enabled in fancam-core; run without -D warnings
       # so the CI report is visible but existing lint debt does not block PRs.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
 
       - name: Check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Solver evaluation harness
+        run: cargo run -p fancam-core --example solver_eval --locked
+
+  frontend:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Check frontend
+        run: npm run check
+        working-directory: ui
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: ui
