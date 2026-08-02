@@ -22,6 +22,7 @@ It features a modular Rust core for video processing, a CLI for batch operations
 - **Performance-first pipeline** — threaded video pipeline with optimized preprocessing and rendering
 - **Smart output** — automatic 1080x1920 crop with fallback handling for occlusion or target loss
 - **Desktop + CLI** — Tauri app for interactive use, CLI for direct batch processing
+- **Safe cancellation** — renders write beside the requested output and replace it only after a complete encode
 
 ##  Architecture
 
@@ -58,7 +59,7 @@ This project is organized as a Cargo workspace:
 
 - **Rust** stable toolchain
 - **Node.js** for the desktop UI
-- **FFmpeg** native libraries installed on your system
+- **FFmpeg 8.1** native libraries installed on your system
 - ONNX models for **YOLOv8 Nano** and **ArcFace / MobileFaceNet**
 
 ## Setup
@@ -74,6 +75,8 @@ Create a `models/` directory in the project root and add:
 - `osnet_x0_25_msmt17.onnx` *(optional but recommended for harder multi-person tracking / occlusion recovery)*
 
 Runtime note: the current ONNX Runtime setup requires a CoreML-capable `libonnxruntime.dylib`, so the supported development target is macOS. Place it at `models/onnxruntime/lib/` or set `ORT_DYLIB_PATH`.
+
+The optional OSNet body re-identification model improves recovery in crowded footage, but face identity scoring works without it. The explicit `--body-reid-model`/GUI model path is validated when supplied; an absent default model is not an error.
 
 ## Desktop Application (GUI)
 
@@ -102,6 +105,8 @@ cargo run --release -p cli -- fancam \
 
 Note: render runs a mandatory offline prepass (tracklet build + clustering)
 before final encode, so startup may be slower on long videos.
+
+The desktop app stores scan sessions and exported diagnostics in Tauri's platform app-data directory. On first launch it copies valid data from the old project-local `.focus-lock/` directory and leaves the originals untouched. Queue messages are intentionally in-memory and are not restored after an app restart.
 
 ## License
 MIT
@@ -134,6 +139,8 @@ The desktop app includes a pre-tracking discovery flow designed to make target s
 - once validated, the selected member card is used as an additional tracking prior alongside the reference image
 
 The Tauri backend persists scan sessions and validates review state server-side before allowing a render to begin.
+
+Cancellation returns a tracking session to `validated`, records a `tracking_cancelled` event, and leaves any previous output file unchanged. A failed render also removes its temporary partial file.
 
 ## Scan session lifecycle
 

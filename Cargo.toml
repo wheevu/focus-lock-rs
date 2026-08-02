@@ -15,7 +15,7 @@ rust-version = "1.88"
 # Shared dependency versions — pin here, reference with workspace = true in members
 [workspace.dependencies]
 # Video
-ffmpeg-next = "8"
+ffmpeg-next = "8.1"
 
 # Inference
 ort = { version = "=2.0.0-rc.10", features = ["load-dynamic", "coreml"] }
@@ -46,7 +46,6 @@ base64 = "0.22"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite   = { version = "0.32", features = ["bundled"] }
-sha2       = "0.10"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

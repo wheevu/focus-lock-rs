@@ -18,17 +18,16 @@ use fancam_core::{
     mode::ProcessingMode,
     pipeline::{OfflinePrepassProgress, Pipeline},
     runtime::OrtConfig,
-    video::{total_frames, transcode_with_progress_staged_mode},
+    video::{total_frames, transcode_with_progress_staged_mode_fallible},
 };
 use image::ImageReader;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use tauri::{AppHandle, Emitter, State};
 use tokio::task;
 
 use crate::{
     CancelFlag, IdentityScanState, IdentityScanStore, QueueStore, QueueWorkerStore, RenderJobStore,
-    ScanJobStore, StorageWorkerStore, queue, storage,
+    ScanJobState, ScanJobStore, StorageWorkerStore, queue, storage,
 };
 
 static RUN_ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -465,6 +464,10 @@ pub struct JobResult {
     pub run_id: Option<String>,
 }
 
+fn emit_render_done(app: &AppHandle, result: &JobResult) {
+    let _ = app.emit("fancam://done", result.clone());
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 /// Return the absolute path to the `models/` directory sitting next to the
@@ -760,6 +763,7 @@ fn can_transition_status(from: &ScanSessionStatus, to: &ScanSessionStatus) -> bo
         (ScanSessionStatus::Proposed, ScanSessionStatus::Validated)
             | (ScanSessionStatus::Validated, ScanSessionStatus::Proposed)
             | (ScanSessionStatus::Validated, ScanSessionStatus::Tracking)
+            | (ScanSessionStatus::Tracking, ScanSessionStatus::Validated)
             | (ScanSessionStatus::Tracking, ScanSessionStatus::Completed)
             | (ScanSessionStatus::Tracking, ScanSessionStatus::Failed)
             | (ScanSessionStatus::Proposed, ScanSessionStatus::Failed)
@@ -1110,6 +1114,7 @@ fn run_identity_scan_for_queue(
     args: IdentityScanArgs,
     app: Option<AppHandle>,
     queue_phase: &'static str,
+    cancel: Arc<AtomicBool>,
 ) -> Result<IdentityScanResult, String> {
     let run_id = args
         .client_run_id
@@ -1135,7 +1140,7 @@ fn run_identity_scan_for_queue(
                 );
             }
         },
-        || false,
+        || cancel.load(Ordering::Relaxed),
     )
 }
 
@@ -1705,10 +1710,14 @@ fn build_runtime_body_reid_gallery(scan: &IdentityScanCache, selected_id: usize)
 }
 
 fn l2_normalize(v: &[f32]) -> Vec<f32> {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm <= 1e-8 {
+    if v.is_empty() || v.iter().any(|value| !value.is_finite()) {
         return Vec::new();
     }
+    let norm_squared = v.iter().map(|x| x * x).sum::<f32>();
+    if !norm_squared.is_finite() || norm_squared <= f32::EPSILON {
+        return Vec::new();
+    }
+    let norm = norm_squared.sqrt();
     v.iter().map(|x| x / norm).collect()
 }
 
@@ -1734,6 +1743,9 @@ pub fn validate_identity_review(
     state: State<'_, IdentityScanStore>,
     args: ValidateIdentityReviewArgs,
 ) -> Result<IdentityReviewResult, String> {
+    if !args.threshold.is_finite() {
+        return Err("identity threshold must be finite".to_string());
+    }
     let mut lock = state.0.lock().map_err(|e| e.to_string())?;
     ensure_scan_store_loaded(&mut lock);
     let Some(scan) = lock.scans.get(&args.scan_id) else {
@@ -2062,8 +2074,18 @@ pub fn export_diagnostics_bundle(
 
     let mut out_path = diagnostics_dir_path();
     fs::create_dir_all(&out_path).map_err(|e| format!("failed to create diagnostics dir: {e}"))?;
-    out_path.push(format!("bundle-{}.json", epoch_ms()));
-    fs::write(&out_path, &json).map_err(|e| format!("failed to write diagnostics bundle: {e}"))?;
+    out_path.push(format!(
+        "bundle-{}-{}.json",
+        epoch_ms(),
+        RUN_ID_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temporary_path = out_path.with_extension("json.partial");
+    fs::write(&temporary_path, &json)
+        .map_err(|e| format!("failed to write diagnostics bundle: {e}"))?;
+    if let Err(error) = fs::rename(&temporary_path, &out_path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!("failed to commit diagnostics bundle: {error}"));
+    }
     let out_path_str = out_path.to_string_lossy().into_owned();
 
     Ok(ExportDiagnosticsResult {
@@ -2150,6 +2172,7 @@ pub fn storage_worker_stop(
         let mut s = state.0.lock().map_err(|e| e.to_string())?;
         s.stop_requested = true;
     }
+    state.1.notify_one();
     storage_worker_status(state)
 }
 
@@ -2196,6 +2219,7 @@ pub fn storage_worker_start(
     }
 
     let worker_arc = state.0.clone();
+    let stop_notify = state.1.clone();
     tokio::spawn(async move {
         loop {
             let (should_stop, poll_ms, age_ms, max_events, vacuum_flag) = match worker_arc.lock() {
@@ -2232,7 +2256,10 @@ pub fn storage_worker_start(
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(poll_ms)) => {},
+                () = stop_notify.notified() => break,
+            }
         }
 
         if let Ok(mut s) = worker_arc.lock() {
@@ -2371,6 +2398,7 @@ pub async fn process_next_discovery_job(
     app: AppHandle,
     queue_state: State<'_, QueueStore>,
     scan_state: State<'_, IdentityScanStore>,
+    scan_job_state: State<'_, ScanJobStore>,
     args: Option<ProcessNextDiscoveryJobArgs>,
 ) -> Result<queue::QueueProcessResult, String> {
     let args = args.unwrap_or(ProcessNextDiscoveryJobArgs {
@@ -2383,6 +2411,7 @@ pub async fn process_next_discovery_job(
         Some(app),
         queue_state.0.clone(),
         scan_state.0.clone(),
+        scan_job_state.0.clone(),
         max_attempts_before_dlq,
         args.client_run_id,
     )
@@ -2393,6 +2422,7 @@ async fn process_next_discovery_job_core(
     app: Option<AppHandle>,
     queue_store: std::sync::Arc<std::sync::Mutex<queue::QueueRuntime>>,
     scan_store: std::sync::Arc<std::sync::Mutex<IdentityScanState>>,
+    scan_job_store: std::sync::Arc<std::sync::Mutex<ScanJobState>>,
     max_attempts_before_dlq: u32,
     client_run_id: Option<String>,
 ) -> Result<queue::QueueProcessResult, String> {
@@ -2406,6 +2436,7 @@ async fn process_next_discovery_job_core(
             Ok(None) => {
                 return Ok(queue::QueueProcessResult {
                     processed: false,
+                    cancelled: false,
                     queue: "discovery".to_string(),
                     message_id: None,
                     job_id: None,
@@ -2418,11 +2449,12 @@ async fn process_next_discovery_job_core(
             }
             Err(err) => {
                 return Ok(queue::QueueProcessResult {
-                    processed: false,
+                    processed: true,
+                    cancelled: false,
                     queue: "discovery".to_string(),
                     message_id: None,
                     job_id: None,
-                    moved_to_dlq: false,
+                    moved_to_dlq: true,
                     requeued: false,
                     attempt: None,
                     error: Some(err),
@@ -2439,7 +2471,9 @@ async fn process_next_discovery_job_core(
     let app_for_scan = app.clone();
     let queue_run_id = client_run_id.clone();
     let run_result = task::spawn_blocking(move || {
-        run_identity_scan_for_queue(
+        let scan_job = ScanJobStore(scan_job_store);
+        let (_guard, cancel) = ScanJobGuard::acquire(&scan_job)?;
+        let result = run_identity_scan_for_queue(
             IdentityScanArgs {
                 video: payload.video,
                 yolo_model: payload.yolo_model,
@@ -2452,10 +2486,14 @@ async fn process_next_discovery_job_core(
             },
             app_for_scan,
             "queued discovery",
-        )
+            Arc::clone(&cancel),
+        );
+        Ok::<_, String>((result, cancel.load(Ordering::Relaxed)))
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
+
+    let (run_result, cancelled) = run_result;
 
     match run_result {
         Ok(scan_result) => {
@@ -2478,6 +2516,7 @@ async fn process_next_discovery_job_core(
             let queue = queue_store.lock().map_err(|e| e.to_string())?;
             Ok(queue::QueueProcessResult {
                 processed: true,
+                cancelled: false,
                 queue: "discovery".to_string(),
                 message_id: Some(envelope.message_id),
                 job_id: Some(envelope.job_id),
@@ -2490,6 +2529,21 @@ async fn process_next_discovery_job_core(
         }
         Err(err) => {
             let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
+            if cancelled {
+                let remaining_depth = queue.requeue_discovery_raw(dequeued.raw);
+                return Ok(queue::QueueProcessResult {
+                    processed: false,
+                    cancelled: true,
+                    queue: "discovery".to_string(),
+                    message_id: Some(envelope.message_id),
+                    job_id: Some(envelope.job_id),
+                    moved_to_dlq: false,
+                    requeued: true,
+                    attempt: Some(envelope.attempt),
+                    error: None,
+                    remaining_depth,
+                });
+            }
             let mut moved_to_dlq = false;
             let mut requeued = false;
             if envelope.attempt + 1 >= max_attempts_before_dlq {
@@ -2501,6 +2555,7 @@ async fn process_next_discovery_job_core(
             }
             Ok(queue::QueueProcessResult {
                 processed: true,
+                cancelled: false,
                 queue: "discovery".to_string(),
                 message_id: Some(envelope.message_id),
                 job_id: Some(envelope.job_id),
@@ -2519,6 +2574,7 @@ pub async fn process_next_rescan_job(
     app: AppHandle,
     queue_state: State<'_, QueueStore>,
     scan_state: State<'_, IdentityScanStore>,
+    scan_job_state: State<'_, ScanJobStore>,
     args: Option<ProcessNextDiscoveryJobArgs>,
 ) -> Result<queue::QueueProcessResult, String> {
     let args = args.unwrap_or(ProcessNextDiscoveryJobArgs {
@@ -2530,6 +2586,7 @@ pub async fn process_next_rescan_job(
         Some(app),
         queue_state.0.clone(),
         scan_state.0.clone(),
+        scan_job_state.0.clone(),
         max_attempts_before_dlq,
         args.client_run_id,
     )
@@ -2540,6 +2597,7 @@ async fn process_next_rescan_job_core(
     app: Option<AppHandle>,
     queue_store: std::sync::Arc<std::sync::Mutex<queue::QueueRuntime>>,
     scan_store: std::sync::Arc<std::sync::Mutex<IdentityScanState>>,
+    scan_job_store: std::sync::Arc<std::sync::Mutex<ScanJobState>>,
     max_attempts_before_dlq: u32,
     client_run_id: Option<String>,
 ) -> Result<queue::QueueProcessResult, String> {
@@ -2551,6 +2609,7 @@ async fn process_next_rescan_job_core(
             Ok(None) => {
                 return Ok(queue::QueueProcessResult {
                     processed: false,
+                    cancelled: false,
                     queue: "rescan".to_string(),
                     message_id: None,
                     job_id: None,
@@ -2563,11 +2622,12 @@ async fn process_next_rescan_job_core(
             }
             Err(err) => {
                 return Ok(queue::QueueProcessResult {
-                    processed: false,
+                    processed: true,
+                    cancelled: false,
                     queue: "rescan".to_string(),
                     message_id: None,
                     job_id: None,
-                    moved_to_dlq: false,
+                    moved_to_dlq: true,
                     requeued: false,
                     attempt: None,
                     error: Some(err),
@@ -2582,7 +2642,9 @@ async fn process_next_rescan_job_core(
     let app_for_scan = app.clone();
     let queue_run_id = client_run_id.clone();
     let run_result = task::spawn_blocking(move || {
-        run_identity_scan_for_queue(
+        let scan_job = ScanJobStore(scan_job_store);
+        let (_guard, cancel) = ScanJobGuard::acquire(&scan_job)?;
+        let result = run_identity_scan_for_queue(
             IdentityScanArgs {
                 video: payload.video,
                 yolo_model: payload.yolo_model,
@@ -2595,9 +2657,13 @@ async fn process_next_rescan_job_core(
             },
             app_for_scan,
             "queued rescan",
-        )
+            Arc::clone(&cancel),
+        );
+        Ok::<_, String>((result, cancel.load(Ordering::Relaxed)))
     });
-    let run_result = run_result.await.map_err(|e| e.to_string())?;
+    let run_result = run_result.await.map_err(|e| e.to_string())??;
+
+    let (run_result, cancelled) = run_result;
 
     match run_result {
         Ok(scan_result) => {
@@ -2631,6 +2697,7 @@ async fn process_next_rescan_job_core(
             let queue = queue_store.lock().map_err(|e| e.to_string())?;
             Ok(queue::QueueProcessResult {
                 processed: true,
+                cancelled: false,
                 queue: "rescan".to_string(),
                 message_id: Some(envelope.message_id),
                 job_id: Some(envelope.job_id),
@@ -2643,6 +2710,21 @@ async fn process_next_rescan_job_core(
         }
         Err(err) => {
             let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
+            if cancelled {
+                let remaining_depth = queue.requeue_rescan_raw(dequeued.raw);
+                return Ok(queue::QueueProcessResult {
+                    processed: false,
+                    cancelled: true,
+                    queue: "rescan".to_string(),
+                    message_id: Some(envelope.message_id),
+                    job_id: Some(envelope.job_id),
+                    moved_to_dlq: false,
+                    requeued: true,
+                    attempt: Some(envelope.attempt),
+                    error: None,
+                    remaining_depth,
+                });
+            }
             let mut moved_to_dlq = false;
             let mut requeued = false;
             if envelope.attempt + 1 >= max_attempts_before_dlq {
@@ -2654,6 +2736,7 @@ async fn process_next_rescan_job_core(
             }
             Ok(queue::QueueProcessResult {
                 processed: true,
+                cancelled: false,
                 queue: "rescan".to_string(),
                 message_id: Some(envelope.message_id),
                 job_id: Some(envelope.job_id),
@@ -2672,6 +2755,7 @@ pub fn queue_worker_start(
     app: AppHandle,
     queue_state: State<'_, QueueStore>,
     scan_state: State<'_, IdentityScanStore>,
+    scan_job_state: State<'_, ScanJobStore>,
     worker_state: State<'_, QueueWorkerStore>,
     args: Option<QueueWorkerStartArgs>,
 ) -> Result<QueueWorkerStatus, String> {
@@ -2714,7 +2798,9 @@ pub fn queue_worker_start(
 
     let queue_arc = queue_state.0.clone();
     let scan_arc = scan_state.0.clone();
+    let scan_job_arc = scan_job_state.0.clone();
     let worker_arc = worker_state.0.clone();
+    let stop_notify = worker_state.1.clone();
     let app_for_worker = app.clone();
 
     tokio::spawn(async move {
@@ -2731,6 +2817,7 @@ pub fn queue_worker_start(
                 Some(app_for_worker.clone()),
                 queue_arc.clone(),
                 scan_arc.clone(),
+                scan_job_arc.clone(),
                 max_attempts_before_dlq,
                 None,
             )
@@ -2742,6 +2829,7 @@ pub fn queue_worker_start(
                         Some(app_for_worker.clone()),
                         queue_arc.clone(),
                         scan_arc.clone(),
+                        scan_job_arc.clone(),
                         max_attempts_before_dlq,
                         None,
                     )
@@ -2794,7 +2882,10 @@ pub fn queue_worker_start(
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)) => {},
+                () = stop_notify.notified() => break,
+            }
         }
 
         if let Ok(mut worker) = worker_arc.lock() {
@@ -2814,6 +2905,7 @@ pub fn queue_worker_stop(
         let mut worker = worker_state.0.lock().map_err(|e| e.to_string())?;
         worker.stop_requested = true;
     }
+    worker_state.1.notify_one();
     queue_worker_status_internal(worker_state.0.clone())
 }
 
@@ -2892,58 +2984,7 @@ fn next_run_id(prefix: &str) -> String {
 }
 
 fn diagnostics_dir_path() -> PathBuf {
-    if let Ok(custom) = std::env::var("FOCUS_LOCK_DIAGNOSTICS_DIR") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    path.push(".focus-lock");
-    path.push("diagnostics");
-    path
-}
-
-/// Validate that `path` resolves inside the diagnostics directory.
-///
-/// Uses real path canonicalization when the target exists and lexical
-/// normalization otherwise. This blocks `..` traversal even when the path
-/// string *starts with* the diagnostics directory prefix.
-fn validated_diagnostics_path(path: &Path) -> Result<PathBuf, String> {
-    let diagnostics_dir = diagnostics_dir_path();
-    let canonical_base = diagnostics_dir
-        .canonicalize()
-        .map_err(|e| format!("invalid diagnostics directory: {e}"))?;
-
-    if let Ok(canonical) = path.canonicalize() {
-        return if canonical.starts_with(&canonical_base) {
-            // Keep the caller's path representation so manifest lookups (which
-            // are keyed by the original string) and filesystem I/O stay consistent.
-            Ok(path.to_path_buf())
-        } else {
-            Err("path must be inside diagnostics directory".to_string())
-        };
-    }
-
-    // Target does not exist yet (e.g. a delete request). Normalize the input
-    // lexically and validate against the canonical base.
-    let abs = std::path::absolute(path).map_err(|e| format!("invalid path: {e}"))?;
-    let mut normalized = PathBuf::new();
-    for component in abs.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::CurDir => {}
-            _ => normalized.push(component),
-        }
-    }
-
-    if normalized.starts_with(&canonical_base) {
-        Ok(path.to_path_buf())
-    } else {
-        Err("path must be inside diagnostics directory".to_string())
-    }
+    storage::diagnostics_dir_path()
 }
 
 fn file_modified_ms(meta: &std::fs::Metadata) -> Option<u64> {
@@ -3055,17 +3096,30 @@ pub async fn run_fancam(
     let _guard = match RenderJobGuard::acquire(&render_state) {
         Ok(g) => g,
         Err(message) => {
-            return Ok(JobResult {
+            let result = JobResult {
                 ok: false,
                 message,
                 output_path: None,
                 run_id: Some(render_run_id.clone()),
-            });
+            };
+            emit_render_done(&app, &result);
+            return Ok(result);
         }
     };
     state.0.store(false, Ordering::Relaxed);
 
     let scan_id_for_state = args.scan_id.clone();
+
+    if let Err(message) = validate_fancam_paths(&args) {
+        let result = JobResult {
+            ok: false,
+            message,
+            output_path: None,
+            run_id: Some(render_run_id.clone()),
+        };
+        emit_render_done(&app, &result);
+        return Ok(result);
+    }
 
     if let Some(scan_id) = &scan_id_for_state {
         let review_args = ValidateIdentityReviewArgs {
@@ -3082,12 +3136,14 @@ pub async fn run_fancam(
             let mut lock = scan_state.0.lock().map_err(|e| e.to_string())?;
             ensure_scan_store_loaded(&mut lock);
             let Some(scan) = lock.scans.get_mut(scan_id) else {
-                return Ok(JobResult {
+                let result = JobResult {
                     ok: false,
                     message: "identity validation session not found; rerun scan".to_string(),
                     output_path: None,
                     run_id: Some(render_run_id.clone()),
-                });
+                };
+                emit_render_done(&app, &result);
+                return Ok(result);
             };
 
             let review = compute_review(scan, &review_args);
@@ -3100,12 +3156,14 @@ pub async fn run_fancam(
                         review.blockers.join("; ")
                     )
                 };
-                return Ok(JobResult {
+                let result = JobResult {
                     ok: false,
                     message: why,
                     output_path: None,
                     run_id: Some(render_run_id.clone()),
-                });
+                };
+                emit_render_done(&app, &result);
+                return Ok(result);
             }
 
             apply_review_to_scan(scan, &review, args.threshold);
@@ -3165,18 +3223,16 @@ pub async fn run_fancam(
         };
         if let Some(snapshot) = snapshot.as_ref() {
             if let Err(err) = persist_scan_entry_snapshot(snapshot) {
-                return Err(err);
+                let result = JobResult {
+                    ok: false,
+                    message: format!("failed to persist tracking state: {err}"),
+                    output_path: None,
+                    run_id: Some(render_run_id.clone()),
+                };
+                emit_render_done(&app, &result);
+                return Ok(result);
             }
         }
-    }
-
-    if let Err(message) = validate_fancam_paths(&args) {
-        return Ok(JobResult {
-            ok: false,
-            message,
-            output_path: None,
-            run_id: Some(render_run_id.clone()),
-        });
     }
 
     let cancel = Arc::clone(&state.0);
@@ -3184,7 +3240,16 @@ pub async fn run_fancam(
 
     let result = match task::spawn_blocking(move || run_pipeline(app2, cancel, args)).await {
         Ok(result) => result,
-        Err(e) => return Err(e.to_string()),
+        Err(e) => {
+            let result = JobResult {
+                ok: false,
+                message: format!("render task failed: {e}"),
+                output_path: None,
+                run_id: Some(render_run_id.clone()),
+            };
+            emit_render_done(&app, &result);
+            return Ok(result);
+        }
     };
 
     match result {
@@ -3205,21 +3270,33 @@ pub async fn run_fancam(
                     }
                 }
             }
-            Ok(JobResult {
+            let result = JobResult {
                 ok: true,
                 message: "Done".into(),
                 output_path: Some(path),
                 run_id: Some(render_run_id),
-            })
+            };
+            emit_render_done(&app, &result);
+            Ok(result)
         }
         Err(e) => {
+            let cancelled = state.0.load(Ordering::Relaxed);
             if let Some(scan_id) = &scan_id_for_state {
                 if let Ok(mut lock) = scan_state.0.lock() {
                     ensure_scan_store_loaded(&mut lock);
                     let snapshot = if let Some(scan) = lock.scans.get_mut(scan_id) {
-                        set_scan_status(scan, ScanSessionStatus::Failed);
+                        let (status, action, details) = if cancelled {
+                            (
+                                ScanSessionStatus::Validated,
+                                "tracking_cancelled",
+                                "render cancelled by user".to_string(),
+                            )
+                        } else {
+                            (ScanSessionStatus::Failed, "tracking_failed", e.to_string())
+                        };
+                        set_scan_status(scan, status);
                         scan.updated_at_ms = epoch_ms();
-                        append_scan_event(scan, "tracking_failed", e.to_string());
+                        append_scan_event(scan, action, details);
                         snapshot_scan_entry(&lock, scan_id).ok().flatten()
                     } else {
                         None
@@ -3229,12 +3306,18 @@ pub async fn run_fancam(
                     }
                 }
             }
-            Ok(JobResult {
+            let result = JobResult {
                 ok: false,
-                message: e.to_string(),
+                message: if cancelled {
+                    "Render cancelled".to_string()
+                } else {
+                    e.to_string()
+                },
                 output_path: None,
                 run_id: Some(render_run_id),
-            })
+            };
+            emit_render_done(&app, &result);
+            Ok(result)
         }
     }
 }
@@ -3251,6 +3334,18 @@ fn validate_fancam_paths(args: &FancamArgs) -> Result<(), String> {
     let yolo_model = PathBuf::from(args.yolo_model.trim());
     let identity_model = effective_identity_model(&args.face_model, args.identity_model.as_deref());
     let face_model = PathBuf::from(identity_model);
+
+    if !args.threshold.is_finite() {
+        return Err("identity threshold must be finite".to_string());
+    }
+    if args
+        .target_anchor_x
+        .into_iter()
+        .chain(args.target_anchor_y)
+        .any(|value| !value.is_finite())
+    {
+        return Err("target anchor coordinates must be finite".to_string());
+    }
 
     if !video_path.is_file() {
         return Err(format!(
@@ -3282,6 +3377,28 @@ fn validate_fancam_paths(args: &FancamArgs) -> Result<(), String> {
     {
         return Err("identity margin threshold must be finite".to_string());
     }
+    if args
+        .target_embedding
+        .as_ref()
+        .is_some_and(|embedding| embedding.iter().any(|value| !value.is_finite()))
+        || args.target_embeddings.as_ref().is_some_and(|gallery| {
+            gallery
+                .iter()
+                .any(|embedding| embedding.iter().any(|value| !value.is_finite()))
+        })
+        || args.negative_embeddings.as_ref().is_some_and(|gallery| {
+            gallery
+                .iter()
+                .any(|embedding| embedding.iter().any(|value| !value.is_finite()))
+        })
+        || args.body_target_embeddings.as_ref().is_some_and(|gallery| {
+            gallery
+                .iter()
+                .any(|embedding| embedding.iter().any(|value| !value.is_finite()))
+        })
+    {
+        return Err("identity embeddings must contain only finite values".to_string());
+    }
     if let Some(reid_model) = args.body_reid_model.as_ref().map(|s| s.trim())
         && !reid_model.is_empty()
     {
@@ -3292,16 +3409,6 @@ fn validate_fancam_paths(args: &FancamArgs) -> Result<(), String> {
                 path.to_string_lossy()
             ));
         }
-    } else if args
-        .target_embeddings
-        .as_ref()
-        .is_some_and(|gallery| gallery.iter().any(|row| !row.is_empty()))
-        && resolve_default_body_reid_model(identity_model).is_none()
-    {
-        return Err(
-            "body reid model not found: expected models/osnet_x0_25_msmt17.onnx for identity-locked runs"
-                .to_string(),
-        );
     }
     if !yolo_model.is_file() {
         return Err(format!(
@@ -3383,16 +3490,6 @@ fn validate_identity_scan_paths(args: &IdentityScanArgs) -> Result<(), String> {
             ));
         }
     }
-    if args
-        .body_reid_model
-        .as_ref()
-        .is_none_or(|value| value.trim().is_empty())
-        && let Some(default_path) = resolve_default_body_reid_model(identity_model)
-        && !PathBuf::from(&default_path).is_file()
-    {
-        return Err(format!("body reid model not found: {default_path}"));
-    }
-
     OrtConfig::ensure_initialized()
         .map_err(|e| format!("failed to initialize ONNX Runtime: {e}"))?;
 
@@ -3429,7 +3526,10 @@ fn run_pipeline(
         .max(0.0);
     let body_reid_model = args
         .body_reid_model
-        .clone()
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
         .or_else(|| resolve_default_body_reid_model(&identity_model));
 
     let target_gallery = args
@@ -3533,7 +3633,7 @@ fn run_pipeline(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
 
-    transcode_with_progress_staged_mode(
+    transcode_with_progress_staged_mode_fallible(
         video_path,
         &output_path,
         total,
@@ -3547,9 +3647,9 @@ fn run_pipeline(
         },
         move |frame, camera| {
             if cancel_render.load(Ordering::Relaxed) {
-                return;
+                return Ok(());
             }
-            renderer.render(frame, camera);
+            renderer.render_checked(frame, camera)
         },
         mode,
         |current, total| {
@@ -3583,16 +3683,6 @@ fn run_pipeline(
         anyhow::bail!("render cancelled");
     }
 
-    let _ = app.emit(
-        "fancam://done",
-        JobResult {
-            ok: true,
-            message: "Done".into(),
-            output_path: Some(args.output.clone()),
-            run_id: Some(run_id),
-        },
-    );
-
     Ok(args.output)
 }
 
@@ -3609,10 +3699,8 @@ mod tests {
     };
 
     use super::{
-        FancamArgs, ListDiagnosticsBundlesArgs, QueryIdentityScansArgs, QueryScanEventsArgs,
-        RenderJobGuard, RenderJobStore, ScanJobGuard, ScanJobStore, ScanSessionStatus,
-        can_transition_status, list_diagnostics_bundles, query_identity_scans, query_scan_events,
-        validate_fancam_paths,
+        FancamArgs, QueryIdentityScansArgs, QueryScanEventsArgs, RenderJobGuard, RenderJobStore,
+        ScanJobGuard, ScanJobStore, query_identity_scans, query_scan_events, validate_fancam_paths,
     };
     use crate::storage;
 

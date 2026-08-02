@@ -1,274 +1,38 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
+  import { invokeCommand as invoke } from './lib/tauri';
   import { listen } from '@tauri-apps/api/event';
   import { open, save } from '@tauri-apps/plugin-dialog';
   import { onMount, onDestroy } from 'svelte';
+  import type {
+    DiagnosticsBundleInfo,
+    DuplicatePair,
+    ExportDiagnosticsResult,
+    IdentityCandidate,
+    IdentityReviewResult,
+    JobStatus,
+    ListDiagnosticsBundlesResult,
+    ProcessingMode,
+    QueryIdentityScansResult,
+    QueryScanEventsResult,
+    QueueActionResult,
+    QueueHealth,
+    QueueWorkerEvent,
+    QueueWorkerStatus,
+    RenderDonePayload,
+    RenderProgressPayload,
+    ScanDonePayload,
+    ScanProgressPayload,
+    ScanResult,
+    ScanSessionDetail,
+    ScanSessionEvent,
+    ScanSessionSummary,
+    ScanStatus,
+    ScanStorageMaintenanceResult,
+    ScanStorageStats,
+    StorageWorkerStatus,
+  } from './lib/contracts';
 
   // ── State ─────────────────────────────────────────────────────────────────
-
-  type JobStatus = 'idle' | 'running' | 'cancelling' | 'done' | 'error';
-  type ScanStatus = 'idle' | 'running' | 'cancelling' | 'done' | 'error';
-
-  type IdentityCandidate = {
-    id: number;
-    confidence: number;
-    observations: number;
-    first_frame: number;
-    last_frame: number;
-    anchor_x: number;
-    anchor_y: number;
-    anchor_x_norm?: number;
-    anchor_y_norm?: number;
-    thumbnail_data_url: string;
-    embedding?: number[];
-    body_embedding?: number[];
-    preview_score?: number;
-    preview_observations?: number;
-  };
-
-  type DuplicatePair = {
-    a: number;
-    b: number;
-    similarity: number;
-  };
-
-  type ScanResult = {
-    scan_id: string;
-    ok: boolean;
-    message: string;
-    video: string;
-    sampled_frames: number;
-    total_decoded_frames: number;
-    proposed_count: number;
-    processing_mode: string;
-    expected_count?: number;
-    rescan_performed: boolean;
-    needs_review: boolean;
-    rejected_embeddings: number;
-    suppressed_clusters: number;
-    merged_clusters: number;
-    provisional_tracklets: number;
-    candidates: IdentityCandidate[];
-    duplicates: DuplicatePair[];
-  };
-
-  type IdentityReviewResult = {
-    ok: boolean;
-    ready: boolean;
-    blockers: string[];
-    active_count: number;
-    selected_identity_id?: number;
-    selected_anchor_x?: number;
-    selected_anchor_y?: number;
-  };
-
-  type QueueHealth = {
-    sqs_enabled: boolean;
-    queues: {
-      discovery_queue: string;
-      rescan_queue: string;
-      tracking_start_queue: string;
-      tracking_monitor_queue: string;
-      dlq_queue: string;
-    };
-    depths: {
-      discovery: number;
-      rescan: number;
-      tracking_start: number;
-      tracking_monitor: number;
-      dlq: number;
-    };
-    dedupe_keys: number;
-  };
-
-  type QueueActionResult = {
-    accepted?: boolean;
-    deduplicated?: boolean;
-    queue: string;
-    message_id?: string;
-    job_id?: string;
-    moved_to_dlq?: boolean;
-    requeued?: boolean;
-    attempt?: number;
-    error?: string;
-    depth?: number;
-    remaining_depth?: number;
-    processed?: boolean;
-  };
-
-  type QueueWorkerStatus = {
-    running: boolean;
-    stop_requested: boolean;
-    poll_interval_ms: number;
-    max_attempts_before_dlq: number;
-    processed_total: number;
-    last_error?: string;
-    recent_events: QueueWorkerEvent[];
-  };
-
-  type QueueWorkerEvent = {
-    at_ms: number;
-    queue: string;
-    message_id?: string;
-    job_id?: string;
-    attempt?: number;
-    moved_to_dlq: boolean;
-    requeued: boolean;
-    error?: string;
-  };
-
-  type ScanSessionEvent = {
-    at_ms: number;
-    action: string;
-    details: string;
-  };
-
-  type ScanSessionDetail = {
-    scan_id: string;
-    video: string;
-    status: 'proposed' | 'validated' | 'tracking' | 'completed' | 'failed';
-    expected_count?: number;
-    processing_mode: string;
-    review_ready: boolean;
-    selected_identity_id?: number;
-    selected_anchor_x?: number;
-    selected_anchor_y?: number;
-    validated_threshold?: number;
-    last_blockers: string[];
-    candidates: IdentityCandidate[];
-    duplicates: DuplicatePair[];
-    excluded_identity_ids: number[];
-    accepted_low_confidence_ids: number[];
-    resolved_duplicates: { a: number; b: number; keep: number }[];
-    pending_split_ids: number[];
-    updated_at_ms: number;
-    event_count: number;
-    recent_events: ScanSessionEvent[];
-  };
-
-  type ScanSessionSummary = {
-    scan_id: string;
-    video: string;
-    status: 'proposed' | 'validated' | 'tracking' | 'completed' | 'failed';
-    review_ready: boolean;
-    selected_identity_id?: number;
-    pending_split_count: number;
-    event_count: number;
-    updated_at_ms: number;
-  };
-
-  type QueryIdentityScansResult = {
-    rows: ScanSessionSummary[];
-    next_cursor_updated_at_ms?: number;
-    next_cursor_scan_id?: string;
-    offset_ignored?: boolean;
-  };
-
-  type QueryScanEventsResult = {
-    rows: ScanSessionEvent[];
-    next_cursor_event_id?: number;
-    offset_ignored?: boolean;
-  };
-
-  type ScanStorageStats = {
-    schema_version: number;
-    session_count: number;
-    event_count: number;
-    db_path: string;
-  };
-
-  type ScanStorageMaintenanceResult = {
-    deleted_sessions: number;
-    deleted_events: number;
-    vacuum_ran: boolean;
-    stats: ScanStorageStats;
-  };
-
-  type ExportDiagnosticsResult = {
-    path: string;
-    bytes: number;
-  };
-
-  type DiagnosticsBundleInfo = {
-    file_name: string;
-    path: string;
-    bytes: number;
-    modified_at_ms?: number;
-    sha256?: string;
-  };
-
-  type ListDiagnosticsBundlesResult = {
-    bundles: DiagnosticsBundleInfo[];
-  };
-
-  type PruneDiagnosticsBundlesResult = {
-    deleted: number;
-    kept: number;
-  };
-
-  type ReadDiagnosticsBundleResult = {
-    path: string;
-    bytes: number;
-    content: string;
-    truncated: boolean;
-  };
-
-  type DeleteDiagnosticsBundleResult = {
-    deleted: boolean;
-  };
-
-  type VerifyDiagnosticsBundleResult = {
-    path: string;
-    expected_sha256?: string;
-    actual_sha256: string;
-    matches: boolean;
-  };
-
-  type StorageWorkerStatus = {
-    running: boolean;
-    stop_requested: boolean;
-    poll_interval_ms: number;
-    max_session_age_ms: number;
-    max_events_per_scan: number;
-    vacuum: boolean;
-    runs_total: number;
-    last_run_ms?: number;
-    last_error?: string;
-  };
-
-  type ScanProgressPayload = {
-    run_id: string;
-    sampled_frames: number;
-    total_decoded_frames: number;
-    estimated_total_samples: number;
-    pass_fraction: number;
-    overall_fraction: number;
-    phase: string;
-    pass_index: number;
-    pass_total: number;
-  };
-
-  type ScanDonePayload = {
-    run_id: string;
-    ok: boolean;
-    message: string;
-  };
-
-  type RenderProgressPayload = {
-    run_id: string;
-    current: number;
-    total: number;
-    fraction: number;
-  };
-
-  type RenderDonePayload = {
-    run_id?: string;
-    ok: boolean;
-    message: string;
-    output_path?: string;
-  };
-
-  type ProcessingMode = 'fast' | 'balanced' | 'quality';
 
   let videoPath    = $state('');
   let biasPath     = $state('');
@@ -348,12 +112,7 @@
   let storageWorkerStatus = $state<StorageWorkerStatus | null>(null);
   let storageWorkerPollInput = $state('300000');
   let diagnosticsBundles = $state<DiagnosticsBundleInfo[]>([]);
-  let diagnosticsKeepInput = $state('20');
   let scanEventWindowMinutesInput = $state('');
-  let diagnosticsPreview = $state('');
-  let diagnosticsPreviewPath = $state('');
-  let diagnosticsVerifyState = $state<Record<string, 'ok' | 'mismatch' | 'untracked'>>({});
-  let diagnosticsVerifyDetails = $state<Record<string, string>>({});
   let scanTelemetrySummary = $state('');
 
   let showSettings = $state(false);
@@ -450,6 +209,10 @@
           resultPath = e.payload.output_path ?? '';
           progress   = 1;
           etaSeconds = 0;
+        } else if (e.payload.message.toLowerCase().includes('cancel')) {
+          status = 'idle';
+          errMsg = '';
+          etaSeconds = null;
         } else {
           status = 'error';
           errMsg = e.payload.message;
@@ -480,6 +243,10 @@
         if (scanStatus !== 'done') {
           scanStatus = 'done';
         }
+      } else if (e.payload.message.toLowerCase().includes('cancel')) {
+        scanStatus = 'idle';
+        scanMessage = 'scan cancelled';
+        scanErr = '';
       } else {
         scanStatus = 'error';
         scanErr = e.payload.message;
@@ -707,6 +474,15 @@
       scanStatus === 'done' &&
       reviewReady &&
       selectedIdentityId !== null
+    );
+  }
+
+  function isBusy() {
+    return (
+      status === 'running' ||
+      status === 'cancelling' ||
+      scanStatus === 'running' ||
+      scanStatus === 'cancelling'
     );
   }
 
@@ -1177,112 +953,9 @@
       });
       if (isSettingsNonceStale(nonce)) return;
       diagnosticsBundles = result.bundles;
-      const next: Record<string, 'ok' | 'mismatch' | 'untracked'> = {};
-      const details: Record<string, string> = {};
-      for (const bundle of result.bundles) {
-        const existing = diagnosticsVerifyState[bundle.path];
-        const existingDetails = diagnosticsVerifyDetails[bundle.path];
-        if (existing) next[bundle.path] = existing;
-        if (existingDetails) details[bundle.path] = existingDetails;
-      }
-      diagnosticsVerifyState = next;
-      diagnosticsVerifyDetails = details;
     } catch {
       if (isSettingsNonceStale(nonce)) return;
       diagnosticsBundles = [];
-      diagnosticsVerifyState = {};
-      diagnosticsVerifyDetails = {};
-    }
-  }
-
-  async function verifyDiagnosticsBundle(path: string) {
-    queueErr = '';
-    try {
-      const result = await invoke<VerifyDiagnosticsBundleResult>('verify_diagnostics_bundle', {
-        args: { path },
-      });
-      if (!result.expected_sha256) {
-        diagnosticsVerifyState = { ...diagnosticsVerifyState, [path]: 'untracked' };
-        diagnosticsVerifyDetails = { ...diagnosticsVerifyDetails, [path]: 'manifest missing' };
-        queueMsg = 'bundle is not tracked in manifest';
-        return;
-      }
-      if (result.matches) {
-        diagnosticsVerifyState = { ...diagnosticsVerifyState, [path]: 'ok' };
-        diagnosticsVerifyDetails = {
-          ...diagnosticsVerifyDetails,
-          [path]: `sha ${result.actual_sha256.slice(0, 12)}`,
-        };
-        queueMsg = 'bundle checksum verified';
-      } else {
-        diagnosticsVerifyState = { ...diagnosticsVerifyState, [path]: 'mismatch' };
-        diagnosticsVerifyDetails = {
-          ...diagnosticsVerifyDetails,
-          [path]: `expected ${result.expected_sha256.slice(0, 8)} actual ${result.actual_sha256.slice(0, 8)}`,
-        };
-        queueMsg = 'bundle checksum mismatch';
-      }
-    } catch (e: unknown) {
-      queueErr = String(e);
-    }
-  }
-
-  async function pruneDiagnosticsBundles() {
-    if (!confirm('Prune diagnostics bundles? Older bundles will be deleted.')) {
-      return;
-    }
-    queueErr = '';
-    try {
-      const keep = Number.parseInt(diagnosticsKeepInput, 10);
-      const result = await invoke<PruneDiagnosticsBundlesResult>('prune_diagnostics_bundles', {
-        args: { keep_latest: Number.isFinite(keep) && keep > 0 ? keep : 20 },
-      });
-      queueMsg = `diagnostics pruned: deleted ${result.deleted}, kept ${result.kept}`;
-      await refreshDiagnosticsBundles();
-    } catch (e: unknown) {
-      queueErr = String(e);
-    }
-  }
-
-  async function previewDiagnosticsBundle(path: string) {
-    queueErr = '';
-    try {
-      const result = await invoke<ReadDiagnosticsBundleResult>('read_diagnostics_bundle', {
-        args: {
-          path,
-          max_bytes: 32 * 1024,
-        },
-      });
-      diagnosticsPreview = result.truncated
-        ? `${result.content}\n\n...truncated (${result.bytes} bytes total)`
-        : result.content;
-      diagnosticsPreviewPath = result.path;
-    } catch (e: unknown) {
-      queueErr = String(e);
-    }
-  }
-
-  async function deleteDiagnosticsBundle(path: string) {
-    if (!confirm(`Delete diagnostics bundle?\n${path}`)) {
-      return;
-    }
-    queueErr = '';
-    try {
-      const result = await invoke<DeleteDiagnosticsBundleResult>('delete_diagnostics_bundle', {
-        args: { path },
-      });
-      if (result.deleted) {
-        queueMsg = 'diagnostics bundle deleted';
-        if (diagnosticsPreviewPath === path) {
-          diagnosticsPreview = '';
-          diagnosticsPreviewPath = '';
-        }
-      } else {
-        queueMsg = 'diagnostics bundle not found';
-      }
-      await refreshDiagnosticsBundles();
-    } catch (e: unknown) {
-      queueErr = String(e);
     }
   }
 
@@ -1558,7 +1231,10 @@
       const result = await invoke<QueueActionResult>('process_next_discovery_job', {
         args: { max_attempts_before_dlq: 3, client_run_id: activeScanRunId },
       });
-      if (!result.processed) {
+      if (result.cancelled) {
+        queueMsg = 'queued discovery cancelled and returned to the queue';
+        scanStatus = 'idle';
+      } else if (!result.processed) {
         queueMsg = 'no queued discovery jobs';
         scanStatus = 'idle';
       } else if (result.error) {
@@ -1601,7 +1277,10 @@
       const result = await invoke<QueueActionResult>('process_next_rescan_job', {
         args: { max_attempts_before_dlq: 3, client_run_id: activeScanRunId },
       });
-      if (!result.processed) {
+      if (result.cancelled) {
+        queueMsg = 'queued rescan cancelled and returned to the queue';
+        scanStatus = 'idle';
+      } else if (!result.processed) {
         queueMsg = 'no queued rescan jobs';
         scanStatus = 'idle';
       } else if (result.error) {
@@ -1871,16 +1550,19 @@
     <span class="logo">focus<span class="accent">-lock</span></span>
     <span class="sub">automated fancam generator</span>
     <button
+      type="button"
       class="icon-btn"
       class:active={showSettings}
       onclick={() => (showSettings = !showSettings)}
       title="Settings"
+      aria-expanded={showSettings}
+      aria-controls="settings-drawer"
     >⚙ settings</button>
   </header>
 
   <!-- settings drawer -->
   {#if showSettings}
-  <section class="drawer">
+  <section id="settings-drawer" class="drawer" aria-label="Settings">
     <h3>models</h3>
 
     <label>
@@ -1910,13 +1592,17 @@
       <input type="range" min="0.3" max="0.95" step="0.01" bind:value={threshold} />
     </label>
 
-    <div class="queue-panel">
-      <h4>queue</h4>
+    <details class="advanced-panel">
+      <summary>queue &amp; diagnostics <span>advanced</span></summary>
+      <div class="queue-panel">
+      <h4>queue &amp; diagnostics</h4>
       {#if queueHealth}
         <div class="queue-meta">
-          <span>{queueHealth.sqs_enabled ? 'sqs mode enabled' : 'in-memory mode'}</span>
+          <span>in-memory queue</span>
           <span>discovery depth {queueHealth.depths.discovery}</span>
+          <span>rescan depth {queueHealth.depths.rescan}</span>
           <span>dlq depth {queueHealth.depths.dlq}</span>
+          <span>dedupe keys {queueHealth.dedupe_keys}</span>
           {#if scanStorageStats}
             <span>db v{scanStorageStats.schema_version}</span>
             <span>sessions {scanStorageStats.session_count}</span>
@@ -1938,8 +1624,6 @@
         <button class="ghost-btn" onclick={runStorageMaintenance}>storage maintenance</button>
         <button class="ghost-btn" onclick={exportDiagnosticsBundle}>export diagnostics</button>
         <button class="ghost-btn" onclick={() => refreshDiagnosticsBundles()}>refresh bundles</button>
-        <input class="count-input" bind:value={diagnosticsKeepInput} placeholder="keep bundles" />
-        <button class="ghost-btn" onclick={pruneDiagnosticsBundles}>prune bundles</button>
         <button class="ghost-btn" disabled={!scanId} onclick={enqueueCurrentScanJob}>enqueue discovery</button>
         <button class="ghost-btn" disabled={!scanId || pendingSplitIds.length === 0} onclick={enqueueSplitRescanJob}>enqueue split rescan</button>
         <button class="ghost-btn" onclick={processNextQueuedScan}>process next</button>
@@ -2005,22 +1689,9 @@
               <span class="session-id">{bundle.file_name}</span>
               <span>{bundle.bytes}b</span>
               <span>{bundle.modified_at_ms ? formatClock(bundle.modified_at_ms) : 'n/a'}</span>
-              <span>{bundle.sha256 ? bundle.sha256.slice(0, 12) : 'no-sha'}</span>
-              <span>{diagnosticsVerifyState[bundle.path] ?? '-'}</span>
-              <span>{diagnosticsVerifyDetails[bundle.path] ?? ''}</span>
               <span class="bundle-path">{bundle.path}</span>
-              <div class="bundle-actions">
-                <button class="ghost-btn tiny" onclick={() => previewDiagnosticsBundle(bundle.path)}>preview</button>
-                <button class="ghost-btn tiny" onclick={() => verifyDiagnosticsBundle(bundle.path)}>verify</button>
-                <button class="ghost-btn tiny" onclick={() => deleteDiagnosticsBundle(bundle.path)}>delete</button>
-              </div>
             </div>
           {/each}
-        </div>
-      {/if}
-      {#if diagnosticsPreview}
-        <div class="queue-event-list">
-          <pre class="diag-preview">{diagnosticsPreview}</pre>
         </div>
       {/if}
       {#if scanSessions.length > 0}
@@ -2135,7 +1806,8 @@
       {#if queueErr}
         <div class="scan-error">{queueErr}</div>
       {/if}
-    </div>
+      </div>
+    </details>
   </section>
   {/if}
 
@@ -2154,7 +1826,7 @@
       <div class="input-block" class:filled={!!videoPath}>
         <div class="input-label">video input</div>
         <div class="input-row">
-          <button class="drop-zone" onclick={pickVideo}>
+          <button type="button" class="drop-zone" onclick={pickVideo} disabled={isBusy()}>
             {#if videoPath}
               <span class="filename">{basename(videoPath)}</span>
               {#if totFrames > 0}
@@ -2187,7 +1859,7 @@
       <div class="input-block" class:filled={!!biasPath}>
         <div class="input-label">bias reference</div>
         <div class="input-row">
-          <button class="drop-zone small" onclick={pickBias}>
+          <button type="button" class="drop-zone small" onclick={pickBias} disabled={isBusy()}>
             {#if biasPath}
               <span class="filename">{basename(biasPath)}</span>
             {:else}
@@ -2216,7 +1888,7 @@
 
       <div class="input-block" class:filled={!!outputPath}>
         <div class="input-label">output path</div>
-        <button class="drop-zone small" onclick={pickOutput}>
+        <button type="button" class="drop-zone small" onclick={pickOutput} disabled={isBusy()}>
           {#if outputPath}
             <span class="filename">{basename(outputPath)}</span>
           {:else}
@@ -2225,7 +1897,12 @@
         </button>
       </div>
 
-      <div class="input-block scan-block" class:filled={scanStatus === 'done'}>
+      <div
+        class="input-block scan-block"
+        class:filled={scanStatus === 'done'}
+        aria-live="polite"
+        aria-busy={scanStatus === 'running' || scanStatus === 'cancelling'}
+      >
         <div class="input-label">identity discovery</div>
         <div class="scan-controls">
           <label class="count-input-wrap" for="expected-members">
@@ -2254,14 +1931,15 @@
             </select>
           </label>
           <button
+            type="button"
             class="ghost-btn"
-            disabled={!videoPath || !yoloModel || !faceModel || scanStatus === 'running' || scanStatus === 'cancelling'}
+            disabled={!videoPath || !yoloModel || !faceModel || isBusy()}
             onclick={runIdentityScan}
           >
             {scanStatus === 'running' ? 'scanning...' : 'scan members'}
           </button>
           {#if scanStatus === 'running' || scanStatus === 'cancelling'}
-            <button class="ghost-btn" onclick={cancelScan} disabled={scanStatus === 'cancelling'}>
+            <button type="button" class="ghost-btn" onclick={cancelScan} disabled={scanStatus === 'cancelling'}>
               {scanStatus === 'cancelling' ? 'cancelling...' : 'cancel scan'}
             </button>
           {/if}
@@ -2284,7 +1962,14 @@
             </span>
             <span class="scan-progress-pct">{pct(scanProgressFraction)}</span>
           </div>
-          <div class="scan-progress-track">
+          <div
+            class="scan-progress-track"
+            role="progressbar"
+            aria-label="Identity scan progress"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow={Math.round(scanProgressFraction * 100)}
+          >
             <div class="scan-progress-fill" style="width:{pct(scanProgressFraction)}"></div>
           </div>
           <div class="scan-meta detail">
@@ -2389,6 +2074,8 @@
                   class:ignored={isIgnored(candidate.id)}
                   role="button"
                   tabindex="0"
+                  aria-pressed={selectedIdentityId === candidate.id}
+                  aria-label={`Select member ${candidate.id + 1}`}
                   onclick={() => selectIdentity(candidate)}
                   onkeydown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
@@ -2481,7 +2168,12 @@
     <div class="divider"></div>
 
     <!-- progress / status -->
-    <section class="status-panel">
+    <section
+      class="status-panel"
+      aria-live="polite"
+      aria-atomic="true"
+      aria-busy={status === 'running' || status === 'cancelling'}
+    >
       {#if status === 'idle'}
         <div class="ready-msg">
           {#if !videoPath || !outputPath || (!biasPath && !hasValidatedScanSelectionForRender())}
@@ -2512,7 +2204,14 @@
             <span class="prog-frames">{curFrame} / {totFrames}</span>
           {/if}
         </div>
-        <div class="prog-track">
+        <div
+          class="prog-track"
+          role="progressbar"
+          aria-label="Render progress"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow={Math.round(progress * 100)}
+        >
           <div class="prog-fill" style="width:{pct(progress)}"></div>
         </div>
 
@@ -2535,11 +2234,12 @@
     <!-- actions -->
     <section class="actions">
       {#if status === 'running' || status === 'cancelling'}
-        <button class="btn-cancel" onclick={cancelJob} disabled={status === 'cancelling'}>
+        <button type="button" class="btn-cancel" onclick={cancelJob} disabled={status === 'cancelling'}>
           {status === 'cancelling' ? 'cancelling...' : 'cancel'}
         </button>
       {:else}
           <button
+            type="button"
             class="btn-run"
             disabled={
               !videoPath ||
@@ -2693,6 +2393,26 @@
     text-transform: uppercase;
     color: #5b5b67;
   }
+  .advanced-panel {
+    border-top: 1px solid #23232a;
+    padding-top: 12px;
+  }
+  .advanced-panel summary {
+    color: #8f8f9a;
+    cursor: pointer;
+    font-size: 11px;
+    list-style-position: inside;
+  }
+  .advanced-panel summary span {
+    color: #5b5b67;
+    font-size: 10px;
+    margin-left: 6px;
+    text-transform: uppercase;
+  }
+  .advanced-panel[open] summary {
+    color: #c8c8d2;
+    margin-bottom: 4px;
+  }
   .queue-meta {
     display: flex;
     flex-wrap: wrap;
@@ -2749,14 +2469,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .diag-preview {
-    margin: 0;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    font-size: 10px;
-    color: #8d8d9a;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
   .queue-session-list {
     display: flex;
     flex-direction: column;
@@ -2792,11 +2504,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: #6f6f7c;
-  }
-  .bundle-actions {
-    display: flex;
-    gap: 6px;
-    align-items: center;
   }
   .file-row {
     display: flex;
@@ -2836,6 +2543,15 @@
   }
   .ghost-btn:hover { color: #c8c8d2; border-color: #52525e; background: #1e1e23; }
   .ghost-btn.active { color: #d8d8e2; border-color: #6ee7b7; background: #143126; }
+  button:disabled { cursor: not-allowed; }
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  summary:focus-visible,
+  .identity-card:focus-visible {
+    outline: 2px solid #6ee7b7;
+    outline-offset: 2px;
+  }
 
   input[type="range"] {
     accent-color: #6ee7b7;
@@ -2901,6 +2617,7 @@
   }
   .drop-zone.small { padding: 10px 16px; }
   .drop-zone:hover { border-color: #52525e; background: #18181c; }
+  .drop-zone:disabled { opacity: 0.55; }
   .input-block.filled .drop-zone {
     border-style: solid;
     border-color: #3a3a42;
@@ -3243,6 +2960,7 @@
     transition: background 0.15s, border-color 0.15s;
   }
   .btn-cancel:hover { background: #1a0808; border-color: #7f1d1d; }
+  .btn-cancel:disabled { cursor: wait; opacity: 0.55; }
 
   /* ── Footer ──────────────────────────────────────────────────────────── */
   footer {
@@ -3272,6 +2990,15 @@
     .scan-controls {
       flex-direction: column;
       align-items: stretch;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
     }
   }
 </style>

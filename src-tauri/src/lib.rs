@@ -7,6 +7,9 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
+use tauri::Manager;
+use tokio::sync::Notify;
+
 /// Cancel flag shared with the active fancam job.
 pub struct CancelFlag(pub Arc<AtomicBool>);
 
@@ -77,8 +80,16 @@ pub struct QueueWorkerEvent {
     pub error: Option<String>,
 }
 
-#[derive(Default)]
-pub struct QueueWorkerStore(pub Arc<Mutex<QueueWorkerState>>);
+pub struct QueueWorkerStore(pub Arc<Mutex<QueueWorkerState>>, pub Arc<Notify>);
+
+impl Default for QueueWorkerStore {
+    fn default() -> Self {
+        Self(
+            Arc::new(Mutex::new(QueueWorkerState::default())),
+            Arc::new(Notify::new()),
+        )
+    }
+}
 
 #[derive(Debug)]
 pub struct StorageWorkerState {
@@ -93,8 +104,16 @@ pub struct StorageWorkerState {
     pub last_error: Option<String>,
 }
 
-#[derive(Default)]
-pub struct StorageWorkerStore(pub Arc<Mutex<StorageWorkerState>>);
+pub struct StorageWorkerStore(pub Arc<Mutex<StorageWorkerState>>, pub Arc<Notify>);
+
+impl Default for StorageWorkerStore {
+    fn default() -> Self {
+        Self(
+            Arc::new(Mutex::new(StorageWorkerState::default())),
+            Arc::new(Notify::new()),
+        )
+    }
+}
 
 impl Default for QueueWorkerState {
     fn default() -> Self {
@@ -134,10 +153,15 @@ pub fn run() {
         )
         .init();
 
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
+        .setup(|app| {
+            let data_dir = app.path().app_data_dir().map_err(std::io::Error::other)?;
+            storage::initialize_app_data_dir(data_dir).map_err(std::io::Error::other)?;
+            Ok(())
+        })
         .manage(CancelFlag::default())
         .manage(RenderJobStore::default())
         .manage(ScanJobStore::default())
@@ -177,6 +201,8 @@ pub fn run() {
             commands::cancel_scan,
             commands::run_fancam,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running focus-lock");
+        .run(tauri::generate_context!());
+    if let Err(error) = result {
+        eprintln!("error while running focus-lock: {error}");
+    }
 }

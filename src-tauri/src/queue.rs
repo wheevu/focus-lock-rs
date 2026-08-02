@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,7 @@ pub struct QueueEnqueueResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueProcessResult {
     pub processed: bool,
+    pub cancelled: bool,
     pub queue: String,
     pub message_id: Option<String>,
     pub job_id: Option<String>,
@@ -70,6 +72,9 @@ pub struct QueueProcessResult {
     pub error: Option<String>,
     pub remaining_depth: usize,
 }
+
+const QUEUE_DEDUPE_LIMIT: usize = 1024;
+static QUEUE_MESSAGE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryDequeued {
@@ -89,6 +94,7 @@ pub struct QueueRuntime {
     rescan: VecDeque<String>,
     dlq: VecDeque<String>,
     seen_idempotency: HashSet<String>,
+    seen_idempotency_order: VecDeque<String>,
 }
 
 impl QueueRuntime {
@@ -98,6 +104,7 @@ impl QueueRuntime {
             rescan: VecDeque::new(),
             dlq: VecDeque::new(),
             seen_idempotency: HashSet::new(),
+            seen_idempotency_order: VecDeque::new(),
         }
     }
 
@@ -129,9 +136,10 @@ impl QueueRuntime {
         }
 
         let created_at_ms = now_ms();
-        let message_id = format!("msg-disc-{created_at_ms}");
-        let job_id = format!("job-disc-{created_at_ms}");
-        let trace_id = format!("trace-disc-{}", created_at_ms % 100_000);
+        let sequence = QUEUE_MESSAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let message_id = format!("msg-disc-{created_at_ms}-{sequence}");
+        let job_id = format!("job-disc-{created_at_ms}-{sequence}");
+        let trace_id = format!("trace-disc-{created_at_ms}-{sequence}");
 
         let envelope = QueueEnvelope {
             message_id: message_id.clone(),
@@ -147,7 +155,7 @@ impl QueueRuntime {
         let serialized = serde_json::to_string(&envelope)
             .map_err(|e| format!("failed to serialize queue message: {e}"))?;
         self.discovery.push_back(serialized);
-        self.seen_idempotency.insert(idempotency_key.clone());
+        self.remember_idempotency(idempotency_key.clone());
 
         Ok(QueueEnqueueResult {
             accepted: true,
@@ -176,21 +184,22 @@ impl QueueRuntime {
         }
 
         let created_at_ms = now_ms();
-        let message_id = format!("msg-rescan-{created_at_ms}");
+        let sequence = QUEUE_MESSAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let message_id = format!("msg-rescan-{created_at_ms}-{sequence}");
         let envelope = QueueEnvelope {
             message_id: message_id.clone(),
             message_type: "RESCAN_REQUEST".to_string(),
-            job_id: format!("job-rescan-{created_at_ms}"),
+            job_id: format!("job-rescan-{created_at_ms}-{sequence}"),
             idempotency_key: idempotency_key.clone(),
             created_at_ms,
             attempt: 0,
-            trace_id: format!("trace-rescan-{}", created_at_ms % 100_000),
+            trace_id: format!("trace-rescan-{created_at_ms}-{sequence}"),
             payload,
         };
         let serialized = serde_json::to_string(&envelope)
             .map_err(|e| format!("failed to serialize rescan queue message: {e}"))?;
         self.rescan.push_back(serialized);
-        self.seen_idempotency.insert(idempotency_key.clone());
+        self.remember_idempotency(idempotency_key.clone());
 
         Ok(QueueEnqueueResult {
             accepted: true,
@@ -217,8 +226,15 @@ impl QueueRuntime {
         let Some(raw) = self.discovery.pop_front() else {
             return Ok(None);
         };
-        let parsed = serde_json::from_str::<QueueEnvelope<DiscoveryJobPayload>>(&raw)
-            .map_err(|e| format!("failed to parse discovery queue message: {e}"))?;
+        let parsed = match serde_json::from_str::<QueueEnvelope<DiscoveryJobPayload>>(&raw) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.dlq.push_back(raw);
+                return Err(format!(
+                    "failed to parse discovery queue message; moved to DLQ: {error}"
+                ));
+            }
+        };
         Ok(Some(DiscoveryDequeued {
             envelope: parsed,
             raw,
@@ -230,12 +246,24 @@ impl QueueRuntime {
         self.dlq.len()
     }
 
+    pub fn requeue_discovery_raw(&mut self, raw: String) -> usize {
+        self.discovery.push_front(raw);
+        self.discovery.len()
+    }
+
     pub fn dequeue_rescan(&mut self) -> Result<Option<RescanDequeued>, String> {
         let Some(raw) = self.rescan.pop_front() else {
             return Ok(None);
         };
-        let parsed = serde_json::from_str::<QueueEnvelope<RescanJobPayload>>(&raw)
-            .map_err(|e| format!("failed to parse rescan queue message: {e}"))?;
+        let parsed = match serde_json::from_str::<QueueEnvelope<RescanJobPayload>>(&raw) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.dlq.push_back(raw);
+                return Err(format!(
+                    "failed to parse rescan queue message; moved to DLQ: {error}"
+                ));
+            }
+        };
         Ok(Some(RescanDequeued {
             envelope: parsed,
             raw,
@@ -258,6 +286,11 @@ impl QueueRuntime {
         self.dlq.len()
     }
 
+    pub fn requeue_rescan_raw(&mut self, raw: String) -> usize {
+        self.rescan.push_front(raw);
+        self.rescan.len()
+    }
+
     pub fn peek_discovery_attempts(&self, limit: usize) -> Result<Vec<u32>, String> {
         self.discovery
             .iter()
@@ -268,6 +301,17 @@ impl QueueRuntime {
                 Ok(parsed.attempt)
             })
             .collect()
+    }
+
+    fn remember_idempotency(&mut self, key: String) {
+        if self.seen_idempotency.insert(key.clone()) {
+            self.seen_idempotency_order.push_back(key);
+        }
+        while self.seen_idempotency_order.len() > QUEUE_DEDUPE_LIMIT {
+            if let Some(oldest) = self.seen_idempotency_order.pop_front() {
+                self.seen_idempotency.remove(&oldest);
+            }
+        }
     }
 }
 
@@ -343,5 +387,46 @@ mod tests {
         assert_eq!(dlq_depth, 1);
         assert_eq!(q.health().depths.discovery, 0);
         assert_eq!(q.health().depths.dlq, 1);
+    }
+
+    #[test]
+    fn message_ids_remain_unique_within_one_millisecond() {
+        let mut q = QueueRuntime::new();
+        let first = q
+            .enqueue_discovery(payload("scan-4"), "idem-d".to_string())
+            .expect("first enqueue should work");
+        let second = q
+            .enqueue_discovery(payload("scan-5"), "idem-e".to_string())
+            .expect("second enqueue should work");
+        assert_ne!(first.message_id, second.message_id);
+    }
+
+    #[test]
+    fn malformed_messages_are_sent_to_dlq_instead_of_disappearing() {
+        let mut q = QueueRuntime::new();
+        q.discovery.push_back("not-json".to_string());
+        let result = q.dequeue_discovery();
+        assert!(result.is_err());
+        assert_eq!(q.health().depths.discovery, 0);
+        assert_eq!(q.health().depths.dlq, 1);
+    }
+
+    #[test]
+    fn raw_requeue_preserves_the_original_message() {
+        let mut q = QueueRuntime::new();
+        q.enqueue_discovery(payload("scan-6"), "idem-f".to_string())
+            .expect("enqueue should work");
+        let message = q
+            .dequeue_discovery()
+            .expect("dequeue should parse")
+            .expect("message should exist");
+        let raw = message.raw.clone();
+        q.requeue_discovery_raw(raw.clone());
+        let requeued = q
+            .dequeue_discovery()
+            .expect("requeue should parse")
+            .expect("message should exist");
+        assert_eq!(requeued.raw, raw);
+        assert_eq!(requeued.envelope.attempt, 0);
     }
 }

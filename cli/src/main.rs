@@ -19,9 +19,13 @@ use tracing_subscriber::EnvFilter;
 
 use fancam_core::{
     detection::{Detector, FaceIdentifier, draw_boxes},
+    mode::ProcessingMode,
     pipeline::Pipeline,
     runtime::OrtConfig,
-    video::{RgbFrame, for_each_rgb_frame, transcode, transcode_with_progress_staged},
+    video::{
+        RgbFrame, for_each_rgb_frame, total_frames, transcode,
+        transcode_with_progress_staged_mode_fallible,
+    },
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -265,16 +269,20 @@ fn cmd_fancam(
 
     pb.set_message("Generating fancam…".to_string());
     let pb_render = pb.clone();
+    let total = total_frames(&video);
 
-    transcode_with_progress_staged(
+    transcode_with_progress_staged_mode_fallible(
         video,
         &output,
-        0,
+        total,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         move |frame| analyzer.analyze(frame),
         move |frame: &mut RgbFrame, camera| {
-            renderer.render(frame, camera);
+            renderer.render_checked(frame, camera)?;
             pb_render.tick();
+            Ok(())
         },
+        ProcessingMode::Balanced,
         |_, _| {},
     )
     .context("fancam transcode failed")?;
@@ -359,21 +367,21 @@ fn cmd_inspect_identity(
         // Load the reference image and detect a face in it
         let ref_rgb = load_reference_as_rgb_frame(&bias)?;
         let ref_faces = fd.detect(&ref_rgb)?;
-        if ref_faces.is_empty() {
-            println!(" ⚠ no face detected in reference image, using full image as fallback");
-            FaceIdentifier::load(&face_model, &bias, threshold.clamp(0.0, 1.0)).with_context(
-                || format!("failed to load ArcFace model: {}", face_model.display()),
-            )?
-        } else {
-            let best_face = ref_faces
-                .into_iter()
-                .max_by(|a, b| {
-                    a.confidence
-                        .partial_cmp(&b.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap();
+        if let Some(best_face) = ref_faces.into_iter().max_by(|a, b| {
+            a.confidence
+                .partial_cmp(&b.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            let cropped_reference = crop_face_from_frame(&ref_rgb, &best_face)?;
             println!(" ✓ face detected (conf={:.2})", best_face.confidence);
+            FaceIdentifier::load_from_rgb_image(
+                &face_model,
+                &cropped_reference,
+                threshold.clamp(0.0, 1.0),
+            )
+            .with_context(|| format!("failed to load ArcFace model: {}", face_model.display()))?
+        } else {
+            println!(" ⚠ no face detected in reference image, using full image as fallback");
             FaceIdentifier::load(&face_model, &bias, threshold.clamp(0.0, 1.0)).with_context(
                 || format!("failed to load ArcFace model: {}", face_model.display()),
             )?
@@ -582,20 +590,35 @@ fn load_reference_as_rgb_frame(path: &Path) -> Result<RgbFrame> {
 }
 
 /// Crop a face region from a frame based on a FaceBox (expands slightly around the bbox).
-#[allow(dead_code)]
 fn crop_face_from_frame(
     frame: &RgbFrame,
     face_box: &fancam_core::face::FaceBox,
-) -> Result<RgbFrame> {
+) -> Result<image::RgbImage> {
+    frame
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid reference frame: {e}"))?;
     let margin = 0.20; // expand 20% around face bbox for context
     let bw = face_box.bbox.width();
     let bh = face_box.bbox.height();
-    let x1 = (face_box.bbox.x1 - bw * margin).max(0.0) as u32;
-    let y1 = (face_box.bbox.y1 - bh * margin).max(0.0) as u32;
-    let x2 = (face_box.bbox.x2 + bw * margin).min(frame.width as f32) as u32;
-    let y2 = (face_box.bbox.y2 + bh * margin).min(frame.height as f32) as u32;
-    let cw = (x2 - x1).max(1);
-    let ch = (y2 - y1).max(1);
+    if !bw.is_finite() || !bh.is_finite() || bw <= 0.0 || bh <= 0.0 {
+        return Err(anyhow::anyhow!(
+            "face detection returned an invalid bounding box"
+        ));
+    }
+    let x1 = (face_box.bbox.x1 - bw * margin)
+        .floor()
+        .clamp(0.0, frame.width.saturating_sub(1) as f32) as u32;
+    let y1 = (face_box.bbox.y1 - bh * margin)
+        .floor()
+        .clamp(0.0, frame.height.saturating_sub(1) as f32) as u32;
+    let x2 = (face_box.bbox.x2 + bw * margin)
+        .ceil()
+        .clamp((x1 + 1) as f32, frame.width as f32) as u32;
+    let y2 = (face_box.bbox.y2 + bh * margin)
+        .ceil()
+        .clamp((y1 + 1) as f32, frame.height as f32) as u32;
+    let cw = x2 - x1;
+    let ch = y2 - y1;
 
     let src_stride = (frame.width * 3) as usize;
     let dst_stride = (cw * 3) as usize;
@@ -606,12 +629,8 @@ fn crop_face_from_frame(
         let len = dst_stride.min(frame.data.len().saturating_sub(src_start));
         data[dst_start..dst_start + len].copy_from_slice(&frame.data[src_start..src_start + len]);
     }
-    Ok(RgbFrame {
-        data,
-        width: cw,
-        height: ch,
-        pts: frame.pts,
-    })
+    image::RgbImage::from_raw(cw, ch, data)
+        .ok_or_else(|| anyhow::anyhow!("cropped face buffer size mismatch"))
 }
 
 fn validate_reference_image(path: &Path) -> Option<String> {
@@ -883,11 +902,10 @@ fn human_size(bytes: u64) -> String {
 
 fn spinner(msg: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
+    let style = ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner())
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+    pb.set_style(style);
     pb.set_message(msg.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
     pb

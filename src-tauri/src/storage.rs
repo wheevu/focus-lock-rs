@@ -1,8 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 pub const SCHEMA_VERSION: i64 = 5;
+
+static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct ScanSessionRow {
@@ -96,28 +102,161 @@ pub struct StorageMaintenanceResult {
     pub vacuum_ran: bool,
 }
 
-/// Returns the path to the SQLite database for scan sessions.
-/// Uses `.focus-lock/scan_sessions.db` in the current working directory.
-pub fn scan_store_db_path() -> PathBuf {
+/// Initialize the app-data directory and migrate the pre-app-data store once.
+pub fn initialize_app_data_dir(path: PathBuf) -> Result<(), String> {
+    fs::create_dir_all(&path).map_err(|e| format!("failed to create app data directory: {e}"))?;
+    migrate_legacy_store(&path);
+    APP_DATA_DIR
+        .set(path)
+        .map_err(|_| "app data directory was already initialized".to_string())
+}
+
+fn legacy_store_root() -> PathBuf {
     let mut base = std::env::current_dir().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "Failed to get current dir, using fallback");
+        tracing::warn!(error = %e, "failed to get current dir, using fallback");
         PathBuf::from(".")
     });
     base.push(".focus-lock");
-    base.push("scan_sessions.db");
     base
 }
 
+fn store_root() -> PathBuf {
+    APP_DATA_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(legacy_store_root)
+}
+
+/// Returns the path to the SQLite database for scan sessions.
+/// Uses the platform app-data directory after Tauri startup, with the legacy
+/// working-directory path retained for library tests and pre-startup callers.
+pub fn scan_store_db_path() -> PathBuf {
+    store_root().join("scan_sessions.db")
+}
+
 /// Returns the path to the legacy JSON storage file.
-/// Uses `.focus-lock/scan_sessions.json` in the current working directory.
+/// The file is kept in app data for compatibility with the original JSON
+/// fallback format.
 pub fn scan_store_json_path() -> PathBuf {
-    let mut base = std::env::current_dir().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "Failed to get current dir, using fallback");
-        PathBuf::from(".")
-    });
-    base.push(".focus-lock");
-    base.push("scan_sessions.json");
-    base
+    store_root().join("scan_sessions.json")
+}
+
+/// Returns the directory used for exported diagnostics bundles.
+pub fn diagnostics_dir_path() -> PathBuf {
+    store_root().join("diagnostics")
+}
+
+fn migrate_legacy_store(app_data_dir: &Path) {
+    let legacy_dir = legacy_store_root();
+    if legacy_dir == app_data_dir || !legacy_dir.is_dir() {
+        return;
+    }
+
+    let legacy_db = legacy_dir.join("scan_sessions.db");
+    let app_db = app_data_dir.join("scan_sessions.db");
+    if legacy_db.is_file() && !app_db.exists() {
+        match copy_validated(&legacy_db, &app_db, |path| {
+            let conn = Connection::open(path)
+                .map_err(|e| format!("failed to open migrated sqlite db: {e}"))?;
+            migrate(&conn)?;
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(|e| format!("failed to checkpoint migrated sqlite db: {e}"))
+        }) {
+            Ok(()) => {
+                tracing::info!(from = %legacy_db.display(), to = %app_db.display(), "migrated scan database to app data")
+            }
+            Err(error) => tracing::warn!(%error, "skipping invalid legacy scan database"),
+        }
+    }
+
+    let legacy_json = legacy_dir.join("scan_sessions.json");
+    let app_json = app_data_dir.join("scan_sessions.json");
+    if legacy_json.is_file() && !app_json.exists() {
+        match copy_validated(&legacy_json, &app_json, |path| {
+            let bytes = fs::read(path).map_err(|e| format!("failed to read migrated JSON: {e}"))?;
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map(|_| ())
+                .map_err(|e| format!("invalid legacy scan JSON: {e}"))
+        }) {
+            Ok(()) => {
+                tracing::info!(from = %legacy_json.display(), to = %app_json.display(), "migrated scan JSON to app data")
+            }
+            Err(error) => tracing::warn!(%error, "skipping invalid legacy scan JSON"),
+        }
+    }
+
+    let legacy_diagnostics = legacy_dir.join("diagnostics");
+    if let Ok(entries) = fs::read_dir(&legacy_diagnostics) {
+        let target_dir = app_data_dir.join("diagnostics");
+        for entry in entries.flatten() {
+            let source = entry.path();
+            if source.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = source.file_name() else {
+                continue;
+            };
+            let target = target_dir.join(name);
+            if target.exists() {
+                continue;
+            }
+            match copy_validated(&source, &target, |path| {
+                let bytes = fs::read(path)
+                    .map_err(|e| format!("failed to read migrated diagnostics: {e}"))?;
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map(|_| ())
+                    .map_err(|e| format!("invalid diagnostics JSON: {e}"))
+            }) {
+                Ok(()) => {
+                    tracing::info!(from = %source.display(), to = %target.display(), "migrated diagnostics bundle to app data")
+                }
+                Err(error) => {
+                    tracing::warn!(%error, path = %source.display(), "skipping invalid diagnostics bundle")
+                }
+            }
+        }
+    }
+}
+
+fn copy_validated<F>(source: &Path, target: &Path, validate: F) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    let parent = target
+        .parent()
+        .ok_or_else(|| "migration target has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| format!("failed to create migration directory: {e}"))?;
+    let temporary = target.with_extension("migrating");
+    let _ = fs::remove_file(&temporary);
+    remove_sqlite_sidecars(&temporary);
+    fs::copy(source, &temporary).map_err(|e| format!("failed to copy legacy data: {e}"))?;
+    for suffix in ["-wal", "-shm"] {
+        let source_sidecar = PathBuf::from(format!("{}{}", source.display(), suffix));
+        if source_sidecar.is_file() {
+            let temporary_sidecar = PathBuf::from(format!("{}{}", temporary.display(), suffix));
+            if let Err(error) = fs::copy(&source_sidecar, &temporary_sidecar) {
+                let _ = fs::remove_file(&temporary);
+                remove_sqlite_sidecars(&temporary);
+                return Err(format!("failed to copy legacy sqlite sidecar: {error}"));
+            }
+        }
+    }
+    if let Err(error) = validate(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        remove_sqlite_sidecars(&temporary);
+        return Err(error);
+    }
+    remove_sqlite_sidecars(&temporary);
+    fs::rename(&temporary, target).map_err(|e| {
+        let _ = fs::remove_file(&temporary);
+        remove_sqlite_sidecars(&temporary);
+        format!("failed to commit migrated data: {e}")
+    })
+}
+
+fn remove_sqlite_sidecars(path: &Path) {
+    let _ = fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
+    let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
 }
 
 pub fn load_scan_rows(db_path: &Path) -> Result<Option<ScanStoreRows>, String> {
@@ -371,8 +510,9 @@ pub fn save_scan_review_state(
         .map_err(|e| format!("failed to start sqlite transaction: {e}"))?;
     upsert_next_id(&tx, next_id)?;
 
-    tx.execute(
-        "UPDATE scan_sessions
+    let changed = tx
+        .execute(
+            "UPDATE scan_sessions
          SET status = ?2,
              expected_count = ?3,
              review_ready = ?4,
@@ -388,25 +528,28 @@ pub fn save_scan_review_state(
              pending_split_count = ?14,
              last_blockers_json = ?15
          WHERE scan_id = ?1",
-        params![
-            review.scan_id,
-            review.status,
-            review.expected_count,
-            if review.review_ready { 1_i64 } else { 0_i64 },
-            review.selected_identity_id,
-            review.selected_anchor_x,
-            review.selected_anchor_y,
-            review.validated_threshold,
-            review.updated_at_ms,
-            review.excluded_identity_ids_json,
-            review.accepted_low_confidence_ids_json,
-            review.resolved_duplicate_keys_json,
-            review.pending_split_ids_json,
-            review.pending_split_count,
-            review.last_blockers_json,
-        ],
-    )
-    .map_err(|e| format!("failed to update scan review state: {e}"))?;
+            params![
+                review.scan_id,
+                review.status,
+                review.expected_count,
+                if review.review_ready { 1_i64 } else { 0_i64 },
+                review.selected_identity_id,
+                review.selected_anchor_x,
+                review.selected_anchor_y,
+                review.validated_threshold,
+                review.updated_at_ms,
+                review.excluded_identity_ids_json,
+                review.accepted_low_confidence_ids_json,
+                review.resolved_duplicate_keys_json,
+                review.pending_split_ids_json,
+                review.pending_split_count,
+                review.last_blockers_json,
+            ],
+        )
+        .map_err(|e| format!("failed to update scan review state: {e}"))?;
+    if changed != 1 {
+        return Err(format!("scan review session not found: {}", review.scan_id));
+    }
 
     tx.execute(
         "DELETE FROM scan_session_events WHERE scan_id = ?1",
@@ -748,12 +891,19 @@ fn open_db(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("failed to create db dir: {e}"))?;
     }
-    Connection::open(path).map_err(|e| format!("failed to open sqlite db: {e}"))
+    let conn = Connection::open(path).map_err(|e| format!("failed to open sqlite db: {e}"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("failed to configure sqlite busy timeout: {e}"))?;
+    Ok(conn)
 }
 
 fn migrate(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("PRAGMA foreign_keys = ON;")
-        .map_err(|e| format!("failed to enable foreign_keys: {e}"))?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;",
+    )
+    .map_err(|e| format!("failed to enable foreign_keys: {e}"))?;
 
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -909,6 +1059,33 @@ mod tests {
     }
 
     #[test]
+    fn migration_copy_preserves_sqlite_wal_data() {
+        let source = temp_db_path("wal-source");
+        let target = temp_db_path("wal-target");
+        {
+            let conn = Connection::open(&source).expect("open source database");
+            conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE wal_data (value TEXT);")
+                .expect("create WAL database");
+            conn.execute("INSERT INTO wal_data (value) VALUES ('kept')", [])
+                .expect("write WAL data");
+            assert!(PathBuf::from(format!("{}-wal", source.display())).is_file());
+            copy_validated(&source, &target, |path| {
+                let conn = Connection::open(path).map_err(|e| e.to_string())?;
+                let value: String = conn
+                    .query_row("SELECT value FROM wal_data", [], |row| row.get(0))
+                    .map_err(|e| e.to_string())?;
+                assert_eq!(value, "kept");
+                Ok(())
+            })
+            .expect("copy WAL database");
+        }
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&target);
+        remove_sqlite_sidecars(&source);
+        remove_sqlite_sidecars(&target);
+    }
+
+    #[test]
     fn maintenance_runs_without_error() {
         let path = temp_db_path("maintenance");
         let rows = ScanStoreRows {
@@ -920,6 +1097,34 @@ mod tests {
         let result =
             run_storage_maintenance(&path, 86_400_000, 50, false).expect("maintenance should work");
         assert_eq!(result.deleted_sessions, 0);
+    }
+
+    #[test]
+    fn review_update_rejects_unknown_session() {
+        let path = temp_db_path("unknown-review");
+        let result = save_scan_review_state(
+            &path,
+            1,
+            &ScanReviewStateRow {
+                scan_id: "missing".to_string(),
+                status: "validated".to_string(),
+                expected_count: None,
+                review_ready: false,
+                selected_identity_id: None,
+                selected_anchor_x: None,
+                selected_anchor_y: None,
+                validated_threshold: None,
+                updated_at_ms: epoch_ms(),
+                excluded_identity_ids_json: "[]".to_string(),
+                accepted_low_confidence_ids_json: "[]".to_string(),
+                resolved_duplicate_keys_json: "[]".to_string(),
+                pending_split_ids_json: "[]".to_string(),
+                pending_split_count: 0,
+                last_blockers_json: "[]".to_string(),
+            },
+            &[],
+        );
+        assert!(result.is_err());
     }
 
     #[test]

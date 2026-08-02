@@ -27,6 +27,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Check FFmpeg toolchain
+        run: |
+          brew install ffmpeg
+          ffmpeg -version | head -n 1
+          ffmpeg -version | grep -Eq '^ffmpeg version 8\.1'
+          pkg-config --exists libavcodec libavformat libavutil libswscale
+
       - name: Format
         run: cargo fmt --all -- --check
 

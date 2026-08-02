@@ -142,6 +142,9 @@ impl FaceDetector {
     ///
     /// Returns an error if preprocessing or inference fails.
     pub fn detect(&mut self, frame: &RgbFrame) -> Result<Vec<FaceBox>> {
+        frame
+            .validate()
+            .map_err(|error| crate::FancamError::invalid_frame(error.to_string()))?;
         self.detect_in_roi(frame, None)
     }
 
@@ -158,6 +161,9 @@ impl FaceDetector {
         person_bbox: BBox,
         expand_margin: f32,
     ) -> Result<Option<FaceBox>> {
+        frame
+            .validate()
+            .map_err(|error| crate::FancamError::invalid_frame(error.to_string()))?;
         // Expand the ROI slightly beyond the person bbox to capture slightly-off boxes.
         let margin_x = person_bbox.width() * expand_margin;
         let margin_y = person_bbox.height() * expand_margin;

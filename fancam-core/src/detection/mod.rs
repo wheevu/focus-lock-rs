@@ -156,7 +156,10 @@ pub struct FaceObservation {
     pub bbox: BBox,
     /// Best cosine similarity against positive target gallery.
     pub similarity: f32,
-    /// Best cosine similarity against negative/impostor gallery.
+    /// Best cosine similarity against the negative/impostor gallery.
+    ///
+    /// When no negative gallery is configured, this mirrors `similarity` so
+    /// the resulting margin is neutral rather than an artificial bonus.
     pub impostor_similarity: f32,
     /// Similarity margin (`similarity - impostor_similarity`).
     pub margin: f32,
@@ -223,6 +226,9 @@ impl Detector {
     ///
     /// Returns an error if inference fails or frame preprocessing fails.
     pub fn detect(&mut self, frame: &RgbFrame) -> Result<Vec<BBox>> {
+        frame
+            .validate()
+            .map_err(|error| crate::FancamError::invalid_frame(error.to_string()))?;
         let max_dim = frame.width.max(frame.height);
         if max_dim > DETECTION_MAX_DIM {
             let scale = DETECTION_MAX_DIM as f32 / max_dim as f32;
@@ -532,6 +538,9 @@ impl FaceEmbedder {
         bboxes: &[BBox],
         min_face_crop_edge: u32,
     ) -> Result<Vec<(BBox, Vec<f32>)>> {
+        frame
+            .validate()
+            .map_err(|error| crate::FancamError::invalid_frame(error.to_string()))?;
         if bboxes.is_empty() {
             return Ok(Vec::new());
         }
@@ -626,9 +635,10 @@ impl FaceIdentifier {
         reference_embedding: Vec<f32>,
         similarity_threshold: f32,
     ) -> Result<Self> {
+        let reference_embedding = l2_normalize(&reference_embedding);
         if reference_embedding.is_empty() {
             return Err(crate::FancamError::invalid_config(
-                "reference embedding is empty",
+                "reference embedding is empty or invalid",
             ));
         }
         let model_path = model_path.as_ref().to_path_buf();
@@ -636,10 +646,10 @@ impl FaceIdentifier {
 
         Ok(Self {
             sessions,
-            target_embeddings: vec![l2_normalize(&reference_embedding)],
+            target_embeddings: vec![reference_embedding],
             negative_embeddings: Vec::new(),
             similarity_threshold,
-            margin_threshold: DEFAULT_IDENTITY_MARGIN_THRESHOLD,
+            margin_threshold: 0.0,
         })
     }
 
@@ -658,12 +668,22 @@ impl FaceIdentifier {
             .into_iter()
             .map(|emb| l2_normalize(&emb))
             .collect();
+        if self.target_embeddings.iter().any(Vec::is_empty) {
+            return Err(crate::FancamError::invalid_config(
+                "target embedding gallery contains an invalid vector",
+            ));
+        }
         self.negative_embeddings = negative_embeddings
             .into_iter()
             .filter(|emb| !emb.is_empty())
             .map(|emb| l2_normalize(&emb))
+            .filter(|emb| !emb.is_empty())
             .collect();
-        self.margin_threshold = margin_threshold.max(0.0);
+        self.margin_threshold = if self.negative_embeddings.is_empty() {
+            0.0
+        } else {
+            margin_threshold.max(0.0)
+        };
         Ok(self)
     }
 
@@ -678,17 +698,32 @@ impl FaceIdentifier {
         reference_image_path: Q,
         similarity_threshold: f32,
     ) -> Result<Self> {
-        let model_path = model_path.as_ref().to_path_buf();
-        let sessions = Self::create_sessions(&model_path, MAX_FACE_CANDIDATES)?;
-
-        // Load and embed the reference image (assumed to be a face crop)
         let ref_img = image::open(&reference_image_path)
             .map_err(|e| {
                 crate::FancamError::image_processing(format!("Failed to open reference image: {e}"))
             })?
             .into_rgb8();
+        Self::load_from_rgb_image(model_path, &ref_img, similarity_threshold)
+    }
 
-        let tensor = preprocess_face(&ref_img)?;
+    /// Load an `ArcFace` model and embed an in-memory RGB reference image.
+    ///
+    /// This is useful when a separate face detector has selected a crop without
+    /// requiring a temporary file on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model cannot be loaded, the reference cannot
+    /// be preprocessed, or inference produces an invalid embedding.
+    pub fn load_from_rgb_image<P: AsRef<Path>>(
+        model_path: P,
+        reference_image: &RgbImage,
+        similarity_threshold: f32,
+    ) -> Result<Self> {
+        let model_path = model_path.as_ref().to_path_buf();
+        let sessions = Self::create_sessions(&model_path, MAX_FACE_CANDIDATES)?;
+
+        let tensor = preprocess_face(reference_image)?;
         let reference_embedding = {
             let mut session = sessions
                 .first()
@@ -705,6 +740,11 @@ impl FaceIdentifier {
             let embedding = extract_first_embedding(&outputs)?;
             l2_normalize(&embedding)
         };
+        if reference_embedding.is_empty() {
+            return Err(crate::FancamError::invalid_config(
+                "ArcFace reference embedding is empty or invalid",
+            ));
+        }
 
         debug!(
             dim = reference_embedding.len(),
@@ -716,7 +756,7 @@ impl FaceIdentifier {
             target_embeddings: vec![reference_embedding],
             negative_embeddings: Vec::new(),
             similarity_threshold,
-            margin_threshold: DEFAULT_IDENTITY_MARGIN_THRESHOLD,
+            margin_threshold: 0.0,
         })
     }
 
@@ -784,6 +824,9 @@ impl FaceIdentifier {
         search_hint: Option<(f32, f32)>,
         max_candidates: usize,
     ) -> Result<Vec<FaceObservation>> {
+        frame
+            .validate()
+            .map_err(|error| crate::FancamError::invalid_frame(error.to_string()))?;
         let mut candidates: Vec<BBox> = persons.to_vec();
         candidates.sort_unstable_by(|a, b| {
             rank_candidate(*b, search_hint)
@@ -821,25 +864,26 @@ impl FaceIdentifier {
                     l2_normalize(&extract_first_embedding(&outputs).ok()?)
                 };
 
-                let similarity = target_gallery
+                let Some(similarity) = target_gallery
                     .iter()
+                    .filter(|target| target.len() == embedding.len())
                     .map(|target| cosine_similarity(&embedding, target))
-                    .fold(f32::NEG_INFINITY, f32::max);
-                if !similarity.is_finite() {
+                    .max_by(f32::total_cmp)
+                else {
                     return None;
-                }
-
-                let impostor_similarity = negative_gallery
-                    .iter()
-                    .map(|neg| cosine_similarity(&embedding, neg))
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let impostor_similarity = if impostor_similarity.is_finite() {
-                    impostor_similarity
-                } else {
-                    -1.0
                 };
 
-                let margin = similarity - impostor_similarity;
+                let (impostor_similarity, margin) = if let Some(impostor_similarity) =
+                    negative_gallery
+                        .iter()
+                        .filter(|negative| negative.len() == embedding.len())
+                        .map(|negative| cosine_similarity(&embedding, negative))
+                        .max_by(f32::total_cmp)
+                {
+                    (impostor_similarity, similarity - impostor_similarity)
+                } else {
+                    (similarity, 0.0)
+                };
                 Some(FaceObservation {
                     bbox,
                     similarity,
@@ -1393,11 +1437,24 @@ fn apply_search_gate(candidates: Vec<BBox>, search_hint: Option<(f32, f32)>) -> 
 // ── Math helpers ─────────────────────────────────────────────────────────────
 
 fn l2_normalize(v: &[f32]) -> Vec<f32> {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+    if v.is_empty() || v.iter().any(|value| !value.is_finite()) {
+        return Vec::new();
+    }
+    let norm_squared = v.iter().map(|x| x * x).sum::<f32>();
+    if !norm_squared.is_finite() || norm_squared <= f32::EPSILON {
+        return Vec::new();
+    }
+    let norm = norm_squared.sqrt();
     v.iter().map(|x| x / norm).collect()
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty()
+        || a.len() != b.len()
+        || a.iter().chain(b.iter()).any(|value| !value.is_finite())
+    {
+        return 0.0;
+    }
     // Assumes both vectors are already L2-normalised.
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
@@ -1540,6 +1597,14 @@ mod tests {
         let near_score = rank_candidate(near, Some((120.0, 150.0)));
         let far_score = rank_candidate(far, Some((120.0, 150.0)));
         assert!(near_score > far_score);
+    }
+
+    #[test]
+    fn invalid_embeddings_are_neutral_and_never_zip_truncated() {
+        assert!(l2_normalize(&[f32::NAN, 1.0]).is_empty());
+        assert!(l2_normalize(&[f32::MAX, f32::MAX]).is_empty());
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0]), 0.0);
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]

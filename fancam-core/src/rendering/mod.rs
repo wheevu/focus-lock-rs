@@ -55,6 +55,14 @@ impl FrameRenderer {
 
     /// Render a 9:16 fancam crop directly into `frame`.
     pub fn crop_fancam_inplace(&mut self, frame: &mut RgbFrame, state: &CameraState) -> Result<()> {
+        frame.validate()?;
+        anyhow::ensure!(
+            state.cx.is_finite()
+                && state.cy.is_finite()
+                && state.half_size.is_finite()
+                && state.half_size > 0.0,
+            "camera state contains invalid coordinates"
+        );
         // Determine crop dimensions in source-frame pixels.
         // We want OUT_WIDTH × OUT_HEIGHT aspect, scaled so it fits the frame.
         let aspect = OUT_WIDTH as f32 / OUT_HEIGHT as f32; // 9/16 ≈ 0.5625
@@ -144,6 +152,7 @@ impl FrameRenderer {
 
     /// Render letterbox passthrough directly into `frame`.
     pub fn letterbox_passthrough_inplace(&mut self, frame: &mut RgbFrame) -> Result<()> {
+        frame.validate()?;
         // Scale uniformly to fit OUT_WIDTH × OUT_HEIGHT, add black bars.
         let src_aspect = frame.width as f32 / frame.height as f32;
         let dst_aspect = OUT_WIDTH as f32 / OUT_HEIGHT as f32;
@@ -216,6 +225,47 @@ impl FrameRenderer {
 impl Default for FrameRenderer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(width: u32, height: u32) -> RgbFrame {
+        RgbFrame {
+            data: vec![0; (width * height * 3) as usize],
+            width,
+            height,
+            pts: 0,
+        }
+    }
+
+    #[test]
+    fn renderer_rejects_invalid_camera_state_without_panicking() {
+        let mut renderer = FrameRenderer::new();
+        let mut input = frame(640, 360);
+        let state = CameraState {
+            cx: 320.0,
+            cy: 180.0,
+            half_size: f32::NAN,
+            source: CameraSource::Observed,
+            miss_count: 0,
+        };
+        assert!(renderer.crop_fancam_inplace(&mut input, &state).is_err());
+        assert_eq!((input.width, input.height), (640, 360));
+    }
+
+    #[test]
+    fn renderer_rejects_invalid_rgb_buffer() {
+        let mut renderer = FrameRenderer::new();
+        let mut input = RgbFrame {
+            data: vec![0; 3],
+            width: 640,
+            height: 360,
+            pts: 0,
+        };
+        assert!(renderer.letterbox_passthrough_inplace(&mut input).is_err());
     }
 }
 

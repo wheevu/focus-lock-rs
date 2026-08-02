@@ -20,10 +20,11 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::{
     codec, encoder, format, frame, media, software::scaling, util::rational::Rational,
 };
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::time::Instant;
@@ -44,6 +45,8 @@ const VIDEO_ANALYZED_QUEUE: usize = 8;
 /// Reusable RGB buffer pool size.
 const VIDEO_BUFFER_POOL: usize = 24;
 
+static TEMP_OUTPUT_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// A single decoded video frame in RGB24 format, along with its presentation
 /// timestamp (in the source stream's time-base units).
 #[derive(Debug, Clone)]
@@ -56,6 +59,25 @@ pub struct RgbFrame {
     pub height: u32,
     /// Presentation timestamp in source stream time-base units.
     pub pts: i64,
+}
+
+impl RgbFrame {
+    /// Validate the packed RGB buffer before it is passed to image processing.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.width > 0, "RGB frame width is zero");
+        anyhow::ensure!(self.height > 0, "RGB frame height is zero");
+        let expected_len = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .context("RGB frame dimensions overflow buffer size")?;
+        anyhow::ensure!(
+            self.data.len() == expected_len,
+            "RGB frame buffer has {} bytes; expected {}",
+            self.data.len(),
+            expected_len
+        );
+        Ok(())
+    }
 }
 
 /// Plain-data audio packet — owns its bytes so it can cross thread boundaries
@@ -86,15 +108,18 @@ where
     F: FnMut(&mut RgbFrame) + Send + 'static,
 {
     let mut frame_fn = frame_fn;
-    transcode_inner(
+    transcode_with_progress_staged_mode_fallible(
         input_path,
         output_path,
         0,
         Arc::new(AtomicBool::new(false)),
         |_frame| None,
-        move |frame, _camera| frame_fn(frame),
-        |_, _| {},
+        move |frame, _camera| {
+            frame_fn(frame);
+            Ok(())
+        },
         ProcessingMode::default(),
+        |_, _| {},
     )
 }
 
@@ -114,15 +139,18 @@ where
     G: FnMut(u64, u64),
 {
     let mut frame_fn = frame_fn;
-    transcode_inner(
+    transcode_with_progress_staged_mode_fallible(
         input_path,
         output_path,
         total,
         Arc::new(AtomicBool::new(false)),
         |_frame| None,
-        move |frame, _camera| frame_fn(frame),
-        progress_fn,
+        move |frame, _camera| {
+            frame_fn(frame);
+            Ok(())
+        },
         ProcessingMode::default(),
+        progress_fn,
     )
 }
 
@@ -161,7 +189,7 @@ pub fn transcode_with_progress_staged_mode<P, Q, A, R, G>(
     total: u64,
     cancel_flag: Arc<AtomicBool>,
     analyze_fn: A,
-    render_fn: R,
+    mut render_fn: R,
     mode: ProcessingMode,
     progress_fn: G,
 ) -> Result<()>
@@ -170,6 +198,42 @@ where
     Q: AsRef<Path>,
     A: FnMut(&RgbFrame) -> Option<CameraState> + Send + 'static,
     R: FnMut(&mut RgbFrame, Option<CameraState>) + Send + 'static,
+    G: FnMut(u64, u64),
+{
+    transcode_with_progress_staged_mode_fallible(
+        input_path,
+        output_path,
+        total,
+        cancel_flag,
+        analyze_fn,
+        move |frame, camera| {
+            render_fn(frame, camera);
+            Ok(())
+        },
+        mode,
+        progress_fn,
+    )
+}
+
+/// Fallible staged variant used by the production pipeline.
+///
+/// Errors returned by `render_fn` stop the worker pipeline and prevent a final
+/// output file from being committed.
+pub fn transcode_with_progress_staged_mode_fallible<P, Q, A, R, G>(
+    input_path: P,
+    output_path: Q,
+    total: u64,
+    cancel_flag: Arc<AtomicBool>,
+    analyze_fn: A,
+    render_fn: R,
+    mode: ProcessingMode,
+    progress_fn: G,
+) -> Result<()>
+where
+    P: AsRef<Path> + Send + 'static,
+    Q: AsRef<Path>,
+    A: FnMut(&RgbFrame) -> Option<CameraState> + Send + 'static,
+    R: FnMut(&mut RgbFrame, Option<CameraState>) -> Result<()> + Send + 'static,
     G: FnMut(u64, u64),
 {
     transcode_inner(
@@ -198,10 +262,13 @@ where
     P: AsRef<Path> + Send + 'static,
     Q: AsRef<Path>,
     A: FnMut(&RgbFrame) -> Option<CameraState> + Send + 'static,
-    R: FnMut(&mut RgbFrame, Option<CameraState>) + Send + 'static,
+    R: FnMut(&mut RgbFrame, Option<CameraState>) -> Result<()> + Send + 'static,
     G: FnMut(u64, u64),
 {
     ffmpeg::init().context("failed to initialise FFmpeg")?;
+    let final_output_path = output_path.as_ref().to_path_buf();
+    let mut temporary_output =
+        TemporaryOutputGuard::new(temporary_output_path(&final_output_path)?);
 
     // ── Probe input (on main thread, before spawning) ─────────────────────────
     let mut ictx = open_input_with_hwaccel(&input_path)?;
@@ -214,7 +281,9 @@ where
 
     let audio_stream_index = ictx.streams().best(media::Type::Audio).map(|s| s.index());
 
-    let input_video_stream = ictx.stream(video_stream_index).unwrap();
+    let input_video_stream = ictx
+        .stream(video_stream_index)
+        .context("video stream disappeared after probing")?;
     let video_time_base = input_video_stream.time_base();
     let frame_rate = input_video_stream.avg_frame_rate();
 
@@ -232,7 +301,7 @@ where
     // Capture stream duration for PTS-based progress when total_frames is 0.
     // Try stream-level first, then format-level (converted to stream time-base).
     let stream_duration_pts: i64 = {
-        let sd = ictx.stream(video_stream_index).unwrap().duration();
+        let sd = input_video_stream.duration();
         if sd > 0 {
             sd
         } else {
@@ -266,7 +335,8 @@ where
     let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(VIDEO_BUFFER_POOL);
 
     // ── Output — lazily initialised on first frame ────────────────────────────
-    let mut octx = format::output(&output_path).context("could not create output context")?;
+    let mut octx =
+        format::output(&temporary_output.path).context("could not create output context")?;
     let global_header = octx
         .format()
         .flags()
@@ -278,7 +348,9 @@ where
     // Pre-create the audio output stream (stream-copy) so stream indices are
     // stable before write_header.
     let audio_out_index: Option<(usize, usize)> = if let Some(ai) = audio_stream_index {
-        let in_stream = ictx.stream(ai).unwrap();
+        let in_stream = ictx
+            .stream(ai)
+            .context("audio stream disappeared after probing")?;
         let mut audio_out = octx.add_stream(codec::Id::None)?;
         audio_out.set_parameters(in_stream.parameters());
         Some((ai, audio_out.index()))
@@ -289,7 +361,10 @@ where
     // audio_out src time-base is needed inside Thread A to fill the struct;
     // dst_time_base is resolved lazily at write time (post write_header).
     let audio_src_tb: Option<(usize, Rational)> = if let Some((ai, _ao)) = audio_out_index {
-        let src_tb = ictx.stream(ai).unwrap().time_base();
+        let src_tb = ictx
+            .stream(ai)
+            .context("audio stream disappeared after probing")?
+            .time_base();
         Some((ai, src_tb))
     } else {
         None
@@ -380,7 +455,9 @@ where
                             // AV_NOPTS_VALUE (i64::MIN) is not a real duration;
                             // treat it as 0 to avoid overflow inside rescale_ts.
                             duration: packet.duration().max(0),
-                            out_stream_index: audio_out_index.unwrap().1,
+                            out_stream_index: audio_out_index
+                                .map(|(_, output_index)| output_index)
+                                .context("audio output stream was not initialized")?,
                             src_time_base: src_tb,
                         };
                         // Ignore send errors — main thread may have exited on
@@ -438,7 +515,10 @@ where
             if render_cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            render_fn(&mut frame, camera);
+            if let Err(err) = render_fn(&mut frame, camera) {
+                render_cancel.store(true, Ordering::Relaxed);
+                return Err(err.context("render callback failed"));
+            }
             video_xfm_tx
                 .send(frame)
                 .map_err(|_| anyhow::anyhow!("video_xfm channel closed"))
@@ -503,7 +583,10 @@ where
         // Resolve the output stream's time-base at write time — it is not
         // finalised until write_header() has been called, so we must NOT
         // capture it earlier (it would be 0/1 and break rescale_ts).
-        let dst_time_base = octx.stream(ap.out_stream_index).unwrap().time_base();
+        let dst_time_base = octx
+            .stream(ap.out_stream_index)
+            .context("audio output stream disappeared")?
+            .time_base();
         let mut pkt = ffmpeg_next::Packet::copy(&ap.data);
         pkt.set_stream(ap.out_stream_index);
         pkt.set_pts(ap.pts);
@@ -517,6 +600,11 @@ where
 
     for mut frame in video_xfm_rx {
         if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(err) = frame.validate() {
+            cancel_flag.store(true, Ordering::Relaxed);
+            pipeline_error = Some(err.context("decoded/transformed RGB frame is invalid"));
             break;
         }
         if let Err(err) = drain_audio(&audio_rx, &mut octx, &mut audio_buffer, header_written) {
@@ -580,7 +668,7 @@ where
             };
 
             info!(out_w, out_h, "output dimensions determined; writing header");
-            format::context::output::dump(&octx, 0, output_path.as_ref().to_str());
+            format::context::output::dump(&octx, 0, temporary_output.path.to_str());
             if let Err(err) = octx.write_header().context("failed to write output header") {
                 cancel_flag.store(true, Ordering::Relaxed);
                 pipeline_error = Some(err);
@@ -617,7 +705,11 @@ where
             });
         }
 
-        let state = enc_state.as_mut().unwrap();
+        let Some(state) = enc_state.as_mut() else {
+            cancel_flag.store(true, Ordering::Relaxed);
+            pipeline_error = Some(anyhow::anyhow!("encoder state was not initialized"));
+            break;
+        };
 
         // Copy transformed RGB data into the output AVFrame (handling stride)
         let out_stride = state.out_rgb_frame.stride(0);
@@ -757,8 +849,77 @@ where
     octx.write_trailer()
         .context("failed to write output trailer")?;
 
+    fs::rename(&temporary_output.path, &final_output_path)
+        .with_context(|| format!("failed to commit output to {}", final_output_path.display()))?;
+    temporary_output.committed = true;
+
     info!(frame_count, "transcode complete");
     Ok(())
+}
+
+struct TemporaryOutputGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TemporaryOutputGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+}
+
+impl Drop for TemporaryOutputGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn temporary_output_path(final_path: &Path) -> Result<PathBuf> {
+    let parent = final_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = final_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let extension = final_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4");
+
+    for _ in 0..100 {
+        let sequence = TEMP_OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{stem}.focus-lock-{}-{sequence}.partial.{extension}",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => {
+                fs::remove_file(&candidate).with_context(|| {
+                    format!("failed to reserve temporary output {}", candidate.display())
+                })?;
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create temporary output {}", candidate.display())
+                });
+            }
+        }
+    }
+
+    anyhow::bail!("could not allocate a unique temporary output path")
 }
 
 fn encoder_options(mode: ProcessingMode) -> ffmpeg_next::Dictionary<'static> {
@@ -795,7 +956,11 @@ fn flush_encoder(
     let mut encoded = ffmpeg_next::Packet::empty();
     while encoder.receive_packet(&mut encoded).is_ok() {
         encoded.set_stream(stream_index);
-        encoded.rescale_ts(time_base, octx.stream(stream_index).unwrap().time_base());
+        let output_time_base = octx
+            .stream(stream_index)
+            .context("video output stream disappeared while flushing encoder")?
+            .time_base();
+        encoded.rescale_ts(time_base, output_time_base);
         encoded
             .write_interleaved(octx)
             .context("failed to write encoded packet")?;
@@ -890,7 +1055,9 @@ where
         .context("no video stream found in input")?
         .index();
 
-    let input_video_stream = ictx.stream(video_stream_index).unwrap();
+    let input_video_stream = ictx
+        .stream(video_stream_index)
+        .context("video stream disappeared after probing")?;
     let decoder_ctx = codec::context::Context::from_parameters(input_video_stream.parameters())
         .context("failed to build decoder context")?;
     let mut decoder = decoder_ctx
@@ -966,4 +1133,43 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgb_frame_validation_rejects_mismatched_buffers() {
+        let frame = RgbFrame {
+            data: vec![0; 5],
+            width: 2,
+            height: 1,
+            pts: 0,
+        };
+        assert!(frame.validate().is_err());
+    }
+
+    #[test]
+    fn temporary_output_names_are_unique_and_cleanup_is_safe() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("focus-lock-video-test-{nonce}"));
+        fs::create_dir_all(&root).expect("create temporary test directory");
+        let final_path = root.join("render.mp4");
+        let first = temporary_output_path(&final_path).expect("allocate first temp path");
+        let second = temporary_output_path(&final_path).expect("allocate second temp path");
+        assert_ne!(first, second);
+
+        fs::write(&first, b"partial").expect("create partial output");
+        {
+            let _guard = TemporaryOutputGuard::new(first.clone());
+        }
+        assert!(!first.exists());
+
+        let _ = fs::remove_file(second);
+        let _ = fs::remove_dir_all(root);
+    }
 }

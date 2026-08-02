@@ -599,16 +599,17 @@ impl Renderer {
         }
     }
 
-    /// Renders a frame based on the camera state.
+    /// Render a frame and return any crop or resize failure to the caller.
     ///
-    /// If `camera` is `Some`, crops to the target position. If `None`, renders
-    /// a letterboxed passthrough.
+    /// # Errors
     ///
-    /// # Arguments
-    ///
-    /// * `frame` - The input frame to modify in-place
-    /// * `camera` - The camera state from the tracker, or `None` if target lost
-    pub fn render(&mut self, frame: &mut RgbFrame, camera: Option<CameraState>) {
+    /// Returns an error when the RGB frame or camera state is invalid, or when
+    /// the requested crop/resize cannot be completed.
+    pub fn render_checked(
+        &mut self,
+        frame: &mut RgbFrame,
+        camera: Option<CameraState>,
+    ) -> Result<()> {
         let render_start = Instant::now();
         let result = match camera {
             Some(ref state) => self.renderer.crop_fancam_inplace(frame, state),
@@ -617,9 +618,7 @@ impl Renderer {
         self.prof_render += render_start.elapsed();
         self.prof_frames += 1;
 
-        if let Err(e) = result {
-            tracing::warn!("render error: {e}");
-        }
+        result?;
 
         if self.prof_frames.is_multiple_of(300) {
             tracing::info!(
@@ -630,6 +629,17 @@ impl Renderer {
                 ),
                 "pipeline render timings"
             );
+        }
+        Ok(())
+    }
+
+    /// Renders a frame based on the camera state.
+    ///
+    /// This compatibility wrapper logs rendering failures. Production callers
+    /// should use [`Self::render_checked`] so failures abort the output job.
+    pub fn render(&mut self, frame: &mut RgbFrame, camera: Option<CameraState>) {
+        if let Err(error) = self.render_checked(frame, camera) {
+            tracing::warn!(%error, "render error");
         }
     }
 }
