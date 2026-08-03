@@ -291,11 +291,11 @@ impl Analyzer {
                     frame.width,
                     frame.height,
                 );
-                if let Some(tracklet_idx) = best_idx {
-                    if let Some(tracklet) = tracklets.get_mut(tracklet_idx) {
-                        tracklet.push(frame_index, bbox, identity);
-                        continue;
-                    }
+                if let Some(tracklet_idx) = best_idx
+                    && let Some(tracklet) = tracklets.get_mut(tracklet_idx)
+                {
+                    tracklet.push(frame_index, bbox, identity);
+                    continue;
                 }
 
                 let mut tracklet = Tracklet::new(next_tracklet_id);
@@ -411,11 +411,11 @@ impl Analyzer {
                     frame.width,
                     frame.height,
                 );
-                if let Some(tracklet_idx) = best_idx {
-                    if let Some(tracklet) = tracklets.get_mut(tracklet_idx) {
-                        tracklet.push(frame_index, bbox, identity);
-                        continue;
-                    }
+                if let Some(tracklet_idx) = best_idx
+                    && let Some(tracklet) = tracklets.get_mut(tracklet_idx)
+                {
+                    tracklet.push(frame_index, bbox, identity);
+                    continue;
                 }
 
                 let mut tracklet = Tracklet::new(next_tracklet_id);

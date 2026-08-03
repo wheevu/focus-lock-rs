@@ -10,10 +10,18 @@
     unused_qualifications
 )]
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -92,7 +100,11 @@ enum Commands {
         face_det_model: Option<PathBuf>,
 
         /// Sample every N frames
-        #[arg(long, default_value_t = 30)]
+        #[arg(
+            long,
+            default_value_t = 30,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
         sample_every: u64,
 
         /// Maximum frames to process
@@ -129,6 +141,10 @@ enum Commands {
         /// Cosine similarity threshold (0–1)
         #[arg(long, default_value_t = 0.6)]
         threshold: f32,
+
+        /// Processing mode: fast, balanced, or quality
+        #[arg(long, value_name = "fast|balanced|quality", default_value = "balanced", value_parser = parse_processing_mode)]
+        mode: ProcessingMode,
     },
 }
 
@@ -165,7 +181,7 @@ fn main() -> Result<()> {
             max_frames,
         } => {
             OrtConfig::ensure_initialized().context("failed to initialize ONNX Runtime")?;
-            cmd_inspect_identity(
+            cmd_inspect_identity(IdentityInspectOptions {
                 video,
                 bias,
                 yolo_model,
@@ -174,7 +190,7 @@ fn main() -> Result<()> {
                 face_det_model,
                 sample_every,
                 max_frames,
-            )
+            })
         }
         Commands::Fancam {
             video,
@@ -184,7 +200,8 @@ fn main() -> Result<()> {
             face_model,
             identity_model,
             threshold,
-        } => cmd_fancam(
+            mode,
+        } => cmd_fancam(FancamOptions {
             video,
             bias,
             output,
@@ -192,8 +209,115 @@ fn main() -> Result<()> {
             face_model,
             identity_model,
             threshold,
-        ),
+            mode,
+        }),
     }
+}
+
+fn parse_processing_mode(value: &str) -> std::result::Result<ProcessingMode, String> {
+    match value {
+        "fast" => Ok(ProcessingMode::Fast),
+        "balanced" => Ok(ProcessingMode::Balanced),
+        "quality" => Ok(ProcessingMode::Quality),
+        _ => Err(format!(
+            "invalid processing mode '{value}'; expected fast, balanced, or quality"
+        )),
+    }
+}
+
+fn validate_fancam_inputs(
+    video: &Path,
+    bias: &Path,
+    output: &Path,
+    yolo_model: &Path,
+    face_model: &Path,
+    identity_model: Option<&Path>,
+    threshold: f32,
+) -> Result<()> {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        bail!("threshold must be a finite number between 0.0 and 1.0");
+    }
+
+    let identity_model = identity_model.unwrap_or(face_model);
+    let sources = [
+        ("video", video),
+        ("bias image", bias),
+        ("YOLO model", yolo_model),
+        ("identity model", identity_model),
+    ];
+    let canonical_sources = sources
+        .into_iter()
+        .map(|(label, path)| canonical_input_file(label, path).map(|canonical| (label, canonical)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let canonical_output = canonical_output_file(output)?;
+    for (label, canonical_source) in canonical_sources {
+        if canonical_source == canonical_output {
+            bail!(
+                "output path {} collides with the {label} at {}",
+                output.display(),
+                canonical_source.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn canonical_input_file(label: &str, path: &Path) -> Result<PathBuf> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("{label} path does not exist: {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} path is not a regular file: {}", path.display());
+    }
+    fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve {label} path: {}", path.display()))
+}
+
+fn canonical_output_file(path: &Path) -> Result<PathBuf> {
+    let file_name = path.file_name().context("output path must name a file")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_metadata = fs::metadata(parent)
+        .with_context(|| format!("output parent does not exist: {}", parent.display()))?;
+    if !parent_metadata.is_dir() {
+        bail!("output parent is not a directory: {}", parent.display());
+    }
+    let canonical_parent = fs::canonicalize(parent)
+        .with_context(|| format!("failed to resolve output parent: {}", parent.display()))?;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("output path must not be a symlink: {}", path.display());
+            }
+            if !metadata.is_file() {
+                bail!("output path is not a regular file: {}", path.display());
+            }
+            fs::canonicalize(path)
+                .with_context(|| format!("failed to resolve output path: {}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(canonical_parent.join(file_name))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect output path: {}", path.display()))
+        }
+    }
+}
+
+fn install_cancellation_handler(cancel_flag: &Arc<AtomicBool>) -> Result<()> {
+    let cancel_flag = Arc::clone(cancel_flag);
+    ctrlc::set_handler(move || {
+        if !cancel_flag.swap(true, Ordering::SeqCst) {
+            eprintln!("Cancellation requested; stopping after the current frame…");
+        } else {
+            eprintln!("Cancellation is already in progress.");
+        }
+    })
+    .context("failed to install Ctrl-C handler")
 }
 
 // ── Phase 2: person detection ─────────────────────────────────────────────────
@@ -226,7 +350,7 @@ fn cmd_detect(input: PathBuf, model: PathBuf, output: PathBuf) -> Result<()> {
 
 // ── Phase 3 + 4: full fancam pipeline ────────────────────────────────────────
 
-fn cmd_fancam(
+struct FancamOptions {
     video: PathBuf,
     bias: PathBuf,
     output: PathBuf,
@@ -234,61 +358,132 @@ fn cmd_fancam(
     face_model: PathBuf,
     identity_model: Option<PathBuf>,
     threshold: f32,
-) -> Result<()> {
+    mode: ProcessingMode,
+}
+
+fn cmd_fancam(options: FancamOptions) -> Result<()> {
+    let FancamOptions {
+        video,
+        bias,
+        output,
+        yolo_model,
+        face_model,
+        identity_model,
+        threshold,
+        mode,
+    } = options;
+    validate_fancam_inputs(
+        &video,
+        &bias,
+        &output,
+        &yolo_model,
+        &face_model,
+        identity_model.as_deref(),
+        threshold,
+    )?;
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    install_cancellation_handler(&cancel_flag)?;
+    OrtConfig::ensure_initialized().context("failed to initialize ONNX Runtime")?;
+
     info!("Fancam pipeline");
     info!("  video      : {}", video.display());
     info!("  bias image : {}", bias.display());
     info!("  output     : {}", output.display());
+    info!("  mode       : {}", mode.as_str());
 
     let identity_model = identity_model.unwrap_or(face_model);
 
-    let pipeline = Pipeline::load(
-        &yolo_model,
-        &identity_model,
-        &bias,
-        threshold.clamp(0.0, 1.0),
-    )
-    .with_context(|| {
-        format!(
-            "failed to load models or embed reference: {}",
-            bias.display()
-        )
-    })?;
+    let pipeline =
+        Pipeline::load_with_hint_mode(&yolo_model, &identity_model, &bias, threshold, None, mode)
+            .with_context(|| {
+            format!(
+                "failed to load models or embed reference: {}",
+                bias.display()
+            )
+        })?;
 
-    let pb = spinner("Building offline prepass…");
-    let pb_prepass = pb.clone();
-    let (mut analyzer, mut renderer) = pipeline
+    let total = total_frames(&video);
+    let prepass_pb = frame_progress(total, "Prepass");
+    let prepass_pb_for_hook = prepass_pb.clone();
+    let cancel_prepass = Arc::clone(&cancel_flag);
+    let offline_parts = pipeline
         .into_parts_with_offline_solution_with_hooks(
             &video,
-            |_| {
-                pb_prepass.tick();
+            move |progress| {
+                if total > 0 {
+                    prepass_pb_for_hook.set_position(progress.decoded_frames.min(total));
+                    prepass_pb_for_hook
+                        .set_message(format!("Prepass: {} sampled", progress.sampled_frames));
+                } else {
+                    prepass_pb_for_hook.set_message(format!(
+                        "Prepass: {} decoded, {} sampled",
+                        progress.decoded_frames, progress.sampled_frames
+                    ));
+                }
+                prepass_pb_for_hook.tick();
             },
-            || false,
+            move || cancel_prepass.load(Ordering::Relaxed),
         )
-        .context("failed to build offline tracklet/camera solution")?;
+        .context("failed to build offline tracklet/camera solution");
+    let (mut analyzer, mut renderer) = match offline_parts {
+        Ok(parts) => {
+            prepass_pb.finish_with_message("Prepass complete.");
+            parts
+        }
+        Err(error) => {
+            prepass_pb.abandon_with_message(if cancel_flag.load(Ordering::Relaxed) {
+                "Prepass cancelled."
+            } else {
+                "Prepass failed."
+            });
+            return Err(error);
+        }
+    };
 
-    pb.set_message("Generating fancam…".to_string());
-    let pb_render = pb.clone();
-    let total = total_frames(&video);
+    let render_pb = frame_progress(total, "Render");
+    let render_pb_for_progress = render_pb.clone();
+    let cancel_render = Arc::clone(&cancel_flag);
 
-    transcode_with_progress_staged_mode_fallible(
+    let transcode_result = transcode_with_progress_staged_mode_fallible(
         video,
         &output,
         total,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_render,
         move |frame| analyzer.analyze(frame),
         move |frame: &mut RgbFrame, camera| {
             renderer.render_checked(frame, camera)?;
-            pb_render.tick();
             Ok(())
         },
-        ProcessingMode::Balanced,
-        |_, _| {},
-    )
-    .context("fancam transcode failed")?;
+        mode,
+        move |current, reported_total| {
+            if total > 0 {
+                render_pb_for_progress.set_position(current.min(total));
+                render_pb_for_progress.set_message(format!("Render: {current}/{total} frames"));
+            } else if reported_total > 0 {
+                render_pb_for_progress
+                    .set_message(format!("Render: {current}/{reported_total} frames"));
+            } else {
+                render_pb_for_progress.set_message(format!("Render: {current} frames"));
+            }
+            render_pb_for_progress.tick();
+        },
+    );
 
-    pb.finish_with_message("Fancam saved.");
-    Ok(())
+    match transcode_result {
+        Ok(()) => {
+            render_pb.finish_with_message("Fancam saved.");
+            Ok(())
+        }
+        Err(error) => {
+            render_pb.abandon_with_message(if cancel_flag.load(Ordering::Relaxed) {
+                "Fancam cancelled."
+            } else {
+                "Fancam failed."
+            });
+            Err(error).context("fancam transcode failed")
+        }
+    }
 }
 
 // ── Identity inspection ───────────────────────────────────────────────────────
@@ -321,7 +516,7 @@ enum ScoringMode {
     NoScore,
 }
 
-fn cmd_inspect_identity(
+struct IdentityInspectOptions {
     video: PathBuf,
     bias: PathBuf,
     yolo_model: PathBuf,
@@ -330,7 +525,25 @@ fn cmd_inspect_identity(
     face_det_model: Option<PathBuf>,
     sample_every: u64,
     max_frames: u64,
-) -> Result<()> {
+}
+
+fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
+    let IdentityInspectOptions {
+        video,
+        bias,
+        yolo_model,
+        face_model,
+        threshold,
+        face_det_model,
+        sample_every,
+        max_frames,
+    } = options;
+    if sample_every == 0 {
+        bail!("sample_every must be greater than zero");
+    }
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        bail!("threshold must be a finite number between 0.0 and 1.0");
+    }
     println!("═══ Identity Inspection ═══\n");
 
     // Validate reference image
@@ -436,7 +649,7 @@ fn cmd_inspect_identity(
         }
         summary.frames_decoded += 1;
 
-        if (summary.frames_decoded - 1) % sample_every != 0 {
+        if !(summary.frames_decoded - 1).is_multiple_of(sample_every) {
             return Ok(false);
         }
         summary.frames_sampled += 1;
@@ -845,7 +1058,7 @@ fn cmd_doctor() -> Result<()> {
         let path = Path::new(rel_path);
         let mark = if path.is_file() { "✓" } else { "✗" };
         let size = if path.is_file() {
-            match std::fs::metadata(path) {
+            match fs::metadata(path) {
                 Ok(m) => format!(" ({})", human_size(m.len())),
                 Err(_) => String::new(),
             }
@@ -860,7 +1073,7 @@ fn cmd_doctor() -> Result<()> {
     // 6. Output directory
     println!("[6/6] Output directory");
     let cwd = std::env::current_dir().unwrap_or_default();
-    let writable = std::fs::metadata(&cwd).is_ok_and(|m| !m.permissions().readonly());
+    let writable = fs::metadata(&cwd).is_ok_and(|m| !m.permissions().readonly());
     if writable {
         println!("  ✓ current directory writable: {}", cwd.display());
     } else {
@@ -907,6 +1120,215 @@ fn spinner(msg: &str) -> ProgressBar {
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
     pb.set_style(style);
     pb.set_message(msg.to_string());
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb.enable_steady_tick(Duration::from_millis(80));
     pb
+}
+
+fn frame_progress(total: u64, phase: &str) -> ProgressBar {
+    if total == 0 {
+        return spinner(phase);
+    }
+
+    let pb = ProgressBar::new(total);
+    let style = ProgressStyle::with_template(
+        "{bar:40.cyan/blue} {pos}/{len} frames {msg} [{elapsed_precise}]",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar());
+    pb.set_style(style);
+    pb.set_message(phase.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "focus-lock-cli-test-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create temporary test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = TempDir::new();
+        let video = dir.path().join("video.mp4");
+        let bias = dir.path().join("bias.jpg");
+        let yolo_model = dir.path().join("yolo.onnx");
+        let face_model = dir.path().join("face.onnx");
+        for path in [&video, &bias, &yolo_model, &face_model] {
+            fs::write(path, b"fixture").expect("write fixture file");
+        }
+        (dir, video, bias, yolo_model, face_model)
+    }
+
+    #[test]
+    fn processing_mode_parser_accepts_only_documented_values() {
+        assert_eq!(parse_processing_mode("fast"), Ok(ProcessingMode::Fast));
+        assert_eq!(
+            parse_processing_mode("balanced"),
+            Ok(ProcessingMode::Balanced)
+        );
+        assert_eq!(
+            parse_processing_mode("quality"),
+            Ok(ProcessingMode::Quality)
+        );
+        assert!(parse_processing_mode("normal").is_err());
+    }
+
+    #[test]
+    fn fancam_defaults_to_balanced_mode() {
+        let cli = Cli::try_parse_from([
+            "focus-lock",
+            "fancam",
+            "--video",
+            "video.mp4",
+            "--bias",
+            "bias.jpg",
+        ])
+        .expect("parse default Fancam arguments");
+
+        let Commands::Fancam { mode, .. } = cli.command else {
+            panic!("expected Fancam command");
+        };
+        assert_eq!(mode, ProcessingMode::Balanced);
+    }
+
+    #[test]
+    fn inspect_identity_rejects_zero_sample_every() {
+        let error = Cli::try_parse_from([
+            "focus-lock",
+            "inspect-identity",
+            "--video",
+            "video.mp4",
+            "--bias",
+            "bias.jpg",
+            "--sample-every",
+            "0",
+        ])
+        .err()
+        .expect("zero sample stride should be rejected");
+        assert!(error.to_string().contains("sample-every"));
+    }
+
+    #[test]
+    fn preflight_rejects_invalid_thresholds() {
+        assert!(
+            validate_fancam_inputs(
+                Path::new("video.mp4"),
+                Path::new("bias.jpg"),
+                Path::new("fancam.mp4"),
+                Path::new("yolo.onnx"),
+                Path::new("face.onnx"),
+                None,
+                f32::NAN,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_fancam_inputs(
+                Path::new("video.mp4"),
+                Path::new("bias.jpg"),
+                Path::new("fancam.mp4"),
+                Path::new("yolo.onnx"),
+                Path::new("face.onnx"),
+                None,
+                -0.01,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_fancam_inputs(
+                Path::new("video.mp4"),
+                Path::new("bias.jpg"),
+                Path::new("fancam.mp4"),
+                Path::new("yolo.onnx"),
+                Path::new("face.onnx"),
+                None,
+                1.01,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_source_collisions_and_missing_output_parent() {
+        let (_dir, video, bias, yolo_model, face_model) = fixture();
+        assert!(
+            validate_fancam_inputs(&video, &bias, &video, &yolo_model, &face_model, None, 0.6,)
+                .is_err()
+        );
+
+        let missing_video = video
+            .parent()
+            .expect("fixture has a parent")
+            .join("missing.mp4");
+        assert!(
+            validate_fancam_inputs(
+                &missing_video,
+                &bias,
+                &video,
+                &yolo_model,
+                &face_model,
+                None,
+                0.6,
+            )
+            .is_err()
+        );
+
+        let output = video
+            .parent()
+            .expect("fixture has a parent")
+            .join("missing")
+            .join("fancam.mp4");
+        assert!(
+            validate_fancam_inputs(&video, &bias, &output, &yolo_model, &face_model, None, 0.6,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn preflight_allows_overwriting_a_distinct_output_file() {
+        let (dir, video, bias, yolo_model, face_model) = fixture();
+        let output = dir.path().join("fancam.mp4");
+        fs::write(&output, b"previous output").expect("write existing output");
+
+        validate_fancam_inputs(&video, &bias, &output, &yolo_model, &face_model, None, 0.6)
+            .expect("distinct output should be valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_dangling_output_symlinks() {
+        let (dir, video, bias, yolo_model, face_model) = fixture();
+        let output = dir.path().join("fancam.mp4");
+        std::os::unix::fs::symlink(dir.path().join("outside.mp4"), &output)
+            .expect("create dangling output symlink");
+
+        assert!(
+            validate_fancam_inputs(&video, &bias, &output, &yolo_model, &face_model, None, 0.6)
+                .is_err()
+        );
+    }
 }

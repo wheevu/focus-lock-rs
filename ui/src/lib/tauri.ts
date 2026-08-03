@@ -18,6 +18,8 @@ export type CommandName =
   | 'storage_worker_stop'
   | 'storage_worker_status'
   | 'queue_health'
+  | 'queue_dlq_list'
+  | 'queue_dlq_replay'
   | 'enqueue_discovery_job'
   | 'enqueue_split_rescan_job'
   | 'process_next_discovery_job'

@@ -212,19 +212,19 @@ impl OrtConfig {
         }
 
         // Add relative paths from executable location
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                // Search up to 7 parent directories
-                let mut current = Some(exe_dir.to_path_buf());
-                for _ in 0..7 {
-                    if let Some(dir) = current {
-                        for rel_path in Self::RELATIVE_PATHS {
-                            candidates.push(dir.join(rel_path).join(Self::LIB_NAME));
-                        }
-                        current = dir.parent().map(Path::to_path_buf);
-                    } else {
-                        break;
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(exe_dir) = exe.parent()
+        {
+            // Search up to 7 parent directories
+            let mut current = Some(exe_dir.to_path_buf());
+            for _ in 0..7 {
+                if let Some(dir) = current {
+                    for rel_path in Self::RELATIVE_PATHS {
+                        candidates.push(dir.join(rel_path).join(Self::LIB_NAME));
                     }
+                    current = dir.parent().map(Path::to_path_buf);
+                } else {
+                    break;
                 }
             }
         }

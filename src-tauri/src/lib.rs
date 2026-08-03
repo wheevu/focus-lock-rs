@@ -50,6 +50,12 @@ pub struct IdentityScanStore(pub Arc<Mutex<IdentityScanState>>);
 
 pub struct QueueStore(pub Arc<Mutex<queue::QueueRuntime>>);
 
+impl QueueStore {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        Ok(Self(Arc::new(Mutex::new(queue::QueueRuntime::open(path)?))))
+    }
+}
+
 impl Default for QueueStore {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(queue::QueueRuntime::new())))
@@ -155,18 +161,18 @@ pub fn run() {
 
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().map_err(std::io::Error::other)?;
             storage::initialize_app_data_dir(data_dir).map_err(std::io::Error::other)?;
+            let queue_store =
+                QueueStore::open(storage::queue_store_db_path()).map_err(std::io::Error::other)?;
+            app.manage(queue_store);
             Ok(())
         })
         .manage(CancelFlag::default())
         .manage(RenderJobStore::default())
         .manage(ScanJobStore::default())
         .manage(IdentityScanStore::default())
-        .manage(QueueStore::default())
         .manage(QueueWorkerStore::default())
         .manage(StorageWorkerStore::default())
         .invoke_handler(tauri::generate_handler![
@@ -188,6 +194,8 @@ pub fn run() {
             commands::storage_worker_stop,
             commands::storage_worker_status,
             commands::queue_health,
+            commands::queue_dlq_list,
+            commands::queue_dlq_replay,
             commands::enqueue_discovery_job,
             commands::enqueue_split_rescan_job,
             commands::process_next_discovery_job,

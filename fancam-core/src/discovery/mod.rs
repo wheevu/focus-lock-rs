@@ -1073,11 +1073,11 @@ fn assign_observations_to_tracklets(
 
     for obs in observations {
         let best_assignment = best_tracklet_assignment(tracklets, &obs, config);
-        if let Some((idx, appearance_similarity)) = best_assignment {
-            if let Some(tracklet) = tracklets.get_mut(idx) {
-                tracklet.push_observation(obs, frame, appearance_similarity);
-                continue;
-            }
+        if let Some((idx, appearance_similarity)) = best_assignment
+            && let Some(tracklet) = tracklets.get_mut(idx)
+        {
+            tracklet.push_observation(obs, frame, appearance_similarity);
+            continue;
         }
         tracklets.push(ProvisionalTracklet::new(obs, frame));
     }
@@ -1188,7 +1188,7 @@ fn tracklet_to_cluster_seed(tracklet: ProvisionalTracklet) -> Option<ClusterSeed
     let mut preview_sum = 0.0f32;
     let mut preview_observations = 0u32;
 
-    face_rows.sort_unstable_by(|(a, _), (b, _)| a.frame_index.cmp(&b.frame_index));
+    face_rows.sort_unstable_by_key(|(row, _)| row.frame_index);
     let mut centroid = face_rows[0].1.clone();
     let mut confidence_sum = face_rows[0].0.bbox.confidence;
     let mut embedding_sim_sum = 1.0f32;

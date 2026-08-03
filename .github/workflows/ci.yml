@@ -37,10 +37,8 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
-      # Pedantic/nursery lints are enabled in fancam-core; run without -D warnings
-      # so the CI report is visible but existing lint debt does not block PRs.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Check
         run: cargo check --workspace --locked
@@ -73,4 +71,28 @@ jobs:
 
       - name: Build frontend
         run: npm run build
+        working-directory: ui
+
+  desktop-smoke:
+    needs: [rust, frontend]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install FFmpeg
+        run: |
+          brew install ffmpeg
+          pkg-config --exists libavcodec libavformat libavutil libswscale
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Build unsigned macOS app bundle
+        run: npm run tauri:build -- --ci --bundles app
         working-directory: ui

@@ -6,16 +6,6 @@
   "permissions": [
     "core:default",
     "dialog:allow-open",
-    "dialog:allow-save",
-    {
-      "identifier": "shell:allow-open",
-      "allow": ["https://*", "http://*", "file://*"]
-    },
-    {
-      "identifier": "fs:allow-app-read-recursive"
-    },
-    {
-      "identifier": "fs:allow-app-write-recursive"
-    }
+    "dialog:allow-save"
   ]
 }

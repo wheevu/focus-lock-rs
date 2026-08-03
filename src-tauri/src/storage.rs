@@ -6,7 +6,7 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -17,6 +17,7 @@ pub struct ScanSessionRow {
     pub yolo_model: String,
     pub identity_model: String,
     pub status: String,
+    pub processing_mode: String,
     pub expected_count: Option<i64>,
     pub review_ready: bool,
     pub selected_identity_id: Option<i64>,
@@ -88,6 +89,17 @@ pub struct ScanEventQueryRow {
     pub details: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ScanEventQuery<'a> {
+    pub scan_id: &'a str,
+    pub limit: u32,
+    pub offset: u32,
+    pub action_contains: Option<&'a str>,
+    pub since_ms: Option<u64>,
+    pub until_ms: Option<u64>,
+    pub cursor_event_id: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StorageStats {
     pub schema_version: i64,
@@ -132,6 +144,11 @@ fn store_root() -> PathBuf {
 /// working-directory path retained for library tests and pre-startup callers.
 pub fn scan_store_db_path() -> PathBuf {
     store_root().join("scan_sessions.db")
+}
+
+/// Returns the path to the durable discovery/rescan queue database.
+pub fn queue_store_db_path() -> PathBuf {
+    store_root().join("queue.db")
 }
 
 /// Returns the path to the legacy JSON storage file.
@@ -279,7 +296,8 @@ pub fn load_scan_rows(db_path: &Path) -> Result<Option<ScanStoreRows>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT
-               scan_id, video, yolo_model, COALESCE(identity_model, face_model) AS identity_model, status, expected_count,
+               scan_id, video, yolo_model, COALESCE(identity_model, face_model) AS identity_model, status,
+               processing_mode, expected_count,
                review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
                validated_threshold, updated_at_ms, candidates_json, duplicates_json,
                excluded_identity_ids_json, accepted_low_confidence_ids_json,
@@ -297,21 +315,22 @@ pub fn load_scan_rows(db_path: &Path) -> Result<Option<ScanStoreRows>, String> {
                 yolo_model: row.get(2)?,
                 identity_model: row.get(3)?,
                 status: row.get(4)?,
-                expected_count: row.get(5)?,
-                review_ready: row.get::<_, i64>(6)? != 0,
-                selected_identity_id: row.get(7)?,
-                selected_anchor_x: row.get(8)?,
-                selected_anchor_y: row.get(9)?,
-                validated_threshold: row.get(10)?,
-                updated_at_ms: row.get(11)?,
-                candidates_json: row.get(12)?,
-                duplicates_json: row.get(13)?,
-                excluded_identity_ids_json: row.get(14)?,
-                accepted_low_confidence_ids_json: row.get(15)?,
-                resolved_duplicate_keys_json: row.get(16)?,
-                pending_split_ids_json: row.get(17)?,
-                pending_split_count: row.get(18)?,
-                last_blockers_json: row.get(19)?,
+                processing_mode: row.get(5)?,
+                expected_count: row.get(6)?,
+                review_ready: row.get::<_, i64>(7)? != 0,
+                selected_identity_id: row.get(8)?,
+                selected_anchor_x: row.get(9)?,
+                selected_anchor_y: row.get(10)?,
+                validated_threshold: row.get(11)?,
+                updated_at_ms: row.get(12)?,
+                candidates_json: row.get(13)?,
+                duplicates_json: row.get(14)?,
+                excluded_identity_ids_json: row.get(15)?,
+                accepted_low_confidence_ids_json: row.get(16)?,
+                resolved_duplicate_keys_json: row.get(17)?,
+                pending_split_ids_json: row.get(18)?,
+                pending_split_count: row.get(19)?,
+                last_blockers_json: row.get(20)?,
             })
         })
         .map_err(|e| format!("failed to map sessions rows: {e}"))?
@@ -363,13 +382,13 @@ pub fn save_scan_rows(db_path: &Path, rows: &ScanStoreRows) -> Result<(), String
     for session in &rows.sessions {
         tx.execute(
             "INSERT INTO scan_sessions (
-               scan_id, video, yolo_model, face_model, identity_model, status, expected_count,
+               scan_id, video, yolo_model, face_model, identity_model, status, processing_mode, expected_count,
                review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
                validated_threshold, updated_at_ms, candidates_json, duplicates_json,
                excluded_identity_ids_json, accepted_low_confidence_ids_json,
                resolved_duplicate_keys_json, pending_split_ids_json,
                pending_split_count, last_blockers_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 session.scan_id,
                 session.video,
@@ -377,6 +396,7 @@ pub fn save_scan_rows(db_path: &Path, rows: &ScanStoreRows) -> Result<(), String
                 session.identity_model,
                 session.identity_model,
                 session.status,
+                session.processing_mode,
                 session.expected_count,
                 if session.review_ready { 1_i64 } else { 0_i64 },
                 session.selected_identity_id,
@@ -425,19 +445,20 @@ pub fn save_scan_row(
 
     tx.execute(
         "INSERT INTO scan_sessions (
-           scan_id, video, yolo_model, face_model, identity_model, status, expected_count,
+           scan_id, video, yolo_model, face_model, identity_model, status, processing_mode, expected_count,
            review_ready, selected_identity_id, selected_anchor_x, selected_anchor_y,
            validated_threshold, updated_at_ms, candidates_json, duplicates_json,
            excluded_identity_ids_json, accepted_low_confidence_ids_json,
            resolved_duplicate_keys_json, pending_split_ids_json,
            pending_split_count, last_blockers_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
          ON CONFLICT(scan_id) DO UPDATE SET
            video = excluded.video,
             yolo_model = excluded.yolo_model,
             face_model = excluded.face_model,
             identity_model = excluded.identity_model,
             status = excluded.status,
+           processing_mode = excluded.processing_mode,
            expected_count = excluded.expected_count,
            review_ready = excluded.review_ready,
            selected_identity_id = excluded.selected_identity_id,
@@ -460,6 +481,7 @@ pub fn save_scan_row(
             session.identity_model,
             session.identity_model,
             session.status,
+            session.processing_mode,
             session.expected_count,
             if session.review_ready { 1_i64 } else { 0_i64 },
             session.selected_identity_id,
@@ -749,17 +771,11 @@ pub fn query_scan_summaries(
 
 pub fn query_scan_events(
     db_path: &Path,
-    scan_id: &str,
-    limit: u32,
-    offset: u32,
-    action_contains: Option<&str>,
-    since_ms: Option<u64>,
-    until_ms: Option<u64>,
-    cursor_event_id: Option<u64>,
+    query: ScanEventQuery<'_>,
 ) -> Result<Vec<ScanEventQueryRow>, String> {
     let conn = open_db(db_path)?;
     migrate(&conn)?;
-    let action_pattern = action_contains.map(|s| format!("%{}%", s));
+    let action_pattern = query.action_contains.map(|s| format!("%{}%", s));
     let mut stmt = conn
         .prepare(
             "SELECT id, at_ms, action, details
@@ -776,13 +792,13 @@ pub fn query_scan_events(
     let mapped = stmt
         .query_map(
             params![
-                scan_id,
+                query.scan_id,
                 action_pattern,
-                since_ms.map(|v| v as i64),
-                until_ms.map(|v| v as i64),
-                cursor_event_id.map(|v| v as i64),
-                limit as i64,
-                offset as i64
+                query.since_ms.map(|v| v as i64),
+                query.until_ms.map(|v| v as i64),
+                query.cursor_event_id.map(|v| v as i64),
+                query.limit as i64,
+                query.offset as i64
             ],
             |row| {
                 Ok(ScanEventQueryRow {
@@ -1022,6 +1038,27 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("failed to set user_version v5: {e}"))?;
     }
 
+    if version < 6 {
+        let alter_result = conn.execute(
+            "ALTER TABLE scan_sessions ADD COLUMN processing_mode TEXT NOT NULL DEFAULT 'fast'",
+            [],
+        );
+        if let Err(e) = alter_result
+            && !e.to_string().contains("duplicate column name")
+        {
+            return Err(format!("failed migration v6 alter: {e}"));
+        }
+        conn.execute(
+            "UPDATE scan_sessions
+             SET processing_mode = 'fast'
+             WHERE processing_mode IS NULL OR processing_mode NOT IN ('fast', 'balanced', 'quality')",
+            [],
+        )
+        .map_err(|e| format!("failed migration v6 backfill: {e}"))?;
+        conn.execute_batch("PRAGMA user_version = 6;")
+            .map_err(|e| format!("failed to set user_version v6: {e}"))?;
+    }
+
     let final_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|e| format!("failed to re-read sqlite user_version: {e}"))?;
@@ -1140,6 +1177,7 @@ mod tests {
                     yolo_model: "y.onnx".to_string(),
                     identity_model: "f.onnx".to_string(),
                     status: "proposed".to_string(),
+                    processing_mode: "fast".to_string(),
                     expected_count: Some(5),
                     review_ready: false,
                     selected_identity_id: None,
@@ -1162,6 +1200,7 @@ mod tests {
                     yolo_model: "y.onnx".to_string(),
                     identity_model: "f.onnx".to_string(),
                     status: "validated".to_string(),
+                    processing_mode: "balanced".to_string(),
                     expected_count: Some(5),
                     review_ready: true,
                     selected_identity_id: Some(2),
@@ -1201,6 +1240,18 @@ mod tests {
             ],
         };
         save_scan_rows(&path, &rows).expect("save should work");
+        let loaded = load_scan_rows(&path)
+            .expect("load persisted rows")
+            .expect("rows should exist");
+        assert_eq!(
+            loaded
+                .sessions
+                .iter()
+                .find(|session| session.scan_id == "scan-2")
+                .expect("balanced session")
+                .processing_mode,
+            "balanced"
+        );
 
         let all = query_scan_summaries(&path, 10, 0, None, None, None).expect("query summaries");
         assert_eq!(all.len(), 2);
@@ -1225,50 +1276,78 @@ mod tests {
         assert_eq!(only_validated[0].scan_id, "scan-2");
         assert_eq!(only_validated[0].event_count, 3);
 
-        let page = query_scan_events(&path, "scan-2", 2, 0, None, None, None, None)
-            .expect("query events page");
+        let page = query_scan_events(
+            &path,
+            ScanEventQuery {
+                scan_id: "scan-2",
+                limit: 2,
+                offset: 0,
+                action_contains: None,
+                since_ms: None,
+                until_ms: None,
+                cursor_event_id: None,
+            },
+        )
+        .expect("query events page");
         assert_eq!(page.len(), 2);
 
-        let filtered = query_scan_events(&path, "scan-2", 10, 0, Some("b"), None, None, None)
-            .expect("filtered events");
+        let filtered = query_scan_events(
+            &path,
+            ScanEventQuery {
+                scan_id: "scan-2",
+                limit: 10,
+                offset: 0,
+                action_contains: Some("b"),
+                since_ms: None,
+                until_ms: None,
+                cursor_event_id: None,
+            },
+        )
+        .expect("filtered events");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].action, "b");
 
         let since_filtered = query_scan_events(
             &path,
-            "scan-2",
-            10,
-            0,
-            None,
-            Some(now.saturating_sub(1)),
-            None,
-            None,
+            ScanEventQuery {
+                scan_id: "scan-2",
+                limit: 10,
+                offset: 0,
+                action_contains: None,
+                since_ms: Some(now.saturating_sub(1)),
+                until_ms: None,
+                cursor_event_id: None,
+            },
         )
         .expect("since filtered events");
         assert_eq!(since_filtered.len(), 2);
 
         let until_filtered = query_scan_events(
             &path,
-            "scan-2",
-            10,
-            0,
-            None,
-            None,
-            Some(now.saturating_sub(1)),
-            None,
+            ScanEventQuery {
+                scan_id: "scan-2",
+                limit: 10,
+                offset: 0,
+                action_contains: None,
+                since_ms: None,
+                until_ms: Some(now.saturating_sub(1)),
+                cursor_event_id: None,
+            },
         )
         .expect("until filtered events");
         assert_eq!(until_filtered.len(), 2);
 
         let cursor_filtered = query_scan_events(
             &path,
-            "scan-2",
-            10,
-            0,
-            None,
-            None,
-            None,
-            Some(page[page.len() - 1].event_id),
+            ScanEventQuery {
+                scan_id: "scan-2",
+                limit: 10,
+                offset: 0,
+                action_contains: None,
+                since_ms: None,
+                until_ms: None,
+                cursor_event_id: Some(page[page.len() - 1].event_id),
+            },
         )
         .expect("cursor events");
         assert!(!cursor_filtered.is_empty());

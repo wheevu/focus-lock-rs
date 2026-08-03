@@ -36,8 +36,6 @@
 #![cfg_attr(not(test), warn(clippy::expect_used))]
 #![warn(
     clippy::all,
-    clippy::pedantic,
-    clippy::nursery,
     missing_docs,
     rust_2018_idioms,
     unused_qualifications,

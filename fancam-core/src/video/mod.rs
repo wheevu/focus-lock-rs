@@ -27,7 +27,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::{mode::ProcessingMode, tracking::CameraState};
@@ -46,6 +46,37 @@ const VIDEO_ANALYZED_QUEUE: usize = 8;
 const VIDEO_BUFFER_POOL: usize = 24;
 
 static TEMP_OUTPUT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Send to a bounded worker queue without allowing cancellation to strand a
+/// producer behind a full queue.  A downstream worker can fail while the
+/// encoder has already stopped consuming, so every producer must observe the
+/// shared cancellation flag while waiting for capacity.
+fn send_sync_with_cancel<T>(
+    sender: &mpsc::SyncSender<T>,
+    mut value: T,
+    cancel_flag: &AtomicBool,
+    channel_name: &str,
+) -> Result<()> {
+    loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        match sender.try_send(value) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(next_value)) => {
+                value = next_value;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                anyhow::bail!("{channel_name} channel closed");
+            }
+        }
+    }
+}
 
 /// A single decoded video frame in RGB24 format, along with its presentation
 /// timestamp (in the source stream's time-base units).
@@ -419,21 +450,17 @@ where
                 }
 
                 let pts = decoded_frame.pts().unwrap_or(0);
-                video_raw_tx
-                    .send(RgbFrame {
+                send_sync_with_cancel(
+                    &video_raw_tx,
+                    RgbFrame {
                         data: rgb_data,
                         width: src_width,
                         height: src_height,
                         pts,
-                    })
-                    .map_err(|_| anyhow::anyhow!("video_raw channel closed"))
-                    .or_else(|err| {
-                        if decode_cancel.load(Ordering::Relaxed) {
-                            Ok(())
-                        } else {
-                            Err(err)
-                        }
-                    })?;
+                    },
+                    &decode_cancel,
+                    "video_raw",
+                )?;
             }
             Ok(())
         };
@@ -445,27 +472,25 @@ where
             let stream_index = stream.index();
 
             // Route audio packets as plain data structs
-            if let Some((ai, src_tb)) = audio_src_tb {
-                if stream_index == ai {
-                    if let Some(data) = packet.data() {
-                        let ap = AudioPacket {
-                            data: data.to_vec(),
-                            pts: packet.pts(),
-                            dts: packet.dts(),
-                            // AV_NOPTS_VALUE (i64::MIN) is not a real duration;
-                            // treat it as 0 to avoid overflow inside rescale_ts.
-                            duration: packet.duration().max(0),
-                            out_stream_index: audio_out_index
-                                .map(|(_, output_index)| output_index)
-                                .context("audio output stream was not initialized")?,
-                            src_time_base: src_tb,
-                        };
-                        // Ignore send errors — main thread may have exited on
-                        // error; we don't want to mask the real error.
-                        let _ = audio_tx.send(ap);
-                    }
-                    continue;
+            if let Some((ai, src_tb)) = audio_src_tb
+                && stream_index == ai
+            {
+                if let Some(data) = packet.data() {
+                    let ap = AudioPacket {
+                        data: data.to_vec(),
+                        pts: packet.pts(),
+                        dts: packet.dts(),
+                        // AV_NOPTS_VALUE (i64::MIN) is not a real duration;
+                        // treat it as 0 to avoid overflow inside rescale_ts.
+                        duration: packet.duration().max(0),
+                        out_stream_index: audio_out_index
+                            .map(|(_, output_index)| output_index)
+                            .context("audio output stream was not initialized")?,
+                        src_time_base: src_tb,
+                    };
+                    send_sync_with_cancel(&audio_tx, ap, &decode_cancel, "audio")?;
                 }
+                continue;
             }
 
             if stream_index != video_stream_index {
@@ -494,16 +519,12 @@ where
                 return Ok(());
             }
             let camera = analyze_fn(&frame);
-            video_analyzed_tx
-                .send((frame, camera))
-                .map_err(|_| anyhow::anyhow!("video_analyzed channel closed"))
-                .or_else(|err| {
-                    if analyze_cancel.load(Ordering::Relaxed) {
-                        Ok(())
-                    } else {
-                        Err(err)
-                    }
-                })?;
+            send_sync_with_cancel(
+                &video_analyzed_tx,
+                (frame, camera),
+                &analyze_cancel,
+                "video_analyzed",
+            )?;
         }
         Ok(())
     });
@@ -519,16 +540,7 @@ where
                 render_cancel.store(true, Ordering::Relaxed);
                 return Err(err.context("render callback failed"));
             }
-            video_xfm_tx
-                .send(frame)
-                .map_err(|_| anyhow::anyhow!("video_xfm channel closed"))
-                .or_else(|err| {
-                    if render_cancel.load(Ordering::Relaxed) {
-                        Ok(())
-                    } else {
-                        Err(err)
-                    }
-                })?;
+            send_sync_with_cancel(&video_xfm_tx, frame, &render_cancel, "video_xfm")?;
         }
         Ok(())
     });
@@ -1138,6 +1150,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    fn make_media_fixture() -> PathBuf {
+        let nonce = TEMP_OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "focus-lock-media-fixture-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create media fixture directory");
+        let input = root.join("input.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=48000",
+                "-t",
+                "2",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-shortest",
+                input.to_str().expect("fixture path"),
+            ])
+            .status()
+            .expect("ffmpeg must be installed for media integration tests");
+        assert!(status.success(), "ffmpeg fixture generation failed");
+        input
+    }
 
     #[test]
     fn rgb_frame_validation_rejects_mismatched_buffers() {
@@ -1148,6 +1198,110 @@ mod tests {
             pts: 0,
         };
         assert!(frame.validate().is_err());
+    }
+
+    #[test]
+    fn bounded_send_observes_cancellation_while_queue_is_full() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(1_u8).expect("seed the bounded queue");
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel_flag);
+        let (result_sender, result_receiver) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let result = send_sync_with_cancel(&sender, 2_u8, &worker_cancel, "test");
+            let _ = result_sender.send(result);
+        });
+
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+        cancel_flag.store(true, Ordering::Relaxed);
+
+        if let Ok(result) = result_receiver.recv_timeout(Duration::from_secs(1)) {
+            assert!(result.is_ok());
+            worker.join().expect("sender worker should exit");
+        } else {
+            // Release a permanently blocked legacy sender before failing
+            // so a regression does not leave the test process hanging.
+            drop(receiver);
+            worker.join().expect("sender worker should exit");
+            panic!("bounded send did not observe cancellation");
+        }
+    }
+
+    #[test]
+    fn media_pipeline_commits_audio_and_cleans_cancelled_or_failed_outputs() {
+        let input = make_media_fixture();
+        let root = input.parent().expect("fixture parent").to_path_buf();
+        let success = root.join("success.mp4");
+        let progress = Arc::new(std::sync::Mutex::new(0_u64));
+        let progress_counter = Arc::clone(&progress);
+        transcode_with_progress_staged_mode_fallible(
+            input.clone(),
+            success.clone(),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            |_frame| None,
+            |frame, _camera| {
+                frame.data[0] = frame.data[0].saturating_add(1);
+                Ok(())
+            },
+            ProcessingMode::Fast,
+            move |current, _total| {
+                *progress_counter.lock().expect("progress lock") = current;
+            },
+        )
+        .expect("media transcode should succeed");
+        assert!(success.is_file());
+        assert!(*progress.lock().expect("progress lock") > 0);
+
+        let cancelled = root.join("cancelled.mp4");
+        fs::write(&cancelled, b"previous output").expect("seed previous output");
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        assert!(
+            transcode_with_progress_staged_mode_fallible(
+                input.clone(),
+                cancelled.clone(),
+                0,
+                cancel_flag,
+                |_frame| None,
+                |_frame, _camera| Ok(()),
+                ProcessingMode::Fast,
+                |_current, _total| {},
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(&cancelled).expect("previous output"),
+            b"previous output"
+        );
+
+        let failed = root.join("failed.mp4");
+        assert!(
+            transcode_with_progress_staged_mode_fallible(
+                input,
+                failed.clone(),
+                0,
+                Arc::new(AtomicBool::new(false)),
+                |_frame| None,
+                |_frame, _camera| anyhow::bail!("intentional render failure"),
+                ProcessingMode::Fast,
+                |_current, _total| {},
+            )
+            .is_err()
+        );
+        assert!(!failed.exists());
+        assert!(
+            fs::read_dir(&root)
+                .expect("fixture directory")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".partial"))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup media fixture");
     }
 
     #[test]

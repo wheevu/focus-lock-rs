@@ -80,7 +80,7 @@ fn solve_global_assignments(tracklets: &[Tracklet]) -> SolverResult {
         return SolverResult::default();
     }
 
-    stats.sort_unstable_by(|a, b| a.first_frame.cmp(&b.first_frame));
+    stats.sort_unstable_by_key(|stat| stat.first_frame);
 
     let mut clusters = Vec::<IdentityCluster>::new();
     let mut assignments = Vec::<TrackletAssignment>::new();

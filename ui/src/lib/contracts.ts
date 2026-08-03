@@ -61,8 +61,13 @@ export type QueueHealth = {
     discovery: number;
     rescan: number;
     dlq: number;
+    discovery_in_flight: number;
+    rescan_in_flight: number;
   };
   dedupe_keys: number;
+  capacity: number;
+  next_discovery_at_ms?: number | null;
+  next_rescan_at_ms?: number | null;
 };
 
 export type QueueActionResult = {
@@ -79,6 +84,16 @@ export type QueueActionResult = {
   depth?: number;
   remaining_depth?: number;
   processed?: boolean;
+  reason?: string | null;
+};
+
+export type QueueDlqItemSummary = {
+  message_id: string;
+  queue: string;
+  job_id: string;
+  attempt: number;
+  created_at_ms: number;
+  last_error?: string | null;
 };
 
 export type QueueWorkerStatus = {
@@ -113,6 +128,8 @@ export type ReviewDuplicateResolution = { a: number; b: number; keep: number };
 export type ScanSessionDetail = {
   scan_id: string;
   video: string;
+  yolo_model: string;
+  identity_model: string;
   status: ScanSessionStatus;
   expected_count?: number | null;
   processing_mode: string;

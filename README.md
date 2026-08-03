@@ -23,6 +23,7 @@ It features a modular Rust core for video processing, a CLI for batch operations
 - **Smart output** — automatic 1080x1920 crop with fallback handling for occlusion or target loss
 - **Desktop + CLI** — Tauri app for interactive use, CLI for direct batch processing
 - **Safe cancellation** — renders write beside the requested output and replace it only after a complete encode
+- **Durable job queue** — SQLite-backed queue with retries, restart recovery, deduplication, and dead-letter replay
 
 ##  Architecture
 
@@ -106,7 +107,7 @@ cargo run --release -p cli -- fancam \
 Note: render runs a mandatory offline prepass (tracklet build + clustering)
 before final encode, so startup may be slower on long videos.
 
-The desktop app stores scan sessions and exported diagnostics in Tauri's platform app-data directory. On first launch it copies valid data from the old project-local `.focus-lock/` directory and leaves the originals untouched. Queue messages are intentionally in-memory and are not restored after an app restart.
+The desktop app stores scan sessions, exported diagnostics, and durable queue state in Tauri's platform app-data directory. On first launch it copies valid data from the old project-local `.focus-lock/` directory and leaves the originals untouched. Queue messages recover after an app restart; failed messages can be retried or replayed from the dead-letter queue.
 
 ## License
 MIT

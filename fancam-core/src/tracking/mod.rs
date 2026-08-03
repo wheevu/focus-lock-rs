@@ -487,9 +487,7 @@ impl TargetTracker {
         if persons.is_empty() {
             return None;
         }
-        let Some((hx, hy)) = self.search_hint() else {
-            return None;
-        };
+        let (hx, hy) = self.search_hint()?;
 
         let mut ranked = persons
             .iter()
@@ -573,13 +571,13 @@ impl TargetTracker {
             return self.current_camera_with_source(CameraSource::Predicted);
         }
 
-        if let Some(mut held) = self.last_confirmed_camera {
-            if self.frozen_misses < MAX_FROZEN_MISSES {
-                self.frozen_misses = self.frozen_misses.saturating_add(1);
-                held.source = CameraSource::Held;
-                held.miss_count = self.misses;
-                return Some(held);
-            }
+        if let Some(mut held) = self.last_confirmed_camera
+            && self.frozen_misses < MAX_FROZEN_MISSES
+        {
+            self.frozen_misses = self.frozen_misses.saturating_add(1);
+            held.source = CameraSource::Held;
+            held.miss_count = self.misses;
+            return Some(held);
         }
 
         None

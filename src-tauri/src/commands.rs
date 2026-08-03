@@ -32,6 +32,10 @@ use crate::{
 
 static RUN_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
+const MAX_PREVIEW_DIMENSION: u32 = 4096;
+const MAX_PREVIEW_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_PREVIEW_ALLOC: u64 = 64 * 1024 * 1024;
+
 // ─── DTO types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +182,8 @@ pub struct ScanSessionSummary {
 pub struct ScanSessionDetail {
     pub scan_id: String,
     pub video: String,
+    pub yolo_model: String,
+    pub identity_model: String,
     pub status: ScanSessionStatus,
     pub expected_count: Option<u32>,
     pub processing_mode: String,
@@ -289,6 +295,16 @@ pub struct QueuePeekArgs {
 #[derive(Debug, Serialize)]
 pub struct QueuePeekResult {
     pub attempts: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueueDlqListArgs {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueueDlqReplayArgs {
+    pub message_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -494,11 +510,21 @@ pub fn model_dir() -> String {
 }
 
 #[tauri::command]
-pub async fn probe_video(path: String) -> u64 {
-    let p = PathBuf::from(path);
-    task::spawn_blocking(move || total_frames(&p))
-        .await
-        .unwrap_or(0)
+pub async fn probe_video(path: String) -> Result<u64, String> {
+    let path = validate_preview_path(&path)?;
+    task::spawn_blocking(move || {
+        let frames = total_frames(&path);
+        if frames == 0 {
+            Err(format!(
+                "could not determine a video frame count for {}",
+                path.display()
+            ))
+        } else {
+            Ok(frames)
+        }
+    })
+    .await
+    .map_err(|e| format!("video probe task failed: {e}"))?
 }
 
 /// Read an image file and return a small JPEG data-URL suitable for preview.
@@ -506,9 +532,10 @@ pub async fn probe_video(path: String) -> u64 {
 /// read + transcode.  The result fits in an `<img src="...">` attribute.
 #[tauri::command]
 pub async fn read_thumbnail(path: String) -> Result<String, String> {
-    task::spawn_blocking(move || make_thumbnail(&path))
+    let path = validate_preview_path(&path)?;
+    task::spawn_blocking(move || make_thumbnail(&path.to_string_lossy()))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("thumbnail task failed: {e}"))?
 }
 
 /// Guard that marks the active scan job and exposes a per-scan cancel flag.
@@ -773,10 +800,16 @@ fn can_transition_status(from: &ScanSessionStatus, to: &ScanSessionStatus) -> bo
     )
 }
 
-fn set_scan_status(scan: &mut IdentityScanCache, to: ScanSessionStatus) {
-    if can_transition_status(&scan.status, &to) {
-        scan.status = to;
+fn set_scan_status(scan: &mut IdentityScanCache, to: ScanSessionStatus) -> Result<(), String> {
+    if !can_transition_status(&scan.status, &to) {
+        return Err(format!(
+            "invalid scan session transition: {} -> {}",
+            status_to_db(&scan.status),
+            status_to_db(&to)
+        ));
     }
+    scan.status = to;
+    Ok(())
 }
 
 fn status_to_db(status: &ScanSessionStatus) -> &'static str {
@@ -812,6 +845,7 @@ fn scan_to_row(scan_id: &str, scan: &IdentityScanCache) -> Result<storage::ScanS
         yolo_model: scan.yolo_model.clone(),
         identity_model,
         status: status_to_db(&scan.status).to_string(),
+        processing_mode: processing_mode_string(Some(&scan.processing_mode)),
         expected_count: scan.expected_count.map(|v| v as i64),
         review_ready: scan.review_ready,
         selected_identity_id: scan.selected_identity_id.map(|v| v as i64),
@@ -859,7 +893,7 @@ fn row_to_scan(
         yolo_model: row.yolo_model.clone(),
         face_model: row.identity_model.clone(),
         identity_model: Some(row.identity_model.clone()),
-        processing_mode: "fast".to_string(),
+        processing_mode: processing_mode_string(Some(&row.processing_mode)),
         expected_count: row.expected_count.map(|v| v as u32),
         candidates: serde_json::from_str(&row.candidates_json)
             .map_err(|e| format!("failed to deserialize candidates: {e}"))?,
@@ -911,9 +945,27 @@ fn ensure_scan_store_loaded(state: &mut IdentityScanState) {
             }
         }
 
+        let mut recovered_scan = false;
+        for scan in scans.values_mut() {
+            if scan.status == ScanSessionStatus::Tracking {
+                scan.status = ScanSessionStatus::Validated;
+                scan.updated_at_ms = epoch_ms();
+                append_scan_event(
+                    scan,
+                    "tracking_recovered",
+                    "application restarted while tracking; session returned to validated"
+                        .to_string(),
+                );
+                recovered_scan = true;
+            }
+        }
+
         state.next_id = rows.next_id;
         state.scans = scans;
         state.loaded_from_disk = true;
+        if recovered_scan && let Err(error) = persist_scan_store(state) {
+            tracing::warn!(%error, "failed to persist recovered scan sessions");
+        }
         return;
     }
 
@@ -923,7 +975,24 @@ fn ensure_scan_store_loaded(state: &mut IdentityScanState) {
     {
         state.next_id = persisted.next_id;
         state.scans = persisted.scans;
+        let mut recovered_scan = false;
+        for scan in state.scans.values_mut() {
+            if scan.status == ScanSessionStatus::Tracking {
+                scan.status = ScanSessionStatus::Validated;
+                scan.updated_at_ms = epoch_ms();
+                append_scan_event(
+                    scan,
+                    "tracking_recovered",
+                    "application restarted while tracking; session returned to validated"
+                        .to_string(),
+                );
+                recovered_scan = true;
+            }
+        }
         let _ = persist_scan_store(state);
+        if recovered_scan {
+            tracing::info!("recovered interrupted legacy tracking session");
+        }
     }
     state.loaded_from_disk = true;
 }
@@ -996,6 +1065,37 @@ fn delete_scan_entries(scan_ids: &[String]) -> Result<(), String> {
     storage::delete_scan_rows(&storage::scan_store_db_path(), scan_ids)
 }
 
+fn validate_preview_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("preview path is empty".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    let metadata = fs::metadata(&path)
+        .map_err(|e| format!("cannot access preview input {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("preview input is not a file: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn validate_preview_dimensions(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("preview input has an empty frame".to_string());
+    }
+    if width > MAX_PREVIEW_DIMENSION || height > MAX_PREVIEW_DIMENSION {
+        return Err(format!(
+            "preview input exceeds the {}px dimension limit",
+            MAX_PREVIEW_DIMENSION
+        ));
+    }
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > MAX_PREVIEW_PIXELS {
+        return Err("preview input exceeds the pixel limit".to_string());
+    }
+    Ok(())
+}
+
 fn make_thumbnail(path: &str) -> Result<String, String> {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
 
@@ -1007,12 +1107,19 @@ fn make_thumbnail(path: &str) -> Result<String, String> {
     let rgb_image = if is_video {
         extract_video_frame(path).map_err(|e| format!("video frame extraction: {e}"))?
     } else {
-        ImageReader::open(path)
-            .map_err(|e| format!("open image: {e}"))?
+        let mut reader = ImageReader::open(path).map_err(|e| format!("open image: {e}"))?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_PREVIEW_DIMENSION);
+        limits.max_image_height = Some(MAX_PREVIEW_DIMENSION);
+        limits.max_alloc = Some(MAX_PREVIEW_ALLOC);
+        reader.limits(limits);
+        reader
             .decode()
             .map_err(|e| format!("decode image: {e}"))?
             .to_rgb8()
     };
+
+    validate_preview_dimensions(rgb_image.width(), rgb_image.height())?;
 
     // Resize preserving aspect ratio — fit within 280px on the longest edge
     let (src_w, src_h) = (rgb_image.width() as f64, rgb_image.height() as f64);
@@ -1063,6 +1170,8 @@ fn extract_video_frame(path: &str) -> Result<image::RgbImage, String> {
         .decoder()
         .video()
         .map_err(|e| format!("decoder: {e}"))?;
+
+    validate_preview_dimensions(decoder.width(), decoder.height())?;
 
     let mut scaler = scaling::Context::get(
         decoder.format(),
@@ -1374,7 +1483,9 @@ fn fraction(current: u64, total: u64) -> f64 {
 }
 
 fn processing_mode_from_option(value: Option<&str>) -> ProcessingMode {
-    value.and_then(ProcessingMode::from_str).unwrap_or_default()
+    value
+        .and_then(|value| value.parse::<ProcessingMode>().ok())
+        .unwrap_or_default()
 }
 
 fn processing_mode_string(value: Option<&str>) -> String {
@@ -1445,14 +1556,16 @@ struct ReviewComputation {
     pending_split_ids: Vec<usize>,
 }
 
-fn normalize_review_duplicates(
-    resolved_duplicates: &[ReviewDuplicateResolution],
-) -> (
+type ReviewDuplicateNormalization = (
     Vec<ReviewDuplicateResolution>,
     HashSet<(usize, usize)>,
     HashSet<usize>,
     usize,
-) {
+);
+
+fn normalize_review_duplicates(
+    resolved_duplicates: &[ReviewDuplicateResolution],
+) -> ReviewDuplicateNormalization {
     let mut normalized = Vec::with_capacity(resolved_duplicates.len());
     let mut resolved_pairs = HashSet::<(usize, usize)>::new();
     let mut forced_excluded = HashSet::<usize>::new();
@@ -1621,7 +1734,11 @@ fn compute_review(
     }
 }
 
-fn apply_review_to_scan(scan: &mut IdentityScanCache, review: &ReviewComputation, threshold: f32) {
+fn apply_review_to_scan(
+    scan: &mut IdentityScanCache,
+    review: &ReviewComputation,
+    threshold: f32,
+) -> Result<(), String> {
     scan.expected_count = review.expected_count;
     scan.review_ready = review.ready;
     scan.selected_identity_id = review.selected_identity_id;
@@ -1641,7 +1758,7 @@ fn apply_review_to_scan(scan: &mut IdentityScanCache, review: &ReviewComputation
         } else {
             ScanSessionStatus::Proposed
         },
-    );
+    )
 }
 
 fn build_runtime_embedding_galleries(
@@ -1702,7 +1819,7 @@ fn build_runtime_body_reid_gallery(scan: &IdentityScanCache, selected_id: usize)
         .collect::<Vec<_>>();
 
     if !gallery.is_empty() {
-        gallery.sort_by(|a, b| b.len().cmp(&a.len()));
+        gallery.sort_by_key(|embedding| std::cmp::Reverse(embedding.len()));
         gallery.truncate(6);
     }
 
@@ -1784,7 +1901,7 @@ pub fn list_identity_scans(
             updated_at_ms: scan.updated_at_ms,
         })
         .collect::<Vec<_>>();
-    rows.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at_ms));
     Ok(rows)
 }
 
@@ -1808,6 +1925,13 @@ pub fn get_identity_scan(
     Ok(ScanSessionDetail {
         scan_id,
         video: scan.video.clone(),
+        yolo_model: scan.yolo_model.clone(),
+        identity_model: scan
+            .identity_model
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&scan.face_model)
+            .to_string(),
         status: scan.status.clone(),
         expected_count: scan.expected_count,
         processing_mode: scan.processing_mode.clone(),
@@ -1925,13 +2049,15 @@ pub fn query_scan_events(args: QueryScanEventsArgs) -> Result<QueryScanEventsRes
         .filter(|s| !s.is_empty());
     let rows = storage::query_scan_events(
         &storage::scan_store_db_path(),
-        &args.scan_id,
-        limit,
-        offset,
-        action_contains,
-        args.since_ms,
-        args.until_ms,
-        args.cursor_event_id,
+        storage::ScanEventQuery {
+            scan_id: &args.scan_id,
+            limit,
+            offset,
+            action_contains,
+            since_ms: args.since_ms,
+            until_ms: args.until_ms,
+            cursor_event_id: args.cursor_event_id,
+        },
     )?
     .into_iter()
     .collect::<Vec<_>>();
@@ -2278,6 +2404,31 @@ pub fn queue_health(state: State<'_, QueueStore>) -> Result<queue::QueueHealth, 
 }
 
 #[tauri::command]
+pub fn queue_dlq_list(
+    state: State<'_, QueueStore>,
+    args: Option<QueueDlqListArgs>,
+) -> Result<Vec<queue::QueueDlqItemSummary>, String> {
+    let limit = args
+        .and_then(|value| value.limit)
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    lock.list_dlq(limit)
+}
+
+#[tauri::command]
+pub fn queue_dlq_replay(
+    state: State<'_, QueueStore>,
+    args: QueueDlqReplayArgs,
+) -> Result<queue::QueueReplayResult, String> {
+    if args.message_id.trim().is_empty() {
+        return Err("message_id is required".to_string());
+    }
+    let mut lock = state.0.lock().map_err(|e| e.to_string())?;
+    lock.replay_dlq(args.message_id.trim())
+}
+
+#[tauri::command]
 pub fn enqueue_discovery_job(
     state: State<'_, QueueStore>,
     args: EnqueueDiscoveryJobArgs,
@@ -2360,8 +2511,9 @@ pub fn enqueue_split_rescan_job(
         yolo_model: scan_snapshot.1,
         identity_model: scan_snapshot.2,
         split_identity_ids: scan_snapshot.3,
-        processing_mode: sanitize_processing_mode(args.processing_mode.as_deref())
-            .or(scan_snapshot.5),
+        // A persisted scan owns its processing mode; do not let a stale UI
+        // payload change the mode of an existing session.
+        processing_mode: scan_snapshot.5,
     };
 
     let enqueue_result = {
@@ -2369,10 +2521,14 @@ pub fn enqueue_split_rescan_job(
         q.enqueue_rescan(payload, idempotency_key)?
     };
 
+    if !enqueue_result.accepted {
+        return Ok(enqueue_result);
+    }
+
     if let Ok(mut scans) = scan_state.0.lock() {
         ensure_scan_store_loaded(&mut scans);
         if let Some(scan) = scans.scans.get_mut(&scan_id) {
-            set_scan_status(scan, ScanSessionStatus::Proposed);
+            set_scan_status(scan, ScanSessionStatus::Proposed)?;
             scan.updated_at_ms = epoch_ms();
             append_scan_event(
                 scan,
@@ -2464,10 +2620,19 @@ async fn process_next_discovery_job_core(
         }
     };
 
-    let envelope = dequeued.envelope;
+    let mut envelope = dequeued.envelope;
     let payload = envelope.payload.clone();
     let yolo_model = payload.yolo_model.clone();
     let identity_model = payload.identity_model.clone();
+    let processing_mode = {
+        let mut scans = scan_store.lock().map_err(|e| e.to_string())?;
+        ensure_scan_store_loaded(&mut scans);
+        scans
+            .scans
+            .get(&payload.scan_id)
+            .map(|scan| scan.processing_mode.clone())
+            .or_else(|| sanitize_processing_mode(payload.processing_mode.as_deref()))
+    };
     let app_for_scan = app.clone();
     let queue_run_id = client_run_id.clone();
     let run_result = task::spawn_blocking(move || {
@@ -2481,7 +2646,7 @@ async fn process_next_discovery_job_core(
                 identity_model: Some(identity_model),
                 body_reid_model: None,
                 expected_member_count: payload.expected_member_count,
-                processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
+                processing_mode,
                 client_run_id: queue_run_id,
             },
             app_for_scan,
@@ -2513,7 +2678,8 @@ async fn process_next_discovery_job_core(
                 persist_scan_entry_snapshot(snapshot)?;
             }
 
-            let queue = queue_store.lock().map_err(|e| e.to_string())?;
+            let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
+            queue.acknowledge(&envelope.message_id)?;
             Ok(queue::QueueProcessResult {
                 processed: true,
                 cancelled: false,
@@ -2530,7 +2696,7 @@ async fn process_next_discovery_job_core(
         Err(err) => {
             let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
             if cancelled {
-                let remaining_depth = queue.requeue_discovery_raw(dequeued.raw);
+                let remaining_depth = queue.requeue_discovery_raw_result(dequeued.raw)?;
                 return Ok(queue::QueueProcessResult {
                     processed: false,
                     cancelled: true,
@@ -2547,10 +2713,10 @@ async fn process_next_discovery_job_core(
             let mut moved_to_dlq = false;
             let mut requeued = false;
             if envelope.attempt + 1 >= max_attempts_before_dlq {
-                queue.move_discovery_to_dlq(dequeued.raw);
+                queue.move_discovery_to_dlq_with_error(dequeued.raw, Some(&err))?;
                 moved_to_dlq = true;
             } else {
-                queue.requeue_discovery_retry(envelope.clone())?;
+                queue.requeue_discovery_retry_with_error(&mut envelope, Some(&err))?;
                 requeued = true;
             }
             Ok(queue::QueueProcessResult {
@@ -2637,8 +2803,17 @@ async fn process_next_rescan_job_core(
         }
     };
 
-    let envelope = dequeued.envelope;
+    let mut envelope = dequeued.envelope;
     let payload = envelope.payload.clone();
+    let processing_mode = {
+        let mut scans = scan_store.lock().map_err(|e| e.to_string())?;
+        ensure_scan_store_loaded(&mut scans);
+        scans
+            .scans
+            .get(&payload.scan_id)
+            .map(|scan| scan.processing_mode.clone())
+            .or_else(|| sanitize_processing_mode(payload.processing_mode.as_deref()))
+    };
     let app_for_scan = app.clone();
     let queue_run_id = client_run_id.clone();
     let run_result = task::spawn_blocking(move || {
@@ -2652,7 +2827,7 @@ async fn process_next_rescan_job_core(
                 identity_model: Some(payload.identity_model),
                 body_reid_model: None,
                 expected_member_count: None,
-                processing_mode: sanitize_processing_mode(payload.processing_mode.as_deref()),
+                processing_mode,
                 client_run_id: queue_run_id,
             },
             app_for_scan,
@@ -2679,7 +2854,7 @@ async fn process_next_rescan_job_core(
                     scan.selected_anchor_x = None;
                     scan.selected_anchor_y = None;
                     scan.validated_threshold = None;
-                    set_scan_status(scan, ScanSessionStatus::Proposed);
+                    set_scan_status(scan, ScanSessionStatus::Proposed)?;
                     scan.last_blockers =
                         vec!["split rescan complete: please validate again".to_string()];
                     scan.updated_at_ms = epoch_ms();
@@ -2694,7 +2869,8 @@ async fn process_next_rescan_job_core(
             if let Some(snapshot) = snapshot.as_ref() {
                 persist_scan_entry_snapshot(snapshot)?;
             }
-            let queue = queue_store.lock().map_err(|e| e.to_string())?;
+            let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
+            queue.acknowledge(&envelope.message_id)?;
             Ok(queue::QueueProcessResult {
                 processed: true,
                 cancelled: false,
@@ -2711,7 +2887,7 @@ async fn process_next_rescan_job_core(
         Err(err) => {
             let mut queue = queue_store.lock().map_err(|e| e.to_string())?;
             if cancelled {
-                let remaining_depth = queue.requeue_rescan_raw(dequeued.raw);
+                let remaining_depth = queue.requeue_rescan_raw_result(dequeued.raw)?;
                 return Ok(queue::QueueProcessResult {
                     processed: false,
                     cancelled: true,
@@ -2728,10 +2904,10 @@ async fn process_next_rescan_job_core(
             let mut moved_to_dlq = false;
             let mut requeued = false;
             if envelope.attempt + 1 >= max_attempts_before_dlq {
-                queue.move_rescan_to_dlq(dequeued.raw);
+                queue.move_rescan_to_dlq_with_error(dequeued.raw, Some(&err))?;
                 moved_to_dlq = true;
             } else {
-                queue.requeue_rescan_retry(envelope.clone())?;
+                queue.requeue_rescan_retry_with_error(&mut envelope, Some(&err))?;
                 requeued = true;
             }
             Ok(queue::QueueProcessResult {
@@ -3146,6 +3322,10 @@ pub async fn run_fancam(
                 return Ok(result);
             };
 
+            // The persisted session is authoritative.  This prevents an old
+            // webview request from silently changing encoder behavior.
+            args.processing_mode = Some(scan.processing_mode.clone());
+
             let review = compute_review(scan, &review_args);
             if !review.ready {
                 let why = if review.blockers.is_empty() {
@@ -3166,7 +3346,7 @@ pub async fn run_fancam(
                 return Ok(result);
             }
 
-            apply_review_to_scan(scan, &review, args.threshold);
+            apply_review_to_scan(scan, &review, args.threshold)?;
 
             args.threshold = scan
                 .validated_threshold
@@ -3205,7 +3385,7 @@ pub async fn run_fancam(
                 }
             }
 
-            set_scan_status(scan, ScanSessionStatus::Tracking);
+            set_scan_status(scan, ScanSessionStatus::Tracking)?;
             scan.updated_at_ms = epoch_ms();
             append_scan_event(
                 scan,
@@ -3221,17 +3401,17 @@ pub async fn run_fancam(
 
             snapshot_scan_entry(&lock, scan_id)?
         };
-        if let Some(snapshot) = snapshot.as_ref() {
-            if let Err(err) = persist_scan_entry_snapshot(snapshot) {
-                let result = JobResult {
-                    ok: false,
-                    message: format!("failed to persist tracking state: {err}"),
-                    output_path: None,
-                    run_id: Some(render_run_id.clone()),
-                };
-                emit_render_done(&app, &result);
-                return Ok(result);
-            }
+        if let Some(snapshot) = snapshot.as_ref()
+            && let Err(err) = persist_scan_entry_snapshot(snapshot)
+        {
+            let result = JobResult {
+                ok: false,
+                message: format!("failed to persist tracking state: {err}"),
+                output_path: None,
+                run_id: Some(render_run_id.clone()),
+            };
+            emit_render_done(&app, &result);
+            return Ok(result);
         }
     }
 
@@ -3254,20 +3434,24 @@ pub async fn run_fancam(
 
     match result {
         Ok(path) => {
-            if let Some(scan_id) = &scan_id_for_state {
-                if let Ok(mut lock) = scan_state.0.lock() {
-                    ensure_scan_store_loaded(&mut lock);
-                    let snapshot = if let Some(scan) = lock.scans.get_mut(scan_id) {
-                        set_scan_status(scan, ScanSessionStatus::Completed);
+            if let Some(scan_id) = &scan_id_for_state
+                && let Ok(mut lock) = scan_state.0.lock()
+            {
+                ensure_scan_store_loaded(&mut lock);
+                let snapshot = if let Some(scan) = lock.scans.get_mut(scan_id) {
+                    if let Err(error) = set_scan_status(scan, ScanSessionStatus::Completed) {
+                        tracing::error!(%error, scan_id, "failed to complete scan session");
+                        None
+                    } else {
                         scan.updated_at_ms = epoch_ms();
                         append_scan_event(scan, "tracking_completed", format!("output={path}"));
                         snapshot_scan_entry(&lock, scan_id).ok().flatten()
-                    } else {
-                        None
-                    };
-                    if let Some(snapshot) = snapshot.as_ref() {
-                        let _ = persist_scan_entry_snapshot(snapshot);
                     }
+                } else {
+                    None
+                };
+                if let Some(snapshot) = snapshot.as_ref() {
+                    let _ = persist_scan_entry_snapshot(snapshot);
                 }
             }
             let result = JobResult {
@@ -3281,29 +3465,33 @@ pub async fn run_fancam(
         }
         Err(e) => {
             let cancelled = state.0.load(Ordering::Relaxed);
-            if let Some(scan_id) = &scan_id_for_state {
-                if let Ok(mut lock) = scan_state.0.lock() {
-                    ensure_scan_store_loaded(&mut lock);
-                    let snapshot = if let Some(scan) = lock.scans.get_mut(scan_id) {
-                        let (status, action, details) = if cancelled {
-                            (
-                                ScanSessionStatus::Validated,
-                                "tracking_cancelled",
-                                "render cancelled by user".to_string(),
-                            )
-                        } else {
-                            (ScanSessionStatus::Failed, "tracking_failed", e.to_string())
-                        };
-                        set_scan_status(scan, status);
+            if let Some(scan_id) = &scan_id_for_state
+                && let Ok(mut lock) = scan_state.0.lock()
+            {
+                ensure_scan_store_loaded(&mut lock);
+                let snapshot = if let Some(scan) = lock.scans.get_mut(scan_id) {
+                    let (status, action, details) = if cancelled {
+                        (
+                            ScanSessionStatus::Validated,
+                            "tracking_cancelled",
+                            "render cancelled by user".to_string(),
+                        )
+                    } else {
+                        (ScanSessionStatus::Failed, "tracking_failed", e.to_string())
+                    };
+                    if let Err(error) = set_scan_status(scan, status) {
+                        tracing::error!(%error, scan_id, "failed to finalize scan session");
+                        None
+                    } else {
                         scan.updated_at_ms = epoch_ms();
                         append_scan_event(scan, action, details);
                         snapshot_scan_entry(&lock, scan_id).ok().flatten()
-                    } else {
-                        None
-                    };
-                    if let Some(snapshot) = snapshot.as_ref() {
-                        let _ = persist_scan_entry_snapshot(snapshot);
                     }
+                } else {
+                    None
+                };
+                if let Some(snapshot) = snapshot.as_ref() {
+                    let _ = persist_scan_entry_snapshot(snapshot);
                 }
             }
             let result = JobResult {
@@ -3737,6 +3925,7 @@ mod tests {
                         yolo_model: "y.onnx".to_string(),
                         identity_model: "f.onnx".to_string(),
                         status: "validated".to_string(),
+                        processing_mode: "fast".to_string(),
                         expected_count: Some(3),
                         review_ready: true,
                         selected_identity_id: Some(1),
@@ -3759,6 +3948,7 @@ mod tests {
                         yolo_model: "y.onnx".to_string(),
                         identity_model: "f.onnx".to_string(),
                         status: "proposed".to_string(),
+                        processing_mode: "balanced".to_string(),
                         expected_count: None,
                         review_ready: false,
                         selected_identity_id: None,
@@ -3781,6 +3971,7 @@ mod tests {
                         yolo_model: "y.onnx".to_string(),
                         identity_model: "f.onnx".to_string(),
                         status: "failed".to_string(),
+                        processing_mode: "quality".to_string(),
                         expected_count: None,
                         review_ready: false,
                         selected_identity_id: None,
@@ -3861,6 +4052,7 @@ mod tests {
                     yolo_model: "y.onnx".to_string(),
                     identity_model: "f.onnx".to_string(),
                     status: "tracking".to_string(),
+                    processing_mode: "fast".to_string(),
                     expected_count: None,
                     review_ready: true,
                     selected_identity_id: Some(1),
@@ -3950,6 +4142,67 @@ mod tests {
             assert!(!with_zero_offset.offset_ignored);
             assert!(with_large_offset.offset_ignored);
         });
+    }
+
+    #[test]
+    fn interrupted_tracking_sessions_recover_and_persist_their_mode() {
+        with_temp_workspace(|_| {
+            let now = super::epoch_ms();
+            let rows = storage::ScanStoreRows {
+                next_id: 2,
+                sessions: vec![storage::ScanSessionRow {
+                    scan_id: "scan-recover".to_string(),
+                    video: "recover.mp4".to_string(),
+                    yolo_model: "y.onnx".to_string(),
+                    identity_model: "f.onnx".to_string(),
+                    status: "tracking".to_string(),
+                    processing_mode: "quality".to_string(),
+                    expected_count: Some(1),
+                    review_ready: true,
+                    selected_identity_id: Some(1),
+                    selected_anchor_x: Some(10.0),
+                    selected_anchor_y: Some(20.0),
+                    validated_threshold: Some(0.7),
+                    updated_at_ms: now,
+                    candidates_json: "[]".to_string(),
+                    duplicates_json: "[]".to_string(),
+                    excluded_identity_ids_json: "[]".to_string(),
+                    accepted_low_confidence_ids_json: "[]".to_string(),
+                    resolved_duplicate_keys_json: "[]".to_string(),
+                    pending_split_ids_json: "[]".to_string(),
+                    pending_split_count: 0,
+                    last_blockers_json: "[]".to_string(),
+                }],
+                events: vec![],
+            };
+            storage::save_scan_rows(&storage::scan_store_db_path(), &rows).expect("seed scan");
+
+            let mut state = super::IdentityScanState::default();
+            super::ensure_scan_store_loaded(&mut state);
+            let recovered = state.scans.get("scan-recover").expect("recovered scan");
+            assert_eq!(recovered.status, super::ScanSessionStatus::Validated);
+            assert_eq!(recovered.processing_mode, "quality");
+            assert!(
+                recovered
+                    .events
+                    .iter()
+                    .any(|event| event.action == "tracking_recovered")
+            );
+
+            let persisted = storage::load_scan_rows(&storage::scan_store_db_path())
+                .expect("load persisted scan")
+                .expect("persisted scan rows");
+            assert_eq!(persisted.sessions[0].status, "validated");
+            assert_eq!(persisted.sessions[0].processing_mode, "quality");
+        });
+    }
+
+    #[test]
+    fn preview_dimension_limits_reject_empty_and_oversized_inputs() {
+        assert!(super::validate_preview_dimensions(0, 100).is_err());
+        assert!(super::validate_preview_dimensions(4096, 4096).is_ok());
+        assert!(super::validate_preview_dimensions(4097, 1).is_err());
+        assert!(super::validate_preview_dimensions(4096, 4097).is_err());
     }
 
     #[test]

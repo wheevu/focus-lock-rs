@@ -228,6 +228,37 @@ impl Default for FrameRenderer {
     }
 }
 
+/// Extract and return the 9:16 fancam crop as an `RgbFrame`.
+///
+/// The crop window is centred on `state.cx`, `state.cy` and has a width of
+/// `OUT_WIDTH` pixels in the source frame (clamped to frame boundaries).
+/// Height is set to maintain the 9:16 aspect ratio.
+pub fn crop_fancam(frame: &RgbFrame, state: &CameraState) -> Result<RgbFrame> {
+    let mut out = RgbFrame {
+        data: frame.data.clone(),
+        width: frame.width,
+        height: frame.height,
+        pts: frame.pts,
+    };
+    let mut renderer = FrameRenderer::new();
+    renderer.crop_fancam_inplace(&mut out, state)?;
+    Ok(out)
+}
+
+/// Write a plain full-frame passthrough (no crop) — used when the target is
+/// lost and we want a letterboxed placeholder rather than a blank frame.
+pub fn letterbox_passthrough(frame: &RgbFrame) -> Result<RgbFrame> {
+    let mut out = RgbFrame {
+        data: frame.data.clone(),
+        width: frame.width,
+        height: frame.height,
+        pts: frame.pts,
+    };
+    let mut renderer = FrameRenderer::new();
+    renderer.letterbox_passthrough_inplace(&mut out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,35 +298,4 @@ mod tests {
         };
         assert!(renderer.letterbox_passthrough_inplace(&mut input).is_err());
     }
-}
-
-/// Extract and return the 9:16 fancam crop as an `RgbFrame`.
-///
-/// The crop window is centred on `state.cx`, `state.cy` and has a width of
-/// `OUT_WIDTH` pixels in the source frame (clamped to frame boundaries).
-/// Height is set to maintain the 9:16 aspect ratio.
-pub fn crop_fancam(frame: &RgbFrame, state: &CameraState) -> Result<RgbFrame> {
-    let mut out = RgbFrame {
-        data: frame.data.clone(),
-        width: frame.width,
-        height: frame.height,
-        pts: frame.pts,
-    };
-    let mut renderer = FrameRenderer::new();
-    renderer.crop_fancam_inplace(&mut out, state)?;
-    Ok(out)
-}
-
-/// Write a plain full-frame passthrough (no crop) — used when the target is
-/// lost and we want a letterboxed placeholder rather than a blank frame.
-pub fn letterbox_passthrough(frame: &RgbFrame) -> Result<RgbFrame> {
-    let mut out = RgbFrame {
-        data: frame.data.clone(),
-        width: frame.width,
-        height: frame.height,
-        pts: frame.pts,
-    };
-    let mut renderer = FrameRenderer::new();
-    renderer.letterbox_passthrough_inplace(&mut out)?;
-    Ok(out)
 }

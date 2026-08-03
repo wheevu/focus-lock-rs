@@ -15,6 +15,7 @@
     QueryIdentityScansResult,
     QueryScanEventsResult,
     QueueActionResult,
+    QueueDlqItemSummary,
     QueueHealth,
     QueueWorkerEvent,
     QueueWorkerStatus,
@@ -90,6 +91,7 @@
   let queueMsg = $state('');
   let queueErr = $state('');
   let queueAttempts = $state<number[]>([]);
+  let queueDlqItems = $state<QueueDlqItemSummary[]>([]);
   let workerStatus = $state<QueueWorkerStatus | null>(null);
   let workerPollMsInput = $state('1200');
   let telemetryInterval: ReturnType<typeof setInterval> | null = null;
@@ -126,17 +128,30 @@
   let biasPreviewRatio = $state(1);
   let startedAtMs = $state<number | null>(null);
   let etaSeconds = $state<number | null>(null);
+  let videoPreviewRequest = 0;
+  let biasPreviewRequest = 0;
+  let queueHealthRequest = 0;
+  let sessionListRequest = 0;
+  let sessionDetailRequest = 0;
+  let scanEventsRequest = 0;
+  let restoringSession = false;
 
   $effect(() => {
     videoPreviewWidth = 138;
     videoPreviewHeight = 78;
     videoPreviewRatio = 16 / 9;
     videoPreviewSrc = '';
-    if (videoPath) {
-      clearIdentityScan();
-      invoke<string>('read_thumbnail', { path: videoPath })
-        .then((src) => { videoPreviewSrc = src; })
-        .catch(() => { videoPreviewSrc = ''; });
+    const selectedPath = videoPath;
+    const request = ++videoPreviewRequest;
+    if (selectedPath) {
+      if (!restoringSession) clearIdentityScan();
+      invoke<string>('read_thumbnail', { path: selectedPath })
+        .then((src) => {
+          if (request === videoPreviewRequest && videoPath === selectedPath) videoPreviewSrc = src;
+        })
+        .catch(() => {
+          if (request === videoPreviewRequest && videoPath === selectedPath) videoPreviewSrc = '';
+        });
     }
   });
 
@@ -145,17 +160,23 @@
     biasPreviewHeight = 62;
     biasPreviewRatio = 1;
     biasPreviewSrc = '';
-    if (biasPath) {
-      invoke<string>('read_thumbnail', { path: biasPath })
-        .then((src) => { biasPreviewSrc = src; })
-        .catch(() => { biasPreviewSrc = ''; });
+    const selectedPath = biasPath;
+    const request = ++biasPreviewRequest;
+    if (selectedPath) {
+      invoke<string>('read_thumbnail', { path: selectedPath })
+        .then((src) => {
+          if (request === biasPreviewRequest && biasPath === selectedPath) biasPreviewSrc = src;
+        })
+        .catch(() => {
+          if (request === biasPreviewRequest && biasPath === selectedPath) biasPreviewSrc = '';
+        });
     }
   });
 
   $effect(() => {
     yoloModel;
     faceModel;
-    clearIdentityScan();
+    if (!restoringSession) clearIdentityScan();
   });
 
   // ── Mount: resolve model dir ──────────────────────────────────────────────
@@ -295,7 +316,13 @@
       if (!outputPath) {
         outputPath = selected.replace(/\.[^.]+$/, '_fancam.mp4');
       }
-      totFrames = await invoke<number>('probe_video', { path: selected });
+      try {
+        totFrames = await invoke<number>('probe_video', { path: selected });
+      } catch {
+        // Some containers do not expose a reliable frame count; rendering can
+        // still proceed with indeterminate progress.
+        totFrames = 0;
+      }
     }
   }
 
@@ -751,16 +778,39 @@
   async function refreshQueueHealth(nonce?: number) {
     if (telemetryRefreshing) return;
     telemetryRefreshing = true;
+    const request = ++queueHealthRequest;
     try {
       const nextHealth = await invoke<QueueHealth>('queue_health');
-      if (isSettingsNonceStale(nonce)) return;
+      if (isSettingsNonceStale(nonce) || request !== queueHealthRequest) return;
       queueHealth = nextHealth;
       queueErr = '';
     } catch (e: unknown) {
-      if (isSettingsNonceStale(nonce)) return;
+      if (isSettingsNonceStale(nonce) || request !== queueHealthRequest) return;
       queueErr = String(e);
     } finally {
       telemetryRefreshing = false;
+    }
+  }
+
+  async function refreshQueueDlq(nonce?: number) {
+    try {
+      const items = await invoke<QueueDlqItemSummary[]>('queue_dlq_list', { args: { limit: 20 } });
+      if (isSettingsNonceStale(nonce)) return;
+      queueDlqItems = items;
+    } catch (e: unknown) {
+      if (isSettingsNonceStale(nonce)) return;
+      queueErr = String(e);
+    }
+  }
+
+  async function replayQueueMessage(messageId: string) {
+    queueErr = '';
+    try {
+      await invoke('queue_dlq_replay', { args: { message_id: messageId } });
+      queueMsg = 'queue message replayed';
+      await Promise.all([refreshQueueHealth(), refreshQueueDlq()]);
+    } catch (e: unknown) {
+      queueErr = String(e);
     }
   }
 
@@ -794,7 +844,13 @@
       });
       queueMsg = result.deduplicated
         ? 'discovery job deduplicated'
-        : 'discovery job queued';
+        : result.accepted === false
+          ? 'discovery queue is full'
+          : 'discovery job queued';
+      if (result.accepted === false) {
+        queueErr = result.reason ?? 'discovery queue is full';
+        return;
+      }
       await refreshQueueHealth();
     } catch (e: unknown) {
       queueErr = String(e);
@@ -812,7 +868,15 @@
           processing_mode: processingMode,
         },
       });
-      queueMsg = result.deduplicated ? 'split rescan deduplicated' : 'split rescan queued';
+      queueMsg = result.deduplicated
+        ? 'split rescan deduplicated'
+        : result.accepted === false
+          ? 'rescan queue is full'
+          : 'split rescan queued';
+      if (result.accepted === false) {
+        queueErr = result.reason ?? 'rescan queue is full';
+        return;
+      }
       await refreshQueueHealth();
     } catch (e: unknown) {
       queueErr = String(e);
@@ -841,6 +905,7 @@
     if (includeHeavy) {
       calls.push(
         peekQueueAttempts(),
+        refreshQueueDlq(nonce),
         refreshScanSessionDetail(nonce),
         refreshScanStorageStats(nonce),
         refreshStorageWorkerStatus(nonce),
@@ -863,37 +928,41 @@
   }
 
   async function refreshScanSessionDetail(nonce?: number) {
+    const request = ++sessionDetailRequest;
+    const requestedScanId = scanId;
     if (!scanId) {
       if (isSettingsNonceStale(nonce)) return;
       scanSessionDetail = null;
       return;
     }
     try {
-      const detail = await invoke<ScanSessionDetail>('get_identity_scan', { scan_id: scanId });
-      if (isSettingsNonceStale(nonce)) return;
+      const detail = await invoke<ScanSessionDetail>('get_identity_scan', { scan_id: requestedScanId });
+      if (isSettingsNonceStale(nonce) || request !== sessionDetailRequest || scanId !== requestedScanId) return;
       scanSessionDetail = detail;
     } catch {
-      if (isSettingsNonceStale(nonce)) return;
+      if (isSettingsNonceStale(nonce) || request !== sessionDetailRequest || scanId !== requestedScanId) return;
       scanSessionDetail = null;
     }
   }
 
   async function refreshScanSessionsList(nonce?: number) {
+    const request = ++sessionListRequest;
+    const requestedStatus = scanSessionStatusFilter;
     try {
       const result = await invoke<QueryIdentityScansResult>('query_identity_scans', {
         args: {
           limit: 20,
-          status: scanSessionStatusFilter === 'all' ? null : scanSessionStatusFilter,
+          status: requestedStatus === 'all' ? null : requestedStatus,
           cursor_updated_at_ms: null,
           cursor_scan_id: null,
         },
       });
-      if (isSettingsNonceStale(nonce)) return;
+      if (isSettingsNonceStale(nonce) || request !== sessionListRequest || requestedStatus !== scanSessionStatusFilter) return;
       scanSessions = result.rows;
       scanSessionsCursorUpdatedAt = result.next_cursor_updated_at_ms ?? null;
       scanSessionsCursorId = result.next_cursor_scan_id ?? null;
     } catch {
-      if (isSettingsNonceStale(nonce)) return;
+      if (isSettingsNonceStale(nonce) || request !== sessionListRequest || requestedStatus !== scanSessionStatusFilter) return;
       scanSessions = [];
       scanSessionsCursorUpdatedAt = null;
       scanSessionsCursorId = null;
@@ -902,15 +971,20 @@
 
   async function loadMoreScanSessions() {
     if (scanSessionsCursorUpdatedAt === null || !scanSessionsCursorId) return;
+    const request = ++sessionListRequest;
+    const requestedStatus = scanSessionStatusFilter;
+    const cursorUpdatedAt = scanSessionsCursorUpdatedAt;
+    const cursorId = scanSessionsCursorId;
     try {
       const result = await invoke<QueryIdentityScansResult>('query_identity_scans', {
         args: {
           limit: 20,
-          status: scanSessionStatusFilter === 'all' ? null : scanSessionStatusFilter,
-          cursor_updated_at_ms: scanSessionsCursorUpdatedAt,
-          cursor_scan_id: scanSessionsCursorId,
+          status: requestedStatus === 'all' ? null : requestedStatus,
+          cursor_updated_at_ms: cursorUpdatedAt,
+          cursor_scan_id: cursorId,
         },
       });
+      if (request !== sessionListRequest || requestedStatus !== scanSessionStatusFilter) return;
       if (result.rows.length === 0) {
         scanSessionsCursorUpdatedAt = null;
         scanSessionsCursorId = null;
@@ -919,8 +993,8 @@
       scanSessions = [...scanSessions, ...result.rows];
       scanSessionsCursorUpdatedAt = result.next_cursor_updated_at_ms ?? null;
       scanSessionsCursorId = result.next_cursor_scan_id ?? null;
-    } catch {
-      // no-op
+    } catch (e: unknown) {
+      if (request === sessionListRequest) queueErr = String(e);
     }
   }
 
@@ -1024,8 +1098,9 @@
     }
   }
 
-  async function refreshScanEventsFirstPage() {
-    if (!scanId) {
+  async function refreshScanEventsFirstPage(requestedScanId = scanId, requestToken?: number) {
+    const request = requestToken ?? ++scanEventsRequest;
+    if (!requestedScanId) {
       scanEventsPage = [];
       return;
     }
@@ -1034,18 +1109,21 @@
     try {
       const result = await invoke<QueryScanEventsResult>('query_scan_events', {
         args: {
-          scan_id: scanId,
+          scan_id: requestedScanId,
           limit: 25,
           action_contains: scanEventActionFilter.trim() ? scanEventActionFilter.trim() : null,
           since_ms: sinceMs,
           cursor_event_id: null,
         },
       });
+      if (request !== scanEventsRequest || scanId !== requestedScanId) return;
       scanEventsPage = result.rows;
       scanEventsCursorId = result.next_cursor_event_id ?? null;
-    } catch {
+    } catch (e: unknown) {
+      if (request !== scanEventsRequest || scanId !== requestedScanId) return;
       scanEventsPage = [];
       scanEventsCursorId = null;
+      queueErr = String(e);
     }
   }
 
@@ -1061,31 +1139,43 @@
 
   async function loadMoreScanEvents() {
     if (!scanId || scanEventsCursorId === null) return;
+    const requestedScanId = scanId;
+    const request = scanEventsRequest;
+    const cursorId = scanEventsCursorId;
     const mins = Number.parseInt(scanEventWindowMinutesInput, 10);
     const sinceMs = Number.isFinite(mins) && mins > 0 ? Date.now() - mins * 60 * 1000 : null;
     try {
       const result = await invoke<QueryScanEventsResult>('query_scan_events', {
         args: {
-          scan_id: scanId,
+          scan_id: requestedScanId,
           limit: 25,
           action_contains: scanEventActionFilter.trim() ? scanEventActionFilter.trim() : null,
           since_ms: sinceMs,
-          cursor_event_id: scanEventsCursorId,
+          cursor_event_id: cursorId,
         },
       });
+      if (request !== scanEventsRequest || scanId !== requestedScanId) return;
       if (result.rows.length === 0) return;
       scanEventsPage = [...scanEventsPage, ...result.rows];
       scanEventsCursorId = result.next_cursor_event_id ?? null;
-    } catch {
-      // no-op
+    } catch (e: unknown) {
+      if (request === scanEventsRequest && scanId === requestedScanId) queueErr = String(e);
     }
   }
 
   async function loadScanSession(scanIdToLoad: string) {
     queueErr = '';
+    const request = ++sessionDetailRequest;
+    ++scanEventsRequest;
     try {
       activeScanRunId = '';
       const detail = await invoke<ScanSessionDetail>('get_identity_scan', { scan_id: scanIdToLoad });
+      if (request !== sessionDetailRequest) return;
+      restoringSession = true;
+      videoPath = detail.video;
+      yoloModel = detail.yolo_model;
+      faceModel = detail.identity_model;
+      identityModel = detail.identity_model;
       scanId = detail.scan_id;
       scanStatus = 'done';
       scanMessage = `loaded saved scan (${detail.status})`;
@@ -1113,11 +1203,16 @@
       reviewReady = detail.review_ready;
       reviewBlockers = detail.last_blockers;
       scanSessionDetail = detail;
-      await refreshScanEventsFirstPage();
+      await refreshScanEventsFirstPage(detail.scan_id);
       scheduleReviewValidation(true);
       queueMsg = `loaded ${detail.scan_id}`;
+      await Promise.resolve();
+      restoringSession = false;
     } catch (e: unknown) {
-      queueErr = String(e);
+      if (request === sessionDetailRequest) {
+        restoringSession = false;
+        queueErr = String(e);
+      }
     }
   }
 
@@ -1468,7 +1563,9 @@
     if (showSettings) {
       settingsNonce += 1;
       refreshQueueHealth(settingsNonce);
+      refreshQueueDlq(settingsNonce);
       refreshWorkerStatus(settingsNonce);
+      refreshScanSessionsList(settingsNonce);
       if (settingsAutoRefresh) {
         startTelemetryLoop();
       } else {
@@ -1495,7 +1592,7 @@
 
   $effect(() => {
     scanSessionStatusFilter;
-    if (showSettings && scanSessions.length > 0) {
+    if (showSettings) {
       refreshScanSessionsList();
     }
   });
@@ -1598,16 +1695,30 @@
       <h4>queue &amp; diagnostics</h4>
       {#if queueHealth}
         <div class="queue-meta">
-          <span>in-memory queue</span>
+          <span>durable queue</span>
           <span>discovery depth {queueHealth.depths.discovery}</span>
           <span>rescan depth {queueHealth.depths.rescan}</span>
+          <span>in flight {queueHealth.depths.discovery_in_flight + queueHealth.depths.rescan_in_flight}</span>
           <span>dlq depth {queueHealth.depths.dlq}</span>
+          <span>capacity {queueHealth.capacity}</span>
           <span>dedupe keys {queueHealth.dedupe_keys}</span>
           {#if scanStorageStats}
             <span>db v{scanStorageStats.schema_version}</span>
             <span>sessions {scanStorageStats.session_count}</span>
             <span>events {scanStorageStats.event_count}</span>
           {/if}
+        </div>
+      {/if}
+      {#if queueDlqItems.length > 0}
+        <div class="queue-session-list">
+          {#each queueDlqItems as item}
+            <div class="queue-session-row">
+              <span class="session-id">{item.queue}</span>
+              <span>{item.message_id}</span>
+              <span>attempt {item.attempt}</span>
+              <button class="ghost-btn tiny" onclick={() => replayQueueMessage(item.message_id)}>replay</button>
+            </div>
+          {/each}
         </div>
       {/if}
       <div class="queue-actions">
@@ -1648,7 +1759,7 @@
         <div class="queue-actions">
           <input class="count-input" bind:value={scanEventActionFilter} placeholder="event action filter" />
           <input class="count-input" bind:value={scanEventWindowMinutesInput} placeholder="window mins" />
-          <button class="ghost-btn" onclick={refreshScanEventsFirstPage}>load events</button>
+          <button class="ghost-btn" onclick={() => refreshScanEventsFirstPage()}>load events</button>
           <button class="ghost-btn" onclick={loadMoreScanEvents}>more events</button>
         </div>
         {#if scanEventsPage.length > 0}

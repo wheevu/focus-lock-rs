@@ -70,30 +70,37 @@ impl FancamError {
         }
     }
 
+    /// Create an inference error.
     pub fn inference(msg: impl Into<String>) -> Self {
         Self::Inference(msg.into())
     }
 
+    /// Create a face-identification error.
     pub fn face_id(msg: impl Into<String>) -> Self {
         Self::FaceIdentification(msg.into())
     }
 
+    /// Create an image-processing error.
     pub fn image_processing(msg: impl Into<String>) -> Self {
         Self::ImageProcessing(msg.into())
     }
 
+    /// Create an invalid-frame error.
     pub fn invalid_frame(msg: impl Into<String>) -> Self {
         Self::InvalidFrame(msg.into())
     }
 
+    /// Create a lock-poisoning error.
     pub fn lock_poisoned(msg: impl Into<String>) -> Self {
         Self::LockPoisoned(msg.into())
     }
 
+    /// Create an ONNX Runtime configuration error.
     pub fn ort_config(msg: impl Into<String>) -> Self {
         Self::OrtConfig(msg.into())
     }
 
+    /// Create an invalid-configuration error.
     pub fn invalid_config(msg: impl Into<String>) -> Self {
         Self::InvalidConfig(msg.into())
     }
@@ -111,6 +118,7 @@ impl From<anyhow::Error> for FancamError {
 
 /// Helper trait for converting poison errors
 pub trait PoisonExt<T> {
+    /// Convert a poisoned lock into a domain error with context.
     fn to_fancam_err(self, context: &str) -> Result<T>;
 }
 

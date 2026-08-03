@@ -15,6 +15,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 use rayon::prelude::*;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Mutex;
@@ -81,6 +82,24 @@ pub struct BBox {
 }
 
 impl BBox {
+    /// Returns whether the box has finite coordinates, positive finite area,
+    /// and a finite confidence score.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let width = self.width();
+        let height = self.height();
+        self.x1.is_finite()
+            && self.y1.is_finite()
+            && self.x2.is_finite()
+            && self.y2.is_finite()
+            && self.confidence.is_finite()
+            && width.is_finite()
+            && height.is_finite()
+            && width > 0.0
+            && height > 0.0
+            && (width * height).is_finite()
+    }
+
     /// Returns the width of the bounding box.
     #[must_use]
     pub fn width(&self) -> f32 {
@@ -104,19 +123,31 @@ impl BBox {
     /// `IoU` (intersection over union) with another box.
     #[must_use]
     pub fn iou(&self, other: &Self) -> f32 {
+        if !self.is_valid() || !other.is_valid() {
+            return 0.0;
+        }
+
         let ix1 = self.x1.max(other.x1);
         let iy1 = self.y1.max(other.y1);
         let ix2 = self.x2.min(other.x2);
         let iy2 = self.y2.min(other.y2);
         let inter = (ix2 - ix1).max(0.0) * (iy2 - iy1).max(0.0);
-        if inter == 0.0 {
+        if !inter.is_finite() || inter <= 0.0 {
             return 0.0;
         }
         let union = self
             .width()
             .mul_add(self.height(), other.width() * other.height())
             - inter;
-        inter / union
+        if !union.is_finite() || union <= 0.0 {
+            return 0.0;
+        }
+        let iou = inter / union;
+        if iou.is_finite() {
+            iou.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     }
 }
 
@@ -245,6 +276,7 @@ impl Detector {
                 b.y1 /= sy;
                 b.y2 /= sy;
             }
+            boxes.retain(BBox::is_valid);
             return Ok(boxes);
         }
 
@@ -285,7 +317,15 @@ impl Detector {
                 // Person score (class 0)
                 let person_score = data[(4 + PERSON_CLASS) * NUM_PROPOSALS + i];
 
-                if person_score < CONF_THRESHOLD {
+                if !cx.is_finite()
+                    || !cy.is_finite()
+                    || !w.is_finite()
+                    || !h.is_finite()
+                    || !person_score.is_finite()
+                    || w <= 0.0
+                    || h <= 0.0
+                    || person_score < CONF_THRESHOLD
+                {
                     return None;
                 }
 
@@ -295,13 +335,14 @@ impl Detector {
                 let x2 = (cx + w / 2.0 - yolo_map.pad_x) / yolo_map.scale;
                 let y2 = (cy + h / 2.0 - yolo_map.pad_y) / yolo_map.scale;
 
-                Some(BBox {
+                let bbox = BBox {
                     x1: x1.max(0.0),
                     y1: y1.max(0.0),
                     x2: x2.min(frame.width as f32),
                     y2: y2.min(frame.height as f32),
                     confidence: person_score,
-                })
+                };
+                bbox.is_valid().then_some(bbox)
             })
             .collect();
 
@@ -550,6 +591,9 @@ impl FaceEmbedder {
             .par_iter()
             .enumerate()
             .filter_map(|(idx, &bbox)| {
+                if !bbox.is_valid() {
+                    return None;
+                }
                 let min_edge = NonZeroU32::new(min_face_crop_edge.max(1))?;
                 let tensor_data =
                     preprocess_face_from_bbox_with_min(frame, bbox, min_edge).ok()??;
@@ -573,6 +617,9 @@ fn preprocess_face_from_bbox_with_min(
     bbox: BBox,
     min_edge: NonZeroU32,
 ) -> Result<Option<Vec<f32>>> {
+    if !bbox.is_valid() {
+        return Ok(None);
+    }
     let (face_x1, face_y1, face_w, face_h) = face_crop_region(frame, bbox);
     if face_w < min_edge.get() || face_h < min_edge.get() {
         return Ok(None);
@@ -827,11 +874,15 @@ impl FaceIdentifier {
         frame
             .validate()
             .map_err(|error| crate::FancamError::invalid_frame(error.to_string()))?;
-        let mut candidates: Vec<BBox> = persons.to_vec();
+        let mut candidates: Vec<BBox> = persons
+            .iter()
+            .copied()
+            .filter(|bbox| bbox.is_valid())
+            .collect();
         candidates.sort_unstable_by(|a, b| {
             rank_candidate(*b, search_hint)
-                .partial_cmp(&rank_candidate(*a, search_hint))
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&rank_candidate(*a, search_hint))
+                .then_with(|| compare_bbox_tie(a, b))
         });
         let mut candidates = apply_search_gate(candidates, search_hint);
         candidates.truncate(max_candidates.max(1));
@@ -864,14 +915,14 @@ impl FaceIdentifier {
                     l2_normalize(&extract_first_embedding(&outputs).ok()?)
                 };
 
-                let Some(similarity) = target_gallery
+                let similarity = target_gallery
                     .iter()
                     .filter(|target| target.len() == embedding.len())
                     .map(|target| cosine_similarity(&embedding, target))
-                    .max_by(f32::total_cmp)
-                else {
+                    .max_by(f32::total_cmp)?;
+                if !similarity.is_finite() {
                     return None;
-                };
+                }
 
                 let (impostor_similarity, margin) = if let Some(impostor_similarity) =
                     negative_gallery
@@ -884,6 +935,9 @@ impl FaceIdentifier {
                 } else {
                     (similarity, 0.0)
                 };
+                if !impostor_similarity.is_finite() || !margin.is_finite() {
+                    return None;
+                }
                 Some(FaceObservation {
                     bbox,
                     similarity,
@@ -896,13 +950,9 @@ impl FaceIdentifier {
 
         observations.sort_unstable_by(|a, b| {
             b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    b.margin
-                        .partial_cmp(&a.margin)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .total_cmp(&a.similarity)
+                .then_with(|| b.margin.total_cmp(&a.margin))
+                .then_with(|| compare_bbox_tie(&a.bbox, &b.bbox))
         });
         Ok(observations)
     }
@@ -1118,6 +1168,10 @@ fn extract_first_embedding(outputs: &ort::session::SessionOutputs<'_>) -> Result
 }
 
 fn face_crop_region(frame: &RgbFrame, bbox: BBox) -> (u32, u32, u32, u32) {
+    if !bbox.is_valid() {
+        return (0, 0, 0, 0);
+    }
+
     let bw = bbox.width().max(1.0);
     let bh = bbox.height().max(1.0);
     let aspect = (bw / bh).clamp(0.2, 2.5);
@@ -1392,8 +1446,12 @@ pub fn face_preview_score(frame: &RgbFrame, bbox: BBox) -> f32 {
 }
 
 fn rank_candidate(bbox: BBox, search_hint: Option<(f32, f32)>) -> f32 {
+    if !bbox.is_valid() {
+        return f32::NEG_INFINITY;
+    }
+
     let mut score = bbox.confidence;
-    if let Some((hx, hy)) = search_hint {
+    if let Some((hx, hy)) = search_hint.filter(|(hx, hy)| hx.is_finite() && hy.is_finite()) {
         let dx = bbox.center_x() - hx;
         let dy = bbox.center_y() - hy;
         let distance = dx.hypot(dy);
@@ -1405,7 +1463,7 @@ fn rank_candidate(bbox: BBox, search_hint: Option<(f32, f32)>) -> f32 {
 }
 
 fn apply_search_gate(candidates: Vec<BBox>, search_hint: Option<(f32, f32)>) -> Vec<BBox> {
-    let Some((hx, hy)) = search_hint else {
+    let Some((hx, hy)) = search_hint.filter(|(hx, hy)| hx.is_finite() && hy.is_finite()) else {
         return candidates;
     };
 
@@ -1459,15 +1517,23 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+fn compare_bbox_tie(a: &BBox, b: &BBox) -> Ordering {
+    a.x1.total_cmp(&b.x1)
+        .then_with(|| a.y1.total_cmp(&b.y1))
+        .then_with(|| a.x2.total_cmp(&b.x2))
+        .then_with(|| a.y2.total_cmp(&b.y2))
+        .then_with(|| a.confidence.total_cmp(&b.confidence))
+}
+
 // ── Non-Maximum Suppression ──────────────────────────────────────────────────
 
 /// Greedy NMS: sort by confidence descending, suppress overlapping boxes.
 fn nms(mut boxes: Vec<BBox>, iou_thresh: f32) -> Vec<BBox> {
-    boxes.retain(|b| b.confidence.is_finite());
+    boxes.retain(BBox::is_valid);
     boxes.sort_unstable_by(|a, b| {
         b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&a.confidence)
+            .then_with(|| compare_bbox_tie(a, b))
     });
 
     let mut kept: Vec<BBox> = Vec::new();
@@ -1496,6 +1562,9 @@ fn nms(mut boxes: Vec<BBox>, iou_thresh: f32) -> Vec<BBox> {
 ///
 /// Returns an error if the frame dimensions are invalid.
 pub fn draw_boxes(frame: &mut RgbFrame, boxes: &[BBox], color: [u8; 3]) -> Result<()> {
+    frame
+        .validate()
+        .map_err(|error| crate::FancamError::invalid_frame(error.to_string()))?;
     // Build the image from the existing buffer — no clone; we write back in-place.
     let mut img: RgbImage =
         ImageBuffer::from_raw(frame.width, frame.height, std::mem::take(&mut frame.data))
@@ -1507,6 +1576,9 @@ pub fn draw_boxes(frame: &mut RgbFrame, boxes: &[BBox], color: [u8; 3]) -> Resul
             })?;
 
     for bbox in boxes {
+        if !bbox.is_valid() {
+            continue;
+        }
         let rect = Rect::at(bbox.x1 as i32, bbox.y1 as i32)
             .of_size(bbox.width() as u32, bbox.height() as u32);
         imageproc::drawing::draw_hollow_rect_mut(&mut img, rect, Rgb(color));
@@ -1561,6 +1633,74 @@ mod tests {
     }
 
     #[test]
+    fn bbox_validity_rejects_nonfinite_and_nonpositive_geometry() {
+        let valid = BBox {
+            x1: 10.0,
+            y1: 20.0,
+            x2: 110.0,
+            y2: 220.0,
+            confidence: 0.9,
+        };
+        assert!(valid.is_valid());
+
+        for invalid in [
+            BBox {
+                x1: f32::NAN,
+                ..valid
+            },
+            BBox { x2: 10.0, ..valid },
+            BBox { y2: 20.0, ..valid },
+            BBox {
+                confidence: f32::INFINITY,
+                ..valid
+            },
+        ] {
+            assert!(!invalid.is_valid());
+            assert_eq!(invalid.iou(&valid), 0.0);
+        }
+    }
+
+    #[test]
+    fn nms_discards_invalid_boxes_and_orders_equal_confidence_deterministically() {
+        let left = BBox {
+            x1: 10.0,
+            y1: 10.0,
+            x2: 110.0,
+            y2: 110.0,
+            confidence: 0.8,
+        };
+        let overlapping = BBox {
+            x1: 12.0,
+            y1: 12.0,
+            x2: 108.0,
+            y2: 108.0,
+            confidence: 0.8,
+        };
+        let distant = BBox {
+            x1: 300.0,
+            y1: 10.0,
+            x2: 360.0,
+            y2: 90.0,
+            confidence: 0.8,
+        };
+        let invalid = BBox {
+            x1: f32::NAN,
+            ..left
+        };
+
+        let kept = nms(vec![overlapping, invalid, distant, left], 0.45);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].x1, left.x1);
+        assert_eq!(kept[1].x1, distant.x1);
+
+        let reversed = nms(vec![left, distant, overlapping], 0.45);
+        assert_eq!(
+            reversed.iter().map(|bbox| bbox.x1).collect::<Vec<_>>(),
+            kept.iter().map(|bbox| bbox.x1).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn face_crop_region_stays_in_bounds() {
         let frame = frame(1920, 1080);
         let bbox = BBox {
@@ -1576,6 +1716,32 @@ mod tests {
         assert!(w > 0 && h > 0);
         assert!(x + w <= frame.width);
         assert!(y + h <= frame.height);
+    }
+
+    #[test]
+    fn invalid_bbox_crop_and_face_score_are_safe() {
+        let frame = frame(1920, 1080);
+        let invalid = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 90.0,
+            y2: 200.0,
+            confidence: 0.8,
+        };
+
+        assert_eq!(face_crop_region(&frame, invalid), (0, 0, 0, 0));
+        assert_eq!(face_presence_score(&frame, invalid), 0.0);
+        assert_eq!(face_preview_score(&frame, invalid), 0.0);
+    }
+
+    #[test]
+    fn draw_boxes_rejects_invalid_frames_without_dropping_the_buffer() {
+        let mut frame = frame(32, 32);
+        frame.data.pop();
+        let original = frame.data.clone();
+
+        assert!(draw_boxes(&mut frame, &[], [255, 0, 0]).is_err());
+        assert_eq!(frame.data, original);
     }
 
     #[test]

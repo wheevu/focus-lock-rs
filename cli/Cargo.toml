@@ -10,6 +10,7 @@ fancam-core  = { path = "../fancam-core" }
 clap         = { workspace = true }
 indicatif    = { workspace = true }
 anyhow       = { workspace = true }
+ctrlc        = "3.4"
 ffmpeg-next  = { workspace = true }
 image        = { workspace = true }
 tracing      = { workspace = true }

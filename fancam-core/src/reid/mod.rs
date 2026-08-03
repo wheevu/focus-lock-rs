@@ -194,7 +194,7 @@ impl BodyReidentifier {
 
         self.annotate_observations_with_gallery(frame, &mut legacy, target_gallery)?;
 
-        for (identity, face) in observations.iter_mut().zip(legacy.into_iter()) {
+        for (identity, face) in observations.iter_mut().zip(legacy) {
             identity.body_similarity = face.body_similarity;
             identity.sync_default_cues();
         }
