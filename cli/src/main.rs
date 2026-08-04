@@ -28,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 use fancam_core::{
     detection::{Detector, FaceIdentifier, draw_boxes},
     mode::ProcessingMode,
-    pipeline::Pipeline,
+    pipeline::{Analyzer, OfflinePrepassProgress, Pipeline, Renderer},
     plan::CropPlanV1,
     runtime::OrtConfig,
     video::{
@@ -95,7 +95,7 @@ enum Commands {
         #[arg(long, default_value_t = 0.6)]
         threshold: f32,
 
-        /// Face detection model (SCRFD, e.g. models/det_500m.onnx).
+        /// Face detection model (SCRFD, e.g. `models/det_500m.onnx`).
         /// When provided, candidate face crops use detected faces instead of heuristic head regions.
         #[arg(long)]
         face_det_model: Option<PathBuf>,
@@ -177,7 +177,7 @@ fn main() -> Result<()> {
             output,
         } => {
             OrtConfig::ensure_initialized().context("failed to initialize ONNX Runtime")?;
-            cmd_detect(input, model, output)
+            cmd_detect(input, &model, &output)
         }
         Commands::Doctor => cmd_doctor(),
         Commands::InspectIdentity {
@@ -278,6 +278,12 @@ fn validate_fancam_inputs(
     Ok(())
 }
 
+#[derive(Clone, Copy, Default)]
+struct PlanPaths<'a> {
+    input: Option<&'a Path>,
+    output: Option<&'a Path>,
+}
+
 fn validate_plan_paths(
     video: &Path,
     bias: &Path,
@@ -285,8 +291,7 @@ fn validate_plan_paths(
     yolo_model: &Path,
     face_model: &Path,
     identity_model: Option<&Path>,
-    plan_input: Option<&Path>,
-    plan_output: Option<&Path>,
+    plan_paths: PlanPaths<'_>,
 ) -> Result<()> {
     let output_canonical = canonical_output_file(output)?;
     let sources = [
@@ -300,7 +305,8 @@ fn validate_plan_paths(
         .map(|(label, path)| canonical_input_file(label, path))
         .collect::<Result<Vec<_>>>()?;
 
-    let input_canonical = plan_input
+    let input_canonical = plan_paths
+        .input
         .map(|path| canonical_input_file("plan input", path))
         .transpose()?;
     if let Some(input_canonical) = input_canonical.as_ref()
@@ -309,7 +315,7 @@ fn validate_plan_paths(
         bail!("plan input must be different from the video output");
     }
 
-    let plan_output_canonical = plan_output.map(canonical_output_file).transpose()?;
+    let plan_output_canonical = plan_paths.output.map(canonical_output_file).transpose()?;
     if let Some(plan_output_canonical) = plan_output_canonical.as_ref() {
         if plan_output_canonical == &output_canonical {
             bail!("plan output must be different from the video output");
@@ -377,10 +383,10 @@ fn canonical_output_file(path: &Path) -> Result<PathBuf> {
 fn install_cancellation_handler(cancel_flag: &Arc<AtomicBool>) -> Result<()> {
     let cancel_flag = Arc::clone(cancel_flag);
     ctrlc::set_handler(move || {
-        if !cancel_flag.swap(true, Ordering::SeqCst) {
-            eprintln!("Cancellation requested; stopping after the current frame…");
-        } else {
+        if cancel_flag.swap(true, Ordering::SeqCst) {
             eprintln!("Cancellation is already in progress.");
+        } else {
+            eprintln!("Cancellation requested; stopping after the current frame…");
         }
     })
     .context("failed to install Ctrl-C handler")
@@ -388,16 +394,16 @@ fn install_cancellation_handler(cancel_flag: &Arc<AtomicBool>) -> Result<()> {
 
 // ── Phase 2: person detection ─────────────────────────────────────────────────
 
-fn cmd_detect(input: PathBuf, model: PathBuf, output: PathBuf) -> Result<()> {
+fn cmd_detect(input: PathBuf, model: &Path, output: &Path) -> Result<()> {
     info!("Phase 2 — person detection");
 
-    let mut detector = Detector::load(&model)
+    let mut detector = Detector::load(model)
         .with_context(|| format!("failed to load model: {}", model.display()))?;
 
     let pb = spinner("Detecting persons…");
     let pb2 = pb.clone();
 
-    transcode(input, &output, move |frame: &mut RgbFrame| {
+    transcode(input, output, move |frame: &mut RgbFrame| {
         pb2.tick();
         match detector.detect(frame) {
             Ok(boxes) => {
@@ -458,20 +464,13 @@ fn cmd_fancam(options: FancamOptions) -> Result<()> {
         &yolo_model,
         &face_model,
         identity_model.as_deref(),
-        plan_input.as_deref(),
-        plan_output.as_deref(),
+        PlanPaths {
+            input: plan_input.as_deref(),
+            output: plan_output.as_deref(),
+        },
     )?;
 
-    let input_plan = plan_input
-        .as_ref()
-        .map(CropPlanV1::read_from_path)
-        .transpose()
-        .with_context(|| {
-            plan_input.as_ref().map_or_else(
-                || "failed to read crop plan".to_string(),
-                |path| format!("failed to read crop plan {}", path.display()),
-            )
-        })?;
+    let input_plan = read_input_plan(plan_input.as_deref())?;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     install_cancellation_handler(&cancel_flag)?;
@@ -495,117 +494,170 @@ fn cmd_fancam(options: FancamOptions) -> Result<()> {
         })?;
 
     let total = total_frames(&video);
-    let prepass_pb = frame_progress(total, "Prepass");
-    let prepass_pb_for_hook = prepass_pb.clone();
-    let cancel_prepass = Arc::clone(&cancel_flag);
     let needs_plan = plan_output.is_some() || input_plan.is_some();
-    let offline_parts = if needs_plan {
-        pipeline
-            .into_parts_with_offline_solution_and_plan_with_hooks(
-                &video,
-                move |progress| {
-                    if total > 0 {
-                        prepass_pb_for_hook.set_position(progress.decoded_frames.min(total));
-                        prepass_pb_for_hook
-                            .set_message(format!("Prepass: {} sampled", progress.sampled_frames));
-                    } else {
-                        prepass_pb_for_hook.set_message(format!(
-                            "Prepass: {} decoded, {} sampled",
-                            progress.decoded_frames, progress.sampled_frames
-                        ));
-                    }
-                    prepass_pb_for_hook.tick();
-                },
-                move || cancel_prepass.load(Ordering::Relaxed),
-            )
-            .map(|(analyzer, renderer, plan)| (analyzer, renderer, Some(plan)))
-    } else {
-        pipeline
-            .into_parts_with_offline_solution_with_hooks(
-                &video,
-                move |progress| {
-                    if total > 0 {
-                        prepass_pb_for_hook.set_position(progress.decoded_frames.min(total));
-                        prepass_pb_for_hook
-                            .set_message(format!("Prepass: {} sampled", progress.sampled_frames));
-                    } else {
-                        prepass_pb_for_hook.set_message(format!(
-                            "Prepass: {} decoded, {} sampled",
-                            progress.decoded_frames, progress.sampled_frames
-                        ));
-                    }
-                    prepass_pb_for_hook.tick();
-                },
-                move || cancel_prepass.load(Ordering::Relaxed),
-            )
-            .map(|(analyzer, renderer)| (analyzer, renderer, None))
-    };
-    let (mut analyzer, mut renderer, generated_plan) = match offline_parts {
-        Ok(parts) => {
-            prepass_pb.finish_with_message("Prepass complete.");
-            parts
-        }
-        Err(error) => {
-            prepass_pb.abandon_with_message(if cancel_flag.load(Ordering::Relaxed) {
-                "Prepass cancelled."
-            } else {
-                "Prepass failed."
-            });
-            return Err(error);
-        }
-    };
+    let (mut analyzer, renderer, generated_plan) = run_offline_prepass(
+        pipeline,
+        &video,
+        total,
+        needs_plan,
+        &cancel_flag,
+        &frame_progress(total, "Prepass"),
+    )?;
 
     if let Some(mut plan) = generated_plan {
-        if let Some(input_plan) = input_plan {
-            plan.ensure_source_fingerprint_matches(&input_plan.source_fingerprint)
-                .context("crop plan input belongs to a different source video")?;
-            plan.manual_keyframes = input_plan.manual_keyframes;
-            plan.validate()
-                .context("manual keyframes made crop plan invalid")?;
-            analyzer.enable_offline_from_plan(&plan);
-        }
+        apply_manual_plan(&mut plan, input_plan, &mut analyzer)?;
         if let Some(plan_output) = plan_output {
             plan.write_to_path(&plan_output)
                 .with_context(|| format!("failed to write crop plan {}", plan_output.display()))?;
         }
     }
 
-    let render_pb = frame_progress(total, "Render");
-    let render_pb_for_progress = render_pb.clone();
-    let cancel_render = Arc::clone(&cancel_flag);
-
-    let transcode_result = transcode_with_progress_staged_mode_fallible(
+    render_with_progress(
         video,
         &output,
         total,
-        cancel_render,
-        move |frame| analyzer.analyze(frame),
+        &cancel_flag,
+        (analyzer, renderer),
+        mode,
+        &frame_progress(total, "Render"),
+    )
+}
+
+fn read_input_plan(path: Option<&Path>) -> Result<Option<CropPlanV1>> {
+    path.map(CropPlanV1::read_from_path)
+        .transpose()
+        .with_context(|| {
+            path.map_or_else(
+                || "failed to read crop plan".to_string(),
+                |path| format!("failed to read crop plan {}", path.display()),
+            )
+        })
+}
+
+fn prepass_progress_hook(pb: &ProgressBar, total: u64, progress: OfflinePrepassProgress) {
+    if total > 0 {
+        pb.set_position(progress.decoded_frames.min(total));
+        pb.set_message(format!("Prepass: {} sampled", progress.sampled_frames));
+    } else {
+        pb.set_message(format!(
+            "Prepass: {} decoded, {} sampled",
+            progress.decoded_frames, progress.sampled_frames
+        ));
+    }
+    pb.tick();
+}
+
+/// Run the offline prepass that builds tracklets and solves the camera path,
+/// reporting progress and honouring the cancellation flag.
+fn run_offline_prepass(
+    pipeline: Pipeline,
+    video: &Path,
+    total: u64,
+    needs_plan: bool,
+    cancel: &Arc<AtomicBool>,
+    pb: &ProgressBar,
+) -> Result<(Analyzer, Renderer, Option<CropPlanV1>)> {
+    let pb_for_hook = pb.clone();
+    let cancel_prepass = Arc::clone(cancel);
+    let parts = if needs_plan {
+        pipeline
+            .into_parts_with_offline_solution_and_plan_with_hooks(
+                video,
+                move |progress| prepass_progress_hook(&pb_for_hook, total, progress),
+                move || cancel_prepass.load(Ordering::Relaxed),
+            )
+            .map(|(analyzer, renderer, plan)| (analyzer, renderer, Some(plan)))
+    } else {
+        pipeline
+            .into_parts_with_offline_solution_with_hooks(
+                video,
+                move |progress| prepass_progress_hook(&pb_for_hook, total, progress),
+                move || cancel_prepass.load(Ordering::Relaxed),
+            )
+            .map(|(analyzer, renderer)| (analyzer, renderer, None))
+    };
+    match parts {
+        Ok(parts) => {
+            pb.finish_with_message("Prepass complete.");
+            Ok(parts)
+        }
+        Err(error) => {
+            pb.abandon_with_message(if cancel.load(Ordering::Relaxed) {
+                "Prepass cancelled."
+            } else {
+                "Prepass failed."
+            });
+            Err(error)
+        }
+    }
+}
+
+/// Overlay manual keyframes from an existing plan onto the freshly generated
+/// plan and re-validate the result.
+fn apply_manual_plan(
+    generated: &mut CropPlanV1,
+    input: Option<CropPlanV1>,
+    analyzer: &mut Analyzer,
+) -> Result<()> {
+    let Some(input_plan) = input else {
+        return Ok(());
+    };
+    generated
+        .ensure_source_fingerprint_matches(&input_plan.source_fingerprint)
+        .context("crop plan input belongs to a different source video")?;
+    generated.manual_keyframes = input_plan.manual_keyframes;
+    generated
+        .validate()
+        .context("manual keyframes made crop plan invalid")?;
+    analyzer.enable_offline_from_plan(generated);
+    Ok(())
+}
+
+/// Render the final fancam using the solved camera path, with progress and
+/// cancellation handling.
+fn render_with_progress(
+    video: PathBuf,
+    output: &Path,
+    total: u64,
+    cancel: &Arc<AtomicBool>,
+    parts: (Analyzer, Renderer),
+    mode: ProcessingMode,
+    pb: &ProgressBar,
+) -> Result<()> {
+    let mut parts: (Analyzer, Renderer) = parts;
+    let pb_for_progress = pb.clone();
+    let transcode_result = transcode_with_progress_staged_mode_fallible(
+        video,
+        output,
+        total,
+        Arc::clone(cancel),
+        move |frame| parts.0.analyze(frame),
         move |frame: &mut RgbFrame, camera| {
-            renderer.render_checked(frame, camera)?;
+            parts.1.render_checked(frame, camera)?;
             Ok(())
         },
         mode,
         move |current, reported_total| {
             if total > 0 {
-                render_pb_for_progress.set_position(current.min(total));
-                render_pb_for_progress.set_message(format!("Render: {current}/{total} frames"));
+                pb_for_progress.set_position(current.min(total));
+                pb_for_progress.set_message(format!("Render: {current}/{total} frames"));
             } else if reported_total > 0 {
-                render_pb_for_progress
+                pb_for_progress
                     .set_message(format!("Render: {current}/{reported_total} frames"));
             } else {
-                render_pb_for_progress.set_message(format!("Render: {current} frames"));
+                pb_for_progress.set_message(format!("Render: {current} frames"));
             }
-            render_pb_for_progress.tick();
+            pb_for_progress.tick();
         },
     );
 
     match transcode_result {
         Ok(()) => {
-            render_pb.finish_with_message("Fancam saved.");
+            pb.finish_with_message("Fancam saved.");
             Ok(())
         }
         Err(error) => {
-            render_pb.abandon_with_message(if cancel_flag.load(Ordering::Relaxed) {
+            pb.abandon_with_message(if cancel.load(Ordering::Relaxed) {
                 "Fancam cancelled."
             } else {
                 "Fancam failed."
@@ -688,54 +740,13 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
     println!("  ✓ YOLO loaded\n");
 
     // Optionally load face detector
-    let mut face_detector: Option<fancam_core::face::FaceDetector> = None;
-    if let Some(ref fd_path) = face_det_model {
-        println!("Loading face detector model...");
-        match fancam_core::face::FaceDetector::load(fd_path) {
-            Ok(fd) => {
-                face_detector = Some(fd);
-                println!("  ✓ Face detector loaded\n");
-            }
-            Err(e) => {
-                println!("  ⚠ Face detector load failed: {e} (proceeding without)\n");
-            }
-        }
-    }
+    let mut face_detector = load_face_detector(face_det_model.as_deref());
 
     // Load identity model and embed reference
     // If face detector is available, first find a face in the reference image
     print!("Loading ArcFace model and embedding reference...");
-    let identifier = if let Some(ref mut fd) = face_detector {
-        // Load the reference image and detect a face in it
-        let ref_rgb = load_reference_as_rgb_frame(&bias)?;
-        let ref_faces = fd.detect(&ref_rgb)?;
-        if let Some(best_face) = ref_faces.into_iter().max_by(|a, b| {
-            a.confidence
-                .partial_cmp(&b.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            let cropped_reference = crop_face_from_frame(&ref_rgb, &best_face)?;
-            println!(" ✓ face detected (conf={:.2})", best_face.confidence);
-            FaceIdentifier::load_from_rgb_image(
-                &face_model,
-                &cropped_reference,
-                threshold.clamp(0.0, 1.0),
-            )
-            .with_context(|| format!("failed to load ArcFace model: {}", face_model.display()))?
-        } else {
-            println!(" ⚠ no face detected in reference image, using full image as fallback");
-            FaceIdentifier::load(&face_model, &bias, threshold.clamp(0.0, 1.0)).with_context(
-                || format!("failed to load ArcFace model: {}", face_model.display()),
-            )?
-        }
-    } else {
-        FaceIdentifier::load(&face_model, &bias, threshold.clamp(0.0, 1.0)).with_context(|| {
-            format!(
-                "failed to load ArcFace model or embed reference: {}",
-                bias.display()
-            )
-        })?
-    };
+    let identifier =
+        embed_reference_identity(&mut face_detector, &face_model, &bias, threshold)?;
     println!(
         "  ✓ Reference embedded (threshold={:.2})\n",
         identifier.similarity_threshold()
@@ -744,30 +755,14 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
     // Sample frames and score identity candidates
     println!("Scanning video: {}", video.display());
     println!(
-        "  Sample every {} frame(s), max {} frames\n",
-        sample_every, max_frames
+        "  Sample every {sample_every} frame(s), max {max_frames} frames\n"
     );
 
-    let mut summary = IdentityInspectSummary {
-        frames_decoded: 0,
-        frames_sampled: 0,
-        frames_with_detections: 0,
-        total_detections: 0,
-        candidates_checked: 0,
-        candidates_with_faces: 0,
-        candidates_heuristic: 0,
-        candidates_skipped_no_face: 0,
-        best_similarity: f32::NEG_INFINITY,
-        best_similarity_mode: ScoringMode::NoScore,
-        second_best_similarity: None,
-        accepted_matches: 0,
-        rejected_matches: 0,
-        best_frame: 0,
-        best_bbox: (0.0, 0.0, 0.0, 0.0),
-        threshold: identifier.similarity_threshold(),
+    let mut summary = initial_inspect_summary(
+        identifier.similarity_threshold(),
         reference_warning,
-        face_detector_loaded: face_detector.is_some(),
-    };
+        face_detector.is_some(),
+    );
 
     let pb = spinner("Inspecting identity...");
     let pb2 = pb.clone();
@@ -799,39 +794,8 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
         summary.total_detections += persons.len() as u64;
 
         // If face detector is available, filter persons to only those with detected faces
-        let persons_to_score = if let Some(ref mut fd) = face_detector {
-            let mut face_persons = Vec::new();
-            let mut no_face_count = 0u64;
-            for person in &persons {
-                match fd.best_face_in_person_bbox(frame, *person, 0.05) {
-                    Ok(Some(_face)) => {
-                        face_persons.push(*person);
-                        summary.candidates_with_faces += 1;
-                    }
-                    Ok(None) => {
-                        no_face_count += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!("face detection error: {e}");
-                        no_face_count += 1;
-                    }
-                }
-            }
-            summary.candidates_skipped_no_face += no_face_count;
-            if face_persons.is_empty() {
-                // Fallback: if no face detected for any person, use all persons with heuristic
-                summary.candidates_skipped_no_face = summary
-                    .candidates_skipped_no_face
-                    .saturating_sub(persons.len() as u64);
-                summary.candidates_heuristic += persons.len() as u64;
-                persons
-            } else {
-                face_persons
-            }
-        } else {
-            summary.candidates_heuristic += persons.len() as u64;
-            persons
-        };
+        let persons_to_score =
+            filter_persons_by_face(frame, &persons, &mut face_detector, &mut summary);
 
         // Score identity candidates
         let observations = match identifier.observations(frame, &persons_to_score, None) {
@@ -843,33 +807,7 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
         };
 
         summary.candidates_checked += observations.len() as u64;
-
-        for obs in &observations {
-            if obs.similarity >= identifier.similarity_threshold()
-                && obs.margin >= identifier.margin_threshold()
-            {
-                summary.accepted_matches += 1;
-            } else {
-                summary.rejected_matches += 1;
-            }
-
-            if obs.similarity > summary.best_similarity {
-                summary.second_best_similarity = Some(summary.best_similarity);
-                summary.best_similarity = obs.similarity;
-                summary.best_frame = summary.frames_decoded;
-                summary.best_bbox = (obs.bbox.x1, obs.bbox.y1, obs.bbox.x2, obs.bbox.y2);
-                summary.best_similarity_mode = if summary.face_detector_loaded {
-                    ScoringMode::FaceDetected
-                } else {
-                    ScoringMode::HeuristicFallback
-                };
-            } else if summary.best_similarity.is_finite() {
-                let second = summary.second_best_similarity.get_or_insert(obs.similarity);
-                if obs.similarity > *second {
-                    *second = obs.similarity;
-                }
-            }
-        }
+        score_observations(&mut summary, &identifier, &observations);
 
         Ok(false)
     })
@@ -879,7 +817,43 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
     println!();
     print_identity_summary(&summary);
     println!();
+    print_identity_verdict(&summary, threshold);
 
+    Ok(())
+}
+
+/// Start an empty inspection summary; `threshold` mirrors the identifier's
+/// effective similarity threshold.
+fn initial_inspect_summary(
+    threshold: f32,
+    reference_warning: Option<String>,
+    face_detector_loaded: bool,
+) -> IdentityInspectSummary {
+    IdentityInspectSummary {
+        frames_decoded: 0,
+        frames_sampled: 0,
+        frames_with_detections: 0,
+        total_detections: 0,
+        candidates_checked: 0,
+        candidates_with_faces: 0,
+        candidates_heuristic: 0,
+        candidates_skipped_no_face: 0,
+        best_similarity: f32::NEG_INFINITY,
+        best_similarity_mode: ScoringMode::NoScore,
+        second_best_similarity: None,
+        accepted_matches: 0,
+        rejected_matches: 0,
+        best_frame: 0,
+        best_bbox: (0.0, 0.0, 0.0, 0.0),
+        threshold,
+        reference_warning,
+        face_detector_loaded,
+    }
+}
+
+/// Print post-scan guidance: missed matches, missing detections, and a
+/// threshold suggestion when the best similarity falls short.
+fn print_identity_verdict(summary: &IdentityInspectSummary, threshold: f32) {
     if summary.accepted_matches == 0 && summary.frames_with_detections > 0 {
         let best = if summary.best_similarity.is_finite() {
             format!("{:.3}", summary.best_similarity)
@@ -887,12 +861,11 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
             "N/A".to_string()
         };
         println!(
-            "  ⚠ No identity matches at threshold {:.2} (best similarity was {})",
-            threshold, best
+            "  ⚠ No identity matches at threshold {threshold:.2} (best similarity was {best})"
         );
         if let Some(second) = summary.second_best_similarity {
             let margin = summary.best_similarity - second;
-            println!("    Margin over next candidate: {:.3}", margin);
+            println!("    Margin over next candidate: {margin:.3}");
         }
         if summary.reference_warning.is_some() {
             println!("    Note: Reference image may not contain a clear face.");
@@ -911,11 +884,139 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
         );
         println!("    or use a better reference image.");
     }
-
-    Ok(())
 }
 
-/// Load an image as an RgbFrame for face detection.
+/// Load the optional SCRFD face detector; a load failure degrades to `None`
+/// (heuristic crops) instead of aborting the inspection.
+fn load_face_detector(path: Option<&Path>) -> Option<fancam_core::face::FaceDetector> {
+    let path = path?;
+    println!("Loading face detector model...");
+    match fancam_core::face::FaceDetector::load(path) {
+        Ok(fd) => {
+            println!("  ✓ Face detector loaded\n");
+            Some(fd)
+        }
+        Err(e) => {
+            println!("  ⚠ Face detector load failed: {e} (proceeding without)\n");
+            None
+        }
+    }
+}
+
+/// Embed the reference identity, preferring a face-detected crop of the
+/// reference image when a face detector is available.
+fn embed_reference_identity(
+    face_detector: &mut Option<fancam_core::face::FaceDetector>,
+    face_model: &Path,
+    bias: &Path,
+    threshold: f32,
+) -> Result<FaceIdentifier> {
+    let threshold = threshold.clamp(0.0, 1.0);
+    if let Some(fd) = face_detector {
+        let ref_rgb = load_reference_as_rgb_frame(bias)?;
+        let ref_faces = fd.detect(&ref_rgb)?;
+        if let Some(best_face) = ref_faces.into_iter().max_by(|a, b| {
+            a.confidence
+                .partial_cmp(&b.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            let cropped_reference = crop_face_from_frame(&ref_rgb, &best_face)?;
+            println!(" ✓ face detected (conf={:.2})", best_face.confidence);
+            FaceIdentifier::load_from_rgb_image(face_model, &cropped_reference, threshold)
+                .with_context(|| format!("failed to load ArcFace model: {}", face_model.display()))
+        } else {
+            println!(" ⚠ no face detected in reference image, using full image as fallback");
+            FaceIdentifier::load(face_model, bias, threshold)
+                .with_context(|| format!("failed to load ArcFace model: {}", face_model.display()))
+        }
+    } else {
+        FaceIdentifier::load(face_model, bias, threshold).with_context(|| {
+            format!(
+                "failed to load ArcFace model or embed reference: {}",
+                bias.display()
+            )
+        })
+    }
+}
+
+/// Restrict candidates to persons with a detected face; falls back to all
+/// persons (heuristic crops) when no face is found in the frame.
+fn filter_persons_by_face(
+    frame: &RgbFrame,
+    persons: &[fancam_core::detection::BBox],
+    face_detector: &mut Option<fancam_core::face::FaceDetector>,
+    summary: &mut IdentityInspectSummary,
+) -> Vec<fancam_core::detection::BBox> {
+    let Some(fd) = face_detector else {
+        summary.candidates_heuristic += persons.len() as u64;
+        return persons.to_vec();
+    };
+    let mut face_persons = Vec::new();
+    let mut no_face_count = 0u64;
+    for person in persons {
+        match fd.best_face_in_person_bbox(frame, *person, 0.05) {
+            Ok(Some(_face)) => {
+                face_persons.push(*person);
+                summary.candidates_with_faces += 1;
+            }
+            Ok(None) => {
+                no_face_count += 1;
+            }
+            Err(e) => {
+                tracing::warn!("face detection error: {e}");
+                no_face_count += 1;
+            }
+        }
+    }
+    summary.candidates_skipped_no_face += no_face_count;
+    if face_persons.is_empty() {
+        // Fallback: if no face detected for any person, use all persons with heuristic
+        summary.candidates_skipped_no_face = summary
+            .candidates_skipped_no_face
+            .saturating_sub(persons.len() as u64);
+        summary.candidates_heuristic += persons.len() as u64;
+        persons.to_vec()
+    } else {
+        face_persons
+    }
+}
+
+/// Fold scored observations into the running summary (best match, margin, and
+/// accept/reject tallies).
+fn score_observations(
+    summary: &mut IdentityInspectSummary,
+    identifier: &FaceIdentifier,
+    observations: &[fancam_core::detection::FaceObservation],
+) {
+    for obs in observations {
+        if obs.similarity >= identifier.similarity_threshold()
+            && obs.margin >= identifier.margin_threshold()
+        {
+            summary.accepted_matches += 1;
+        } else {
+            summary.rejected_matches += 1;
+        }
+
+        if obs.similarity > summary.best_similarity {
+            summary.second_best_similarity = Some(summary.best_similarity);
+            summary.best_similarity = obs.similarity;
+            summary.best_frame = summary.frames_decoded;
+            summary.best_bbox = (obs.bbox.x1, obs.bbox.y1, obs.bbox.x2, obs.bbox.y2);
+            summary.best_similarity_mode = if summary.face_detector_loaded {
+                ScoringMode::FaceDetected
+            } else {
+                ScoringMode::HeuristicFallback
+            };
+        } else if summary.best_similarity.is_finite() {
+            let second = summary.second_best_similarity.get_or_insert(obs.similarity);
+            if obs.similarity > *second {
+                *second = obs.similarity;
+            }
+        }
+    }
+}
+
+/// Load an image as an [`RgbFrame`] for face detection.
 fn load_reference_as_rgb_frame(path: &Path) -> Result<RgbFrame> {
     let img = image::ImageReader::open(path)
         .map_err(|e| anyhow::anyhow!("cannot open image: {e}"))?
@@ -931,7 +1032,11 @@ fn load_reference_as_rgb_frame(path: &Path) -> Result<RgbFrame> {
     })
 }
 
-/// Crop a face region from a frame based on a FaceBox (expands slightly around the bbox).
+/// Crop a face region from a frame based on a `FaceBox` (expands slightly around the bbox).
+///
+/// All float coordinates are clamped to the valid pixel range before the `u32`
+/// conversion, so the casts cannot truncate or lose the sign.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 fn crop_face_from_frame(
     frame: &RgbFrame,
     face_box: &fancam_core::face::FaceBox,
@@ -975,6 +1080,11 @@ fn crop_face_from_frame(
         .ok_or_else(|| anyhow::anyhow!("cropped face buffer size mismatch"))
 }
 
+/// Heuristic check that the reference image is not blank or too small.
+///
+/// Pixel counts are small enough that converting the count to `f32` cannot
+/// lose meaningful precision for the variance heuristic.
+#[allow(clippy::cast_precision_loss)]
 fn validate_reference_image(path: &Path) -> Option<String> {
     if !path.is_file() {
         return Some(format!("reference image not found: {}", path.display()));
@@ -1003,27 +1113,32 @@ fn validate_reference_image(path: &Path) -> Option<String> {
     if n == 0 {
         return Some("reference image has no pixels".to_string());
     }
-    let mean_r = pixels.iter().step_by(3).map(|&v| v as f32).sum::<f32>() / n as f32;
+    let mean_r = pixels
+        .iter()
+        .step_by(3)
+        .map(|&v| f32::from(v))
+        .sum::<f32>()
+        / n as f32;
     let mean_g = pixels
         .iter()
         .skip(1)
         .step_by(3)
-        .map(|&v| v as f32)
+        .map(|&v| f32::from(v))
         .sum::<f32>()
         / n as f32;
     let mean_b = pixels
         .iter()
         .skip(2)
         .step_by(3)
-        .map(|&v| v as f32)
+        .map(|&v| f32::from(v))
         .sum::<f32>()
         / n as f32;
     let variance = pixels
         .chunks_exact(3)
         .map(|c| {
-            let dr = c[0] as f32 - mean_r;
-            let dg = c[1] as f32 - mean_g;
-            let db = c[2] as f32 - mean_b;
+            let dr = f32::from(c[0]) - mean_r;
+            let dg = f32::from(c[1]) - mean_g;
+            let db = f32::from(c[2]) - mean_b;
             dr * dr + dg * dg + db * db
         })
         .sum::<f32>()
@@ -1032,8 +1147,7 @@ fn validate_reference_image(path: &Path) -> Option<String> {
 
     if std_dev < 5.0 {
         return Some(format!(
-            "reference image appears near-blank (std_dev={:.1}). ArcFace requires a recognizable face crop.",
-            std_dev
+            "reference image appears near-blank (std_dev={std_dev:.1}). ArcFace requires a recognizable face crop."
         ));
     }
 
@@ -1063,7 +1177,7 @@ fn print_identity_summary(s: &IdentityInspectSummary) {
     println!("  Best similarity:      {:.4}", s.best_similarity);
     println!("  Best similarity mode: {:?}", s.best_similarity_mode);
     if let Some(second) = s.second_best_similarity {
-        println!("  Second best:          {:.4}", second);
+        println!("  Second best:          {second:.4}");
         println!("  Margin:               {:.4}", s.best_similarity - second);
     }
     println!(
@@ -1098,8 +1212,27 @@ fn cmd_doctor() -> Result<()> {
     println!();
 
     let mut all_ok = true;
+    all_ok &= doctor_platform();
+    all_ok &= doctor_ffmpeg();
+    all_ok &= doctor_ort_library();
+    all_ok &= doctor_ort_init();
+    all_ok &= doctor_model_files();
+    all_ok &= doctor_output_directory();
 
-    // 1. Platform
+    println!(
+        "╚═══ {}",
+        if all_ok {
+            "all checks passed"
+        } else {
+            "some checks failed — see above"
+        }
+    );
+
+    // Use process exit to avoid ORT C++ runtime cleanup crash during global dtor
+    std::process::exit(i32::from(!all_ok));
+}
+
+fn doctor_platform() -> bool {
     println!("[1/6] Platform");
     println!(
         "  OS:   {} {}",
@@ -1108,37 +1241,37 @@ fn cmd_doctor() -> Result<()> {
     );
     println!("  Rust: {}", rustc_version());
     println!();
+    true
+}
 
-    // 2. FFmpeg
+fn doctor_ffmpeg() -> bool {
     println!("[2/6] FFmpeg");
     match ffmpeg_next::init() {
         Ok(()) => println!("  ✓ FFmpeg initialized"),
         Err(e) => {
             println!("  ✗ FFmpeg init failed: {e}");
-            all_ok = false;
+            return false;
         }
     }
     println!();
+    true
+}
 
-    // 3. ONNX Runtime dylib
+fn doctor_ort_library() -> bool {
     println!("[3/6] ONNX Runtime library");
-    let found_ort = match std::env::var("ORT_DYLIB_PATH") {
-        Ok(ref path) => {
-            let exists = Path::new(path).is_file();
-            println!("  ORT_DYLIB_PATH = {path}");
-            if exists {
-                println!("  ✓ file exists");
-                true
-            } else {
-                println!("  ✗ file does not exist");
-                all_ok = false;
-                false
-            }
-        }
-        Err(_) => {
-            println!("  ORT_DYLIB_PATH not set (will auto-discover)");
+    let found_ort = if let Ok(ref path) = std::env::var("ORT_DYLIB_PATH") {
+        let exists = Path::new(path).is_file();
+        println!("  ORT_DYLIB_PATH = {path}");
+        if exists {
+            println!("  ✓ file exists");
+            true
+        } else {
+            println!("  ✗ file does not exist");
             false
         }
+    } else {
+        println!("  ORT_DYLIB_PATH not set (will auto-discover)");
+        false
     };
     if !found_ort {
         let found: Vec<_> = OrtConfig::candidates()
@@ -1151,16 +1284,17 @@ fn cmd_doctor() -> Result<()> {
             println!("    - models/onnxruntime/lib/");
             println!("    - /opt/homebrew/lib/");
             println!("    - ORT_DYLIB_PATH environment variable");
-            all_ok = false;
-        } else {
-            for cand in &found {
-                println!("  ✓ found: {}", cand.display());
-            }
+            return false;
+        }
+        for cand in &found {
+            println!("  ✓ found: {}", cand.display());
         }
     }
     println!();
+    true
+}
 
-    // 4. ONNX Runtime init (dylib presence check only)
+fn doctor_ort_init() -> bool {
     // Full session init is skipped to avoid C++ runtime cleanup crash on exit.
     // Run `focus-lock detect` or `focus-lock fancam` to validate model loading.
     println!("[4/6] ONNX Runtime initialization (light check)");
@@ -1170,12 +1304,14 @@ fn cmd_doctor() -> Result<()> {
         }
         Err(e) => {
             println!("  ✗ {e}");
-            all_ok = false;
+            return false;
         }
     }
     println!();
+    true
+}
 
-    // 5. Model files
+fn doctor_model_files() -> bool {
     println!("[5/6] Model files");
     let expected_models = &[
         ("YOLO", "models/yolov8n.onnx"),
@@ -1183,6 +1319,7 @@ fn cmd_doctor() -> Result<()> {
         ("Body ReID", "models/osnet_x0_25_msmt17.onnx"),
         ("Face Detector (SCRFD)", "models/det_500m.onnx"),
     ];
+    let mut ok = true;
     for (label, rel_path) in expected_models {
         let path = Path::new(rel_path);
         let mark = if path.is_file() { "✓" } else { "✗" };
@@ -1192,14 +1329,16 @@ fn cmd_doctor() -> Result<()> {
                 Err(_) => String::new(),
             }
         } else {
-            all_ok = false;
+            ok = false;
             String::new()
         };
         println!("  [{mark}] {label}: {rel_path}{size}");
     }
     println!();
+    ok
+}
 
-    // 6. Output directory
+fn doctor_output_directory() -> bool {
     println!("[6/6] Output directory");
     let cwd = std::env::current_dir().unwrap_or_default();
     let writable = fs::metadata(&cwd).is_ok_and(|m| !m.permissions().readonly());
@@ -1207,21 +1346,9 @@ fn cmd_doctor() -> Result<()> {
         println!("  ✓ current directory writable: {}", cwd.display());
     } else {
         println!("  ✗ current directory not writable: {}", cwd.display());
-        all_ok = false;
     }
     println!();
-
-    println!(
-        "╚═══ {}",
-        if all_ok {
-            "all checks passed"
-        } else {
-            "some checks failed — see above"
-        }
-    );
-
-    // Use process exit to avoid ORT C++ runtime cleanup crash during global dtor
-    std::process::exit(if all_ok { 0 } else { 1 });
+    writable
 }
 
 fn rustc_version() -> String {
@@ -1229,11 +1356,14 @@ fn rustc_version() -> String {
     v.to_string()
 }
 
+/// Format a byte count for display; `f64` is exact well beyond any realistic
+/// model file size.
+#[allow(clippy::cast_precision_loss)]
 fn human_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
     let mut size = bytes as f64;
     let mut unit_idx = 0;
-    while size > 1024.0 && unit_idx < UNITS.len() - 1 {
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
         size /= 1024.0;
         unit_idx += 1;
     }
@@ -1489,8 +1619,10 @@ mod tests {
             &yolo_model,
             &face_model,
             None,
-            Some(&plan_input),
-            Some(&plan_output),
+            PlanPaths {
+                input: Some(&plan_input),
+                output: Some(&plan_output),
+            },
         )
         .expect("distinct plan paths should be valid");
 
@@ -1502,8 +1634,10 @@ mod tests {
                 &yolo_model,
                 &face_model,
                 None,
-                Some(&plan_input),
-                Some(&dir.path().join("fancam.mp4")),
+                PlanPaths {
+                    input: Some(&plan_input),
+                    output: Some(&dir.path().join("fancam.mp4")),
+                },
             )
             .is_err()
         );
@@ -1515,8 +1649,10 @@ mod tests {
                 &yolo_model,
                 &face_model,
                 None,
-                Some(&plan_input),
-                Some(&plan_input),
+                PlanPaths {
+                    input: Some(&plan_input),
+                    output: Some(&plan_input),
+                },
             )
             .is_err()
         );
@@ -1534,5 +1670,14 @@ mod tests {
             validate_fancam_inputs(&video, &bias, &output, &yolo_model, &face_model, None, 0.6)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn human_size_uses_next_unit_at_exact_1024_boundaries() {
+        assert_eq!(human_size(1023), "1023.0 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1025), "1.0 KB");
+        assert_eq!(human_size(1_048_576), "1.0 MB");
+        assert_eq!(human_size(12_300_000), "11.7 MB");
     }
 }
