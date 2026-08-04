@@ -1,5 +1,8 @@
 <script lang="ts">
-  import { invokeCommand as invoke } from './lib/tauri';
+  import CropPlanEditor from './lib/CropPlanEditor.svelte';
+  import { defaultCropPlanPath, type CropPlanV1, type ManualKeyframe } from './lib/cropPlan';
+  import { CropPlanSaveQueue } from './lib/cropPlanSaveQueue';
+  import { invokeCommand as invoke, readCropPlan, writeCropPlan } from './lib/tauri';
   import { listen } from '@tauri-apps/api/event';
   import { open, save } from '@tauri-apps/plugin-dialog';
   import { onMount, onDestroy } from 'svelte';
@@ -33,6 +36,13 @@
     StorageWorkerStatus,
   } from './lib/contracts';
 
+  type AppProps = {
+    cropPlan?: CropPlanV1 | null;
+    onCropPlanChange?: (manualKeyframes: ManualKeyframe[]) => void;
+  };
+
+  let { onCropPlanChange }: AppProps = $props();
+
   // ── State ─────────────────────────────────────────────────────────────────
 
   let videoPath    = $state('');
@@ -50,6 +60,12 @@
   let totFrames  = $state(0);
   let errMsg     = $state('');
   let resultPath = $state('');
+  let cropPlan   = $state<CropPlanV1 | null>(null);
+  let cropPlanPath = $state('');
+  let cropPlanOutputPath = $state('');
+  let cropPlanMessage = $state('');
+  let cropPlanError = $state('');
+  const cropPlanSaves = new CropPlanSaveQueue(writeCropPlan);
 
   let scanStatus: ScanStatus = $state('idle');
   let scanMessage = $state('');
@@ -312,6 +328,13 @@
       filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'mkv', 'avi', 'webm'] }],
     });
     if (typeof selected === 'string') {
+      if (videoPath && videoPath !== selected) {
+        cropPlan = null;
+        cropPlanPath = '';
+        cropPlanOutputPath = '';
+        cropPlanMessage = '';
+        cropPlanError = '';
+      }
       videoPath = selected;
       if (!outputPath) {
         outputPath = selected.replace(/\.[^.]+$/, '_fancam.mp4');
@@ -340,6 +363,79 @@
       defaultPath: outputPath || 'fancam.mp4',
     });
     if (selected) outputPath = selected;
+  }
+
+  async function pickCropPlan() {
+    cropPlanError = '';
+    cropPlanMessage = '';
+    if (!videoPath) {
+      cropPlanError = 'choose a video before loading a crop plan';
+      return;
+    }
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: 'Crop plan', extensions: ['json'] }],
+    });
+    if (typeof selected !== 'string') return;
+    try {
+      cropPlan = await readCropPlan(selected, videoPath);
+      cropPlanPath = selected;
+      cropPlanOutputPath = '';
+      cropPlanMessage = 'loaded and matched to this video';
+    } catch (error: unknown) {
+      cropPlan = null;
+      cropPlanPath = '';
+      cropPlanError = String(error);
+    }
+  }
+
+  async function saveCropPlanAt(path: string, plan: CropPlanV1) {
+    const receipt = await cropPlanSaves.save(path, plan);
+    if (receipt.revision === cropPlanSaves.revision) {
+      cropPlanPath = path;
+      cropPlanMessage = 'saved';
+      cropPlanError = '';
+    }
+  }
+
+  async function pickCropPlanOutput() {
+    const selected = await save({
+      filters: [{ name: 'Crop plan', extensions: ['json'] }],
+      defaultPath: cropPlanOutputPath || defaultCropPlanPath(outputPath),
+    });
+    if (selected) cropPlanOutputPath = selected;
+  }
+
+  async function saveCropPlan() {
+    if (!cropPlan) return;
+    cropPlanError = '';
+    cropPlanMessage = '';
+    let target = cropPlanPath;
+    if (!target) {
+      const selected = await save({
+        filters: [{ name: 'Crop plan', extensions: ['json'] }],
+        defaultPath: 'crop-plan.json',
+      });
+      if (!selected) return;
+      target = selected;
+    }
+    try {
+      await saveCropPlanAt(target, cropPlan);
+    } catch (error: unknown) {
+      cropPlanError = String(error);
+    }
+  }
+
+  function handleCropPlanChange(manualKeyframes: ManualKeyframe[]) {
+    if (!cropPlan) return;
+    cropPlan = { ...cropPlan, manual_keyframes: manualKeyframes };
+    onCropPlanChange?.(manualKeyframes);
+    if (cropPlanPath) {
+      void saveCropPlanAt(cropPlanPath, cropPlan).catch((error: unknown) => {
+        cropPlanError = String(error);
+        cropPlanMessage = '';
+      });
+    }
   }
 
   async function pickYolo() {
@@ -1403,6 +1499,16 @@
 
   async function startJob() {
     if (!canRenderNow()) return;
+    try {
+      await cropPlanSaves.flush();
+    } catch (error: unknown) {
+      status = 'error';
+      errMsg = `crop plan save failed: ${String(error)}`;
+      return;
+    }
+    const generatedPlanPath = cropPlan
+      ? null
+      : cropPlanOutputPath || defaultCropPlanPath(outputPath);
     activeRenderRunId = nextClientRunId('render');
     status   = 'running';
     progress = 0;
@@ -1436,6 +1542,8 @@
               selected_identity_id: selectedIdentityId,
               target_anchor_x: selectedAnchorX,
               target_anchor_y: selectedAnchorY,
+              plan_input: cropPlanPath || null,
+              plan_output: generatedPlanPath,
             },
           }
       );
@@ -1453,6 +1561,17 @@
         resultPath = result.output_path ?? '';
         progress = 1;
         etaSeconds = 0;
+        if (generatedPlanPath) {
+          try {
+            cropPlan = await readCropPlan(generatedPlanPath, videoPath);
+            cropPlanPath = generatedPlanPath;
+            cropPlanOutputPath = '';
+            cropPlanMessage = 'created with this render';
+            cropPlanError = '';
+          } catch (error: unknown) {
+            cropPlanError = `render completed, but the crop plan could not be loaded: ${String(error)}`;
+          }
+        }
       }
     } catch (e: unknown) {
       status = 'error';
@@ -2008,6 +2127,32 @@
         </button>
       </div>
 
+      <div class="input-block" class:filled={!!cropPlan}>
+        <div class="input-label">crop plan sidecar</div>
+        <div class="file-row">
+          <button type="button" class="drop-zone small" onclick={pickCropPlan} disabled={isBusy()}>
+            {#if cropPlanPath}
+              <span class="filename">{basename(cropPlanPath)}</span>
+            {:else if cropPlanOutputPath || outputPath}
+              <span class="placeholder">will create {basename(cropPlanOutputPath || defaultCropPlanPath(outputPath))}</span>
+            {:else}
+              <span class="placeholder">click to load crop plan</span>
+            {/if}
+          </button>
+          {#if cropPlan}
+            <button type="button" class="ghost-btn" onclick={saveCropPlan} disabled={isBusy()}>
+              save sidecar
+            </button>
+          {:else}
+            <button type="button" class="ghost-btn" onclick={pickCropPlanOutput} disabled={isBusy() || !outputPath}>
+              choose path
+            </button>
+          {/if}
+        </div>
+        {#if cropPlanMessage}<div class="queue-msg">{cropPlanMessage}</div>{/if}
+        {#if cropPlanError}<div class="scan-error">{cropPlanError}</div>{/if}
+      </div>
+
       <div
         class="input-block scan-block"
         class:filled={scanStatus === 'done'}
@@ -2272,6 +2417,13 @@
           {/if}
         {/if}
       </div>
+
+      {#if cropPlan}
+        <CropPlanEditor
+          plan={cropPlan}
+          onManualKeyframesChange={handleCropPlanChange}
+        />
+      {/if}
 
     </section>
 

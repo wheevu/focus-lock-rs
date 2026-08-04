@@ -20,7 +20,9 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::{
     codec, encoder, format, frame, media, software::scaling, util::rational::Rational,
 };
-use std::fs;
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -30,7 +32,17 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use crate::{mode::ProcessingMode, tracking::CameraState};
+use crate::{
+    mode::ProcessingMode,
+    plan::{
+        SOURCE_FINGERPRINT_ALGORITHM, SOURCE_FINGERPRINT_VERSION, SourceVideoFingerprint,
+        VideoMetadata,
+    },
+    tracking::CameraState,
+};
+
+const FINGERPRINT_BLOCK_BYTES: u64 = 64 * 1024;
+const FINGERPRINT_MAX_BLOCKS: usize = 16;
 
 /// Output pixel format for the encoder (`YUV420p` is universally compatible).
 const ENCODE_FORMAT: format::Pixel = format::Pixel::YUV420P;
@@ -1022,6 +1034,140 @@ pub fn total_frames<P: AsRef<Path>>(input_path: P) -> u64 {
     0
 }
 
+/// Probe the metadata needed by a privacy-safe crop plan.
+///
+/// The returned value intentionally excludes the source path, codec-private
+/// metadata, and any decoded pixels.  A zero frame-rate component means that
+/// the container did not expose a reliable average frame rate.
+pub fn probe_video_metadata<P: AsRef<Path>>(input_path: P) -> Result<VideoMetadata> {
+    ffmpeg::init().context("failed to initialise FFmpeg")?;
+    let ictx = open_input_with_hwaccel(&input_path)?;
+    let format_duration = ictx.duration();
+    let input_video_stream = ictx
+        .streams()
+        .best(media::Type::Video)
+        .context("no video stream found in input")?;
+    let fps = input_video_stream.avg_frame_rate();
+    let frame_rate_num = if fps.numerator() > 0 {
+        fps.numerator() as u32
+    } else {
+        0
+    };
+    let frame_rate_den = if fps.denominator() > 0 {
+        fps.denominator() as u32
+    } else {
+        0
+    };
+    let stream_duration = input_video_stream.duration();
+    let time_base = input_video_stream.time_base();
+    let duration_seconds = if stream_duration > 0 && time_base.denominator() > 0 {
+        stream_duration as f64 * f64::from(time_base.numerator())
+            / f64::from(time_base.denominator())
+    } else if format_duration > 0 {
+        format_duration as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
+    } else {
+        0.0
+    };
+    let duration_ms = (duration_seconds.is_finite() && duration_seconds > 0.0)
+        .then(|| (duration_seconds * 1000.0).round() as u64);
+    let frame_count = if input_video_stream.frames() > 0 {
+        input_video_stream.frames() as u64
+    } else if duration_seconds > 0.0 && frame_rate_num > 0 && frame_rate_den > 0 {
+        (duration_seconds * f64::from(frame_rate_num) / f64::from(frame_rate_den)).round() as u64
+    } else {
+        0
+    };
+
+    let decoder_ctx = codec::context::Context::from_parameters(input_video_stream.parameters())
+        .context("failed to build decoder context")?;
+    let decoder = decoder_ctx
+        .decoder()
+        .video()
+        .context("failed to open video decoder")?;
+
+    Ok(VideoMetadata {
+        width: decoder.width(),
+        height: decoder.height(),
+        frame_count,
+        frame_rate_num,
+        frame_rate_den,
+        duration_ms,
+    })
+}
+
+/// Compute the bounded, path-free source fingerprint used by crop plans.
+///
+/// The digest reads at most 1 MiB from the raw container, plus canonical
+/// metadata. It is intentionally not a full-file hash; callers must treat the
+/// algorithm/version as part of the match contract.
+pub fn fingerprint_video<P: AsRef<Path>>(
+    input_path: P,
+    metadata: &VideoMetadata,
+) -> Result<SourceVideoFingerprint> {
+    let mut file = File::open(input_path.as_ref()).with_context(|| {
+        format!(
+            "failed to open source video {}",
+            input_path.as_ref().display()
+        )
+    })?;
+    let file_size = file
+        .metadata()
+        .context("failed to inspect source video size")?
+        .len();
+    let offsets = fingerprint_offsets(file_size);
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_FINGERPRINT_ALGORITHM.as_bytes());
+    hasher.update(SOURCE_FINGERPRINT_VERSION.to_be_bytes());
+    hasher.update(metadata.width.to_be_bytes());
+    hasher.update(metadata.height.to_be_bytes());
+    hasher.update(metadata.frame_count.to_be_bytes());
+    hasher.update(metadata.frame_rate_num.to_be_bytes());
+    hasher.update(metadata.frame_rate_den.to_be_bytes());
+    hasher.update(metadata.duration_ms.unwrap_or(0).to_be_bytes());
+    hasher.update(file_size.to_be_bytes());
+
+    let mut sampled_bytes = 0u64;
+    let mut buffer = vec![0u8; FINGERPRINT_BLOCK_BYTES as usize];
+    for offset in offsets {
+        let length = (file_size - offset).min(FINGERPRINT_BLOCK_BYTES) as usize;
+        file.seek(SeekFrom::Start(offset))
+            .context("failed to seek source video for fingerprint")?;
+        file.read_exact(&mut buffer[..length])
+            .context("failed to read source video fingerprint window")?;
+        hasher.update(offset.to_be_bytes());
+        hasher.update((length as u64).to_be_bytes());
+        hasher.update(&buffer[..length]);
+        sampled_bytes = sampled_bytes.saturating_add(length as u64);
+    }
+
+    Ok(SourceVideoFingerprint {
+        version: SOURCE_FINGERPRINT_VERSION,
+        algorithm: SOURCE_FINGERPRINT_ALGORITHM.to_string(),
+        digest: format!("{:x}", hasher.finalize()),
+        file_size,
+        sampled_bytes,
+    })
+}
+
+fn fingerprint_offsets(file_size: u64) -> Vec<u64> {
+    if file_size == 0 {
+        return Vec::new();
+    }
+    if file_size <= FINGERPRINT_BLOCK_BYTES {
+        return vec![0];
+    }
+    let max_offset = file_size - FINGERPRINT_BLOCK_BYTES;
+    let mut offsets = Vec::with_capacity(FINGERPRINT_MAX_BLOCKS);
+    for index in 0..FINGERPRINT_MAX_BLOCKS {
+        let offset = max_offset.saturating_mul(index as u64)
+            / (FINGERPRINT_MAX_BLOCKS.saturating_sub(1) as u64);
+        if offsets.last().copied() != Some(offset) {
+            offsets.push(offset);
+        }
+    }
+    offsets
+}
+
 /// Open an input file while hinting hardware decode when available.
 ///
 /// This attempts to open with macOS `VideoToolbox` first and falls back to
@@ -1198,6 +1344,42 @@ mod tests {
             pts: 0,
         };
         assert!(frame.validate().is_err());
+    }
+
+    #[test]
+    fn source_fingerprint_is_path_independent_and_binds_sampled_content() {
+        let nonce = TEMP_OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "focus-lock-fingerprint-fixture-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create fingerprint fixture directory");
+        let first = root.join("first.bin");
+        let second = root.join("second.bin");
+        let bytes = (0..(128 * 1024))
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&first, &bytes).expect("write first fixture");
+        fs::write(&second, &bytes).expect("write second fixture");
+        let metadata = VideoMetadata {
+            width: 1920,
+            height: 1080,
+            frame_count: 120,
+            frame_rate_num: 30,
+            frame_rate_den: 1,
+            duration_ms: Some(4_000),
+        };
+        let first_fingerprint = fingerprint_video(&first, &metadata).expect("fingerprint first");
+        let second_fingerprint = fingerprint_video(&second, &metadata).expect("fingerprint second");
+        assert_eq!(first_fingerprint, second_fingerprint);
+
+        let mut changed = bytes;
+        changed[0] ^= 0xff;
+        fs::write(&second, changed).expect("change sampled fixture bytes");
+        let changed_fingerprint =
+            fingerprint_video(&second, &metadata).expect("fingerprint changed");
+        assert_ne!(first_fingerprint.digest, changed_fingerprint.digest);
+        fs::remove_dir_all(root).expect("cleanup fingerprint fixture");
     }
 
     #[test]

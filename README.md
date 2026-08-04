@@ -200,6 +200,27 @@ Rendering is optimized for vertical fancam output while remaining resilient when
 
 This keeps output usable even when the tracker cannot confidently maintain a tight crop for every frame.
 
+## Crop-plan sidecars
+
+`--plan-output` writes a versioned `focus-lock.crop-plan` JSON sidecar. Frame
+indices are one-based throughout the decoder, Rust plan, and Svelte editor:
+valid source frames are `1..=frame_count`. Crop centers are stored after the
+same frame-boundary normalization used by the renderer, so an imported plan
+does not silently render a different crop at an edge. The frame count is the
+actual number decoded by the offline prepass, not a container estimate, and V1
+plans use the renderer's fixed 1080x1920 output.
+
+Each plan includes a `sha256-sampled-container-v1` source fingerprint. It hashes
+canonical metadata, file length, and at most sixteen evenly spaced 64 KiB raw
+container windows (1 MiB maximum); it excludes paths, decoded pixels, and
+embeddings. This bounded identity catches many source substitutions without
+the cost of a full-file hash, but changes outside the sampled windows can go
+undetected. `--plan-input` and the desktop importer reject a fingerprint
+mismatch before applying manual corrections.
+
+The desktop render flow creates a sidecar beside the output by default using
+`<output-stem>.crop-plan.json`; the path can be changed before rendering.
+
 ## Interfaces
 
 The project supports two main usage paths:

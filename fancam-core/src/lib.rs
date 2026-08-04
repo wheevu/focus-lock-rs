@@ -58,6 +58,7 @@ pub mod face;
 pub mod mode;
 pub mod observation;
 pub mod pipeline;
+pub mod plan;
 pub mod reid;
 pub mod rendering;
 pub mod runtime;

@@ -31,6 +31,7 @@ use anyhow::Result;
 use crate::camera::CameraCursor;
 use crate::detection::{BBox, Detector, FaceIdentifier};
 use crate::mode::ProcessingMode;
+use crate::plan::{CropPlanV1, ShotBoundary, ShotBoundaryKind};
 use crate::reid::BodyReidentifier;
 use crate::rendering::FrameRenderer;
 use crate::solver::{self, SolverResult};
@@ -44,6 +45,89 @@ const TRACKLET_MIN_IOU: f32 = 0.12;
 const TRACKLET_MAX_CENTER_DISTANCE_NORM: f32 = 0.24;
 const OBS_MATCH_MIN_SCORE: f32 = 0.56;
 
+const SHOT_SIGNATURE_WIDTH: usize = 8;
+const SHOT_SIGNATURE_HEIGHT: usize = 4;
+const SHOT_CUT_THRESHOLD: f32 = 0.32;
+const SHOT_BOUNDARY_COOLDOWN: u64 = 8;
+
+#[derive(Debug, Default)]
+struct ShotDetector {
+    previous: Option<(u64, [u8; SHOT_SIGNATURE_WIDTH * SHOT_SIGNATURE_HEIGHT])>,
+    last_boundary: Option<u64>,
+    boundaries: Vec<ShotBoundary>,
+}
+
+impl ShotDetector {
+    fn observe(&mut self, frame_index: u64, frame: &RgbFrame) {
+        let Some(signature) = frame_signature(frame) else {
+            return;
+        };
+        if let Some((previous_frame, previous)) = self.previous {
+            let difference = signature_difference(previous, signature);
+            let outside_cooldown = self.last_boundary.is_none_or(|boundary| {
+                frame_index.saturating_sub(boundary) >= SHOT_BOUNDARY_COOLDOWN
+            });
+            if difference >= SHOT_CUT_THRESHOLD && outside_cooldown {
+                let confidence = ((difference - SHOT_CUT_THRESHOLD) / (1.0 - SHOT_CUT_THRESHOLD))
+                    .clamp(0.0, 1.0);
+                self.boundaries.push(ShotBoundary {
+                    frame_index,
+                    confidence,
+                    kind: ShotBoundaryKind::HardCut,
+                });
+                self.last_boundary = Some(frame_index);
+            }
+            if frame_index <= previous_frame {
+                self.boundaries.clear();
+                self.last_boundary = None;
+            }
+        }
+        self.previous = Some((frame_index, signature));
+    }
+
+    fn finish(mut self) -> Vec<ShotBoundary> {
+        self.boundaries
+            .sort_unstable_by_key(|boundary| boundary.frame_index);
+        self.boundaries
+            .dedup_by_key(|boundary| boundary.frame_index);
+        self.boundaries
+    }
+}
+
+fn frame_signature(frame: &RgbFrame) -> Option<[u8; SHOT_SIGNATURE_WIDTH * SHOT_SIGNATURE_HEIGHT]> {
+    if frame.validate().is_err() {
+        return None;
+    }
+    let mut signature = [0u8; SHOT_SIGNATURE_WIDTH * SHOT_SIGNATURE_HEIGHT];
+    for row in 0..SHOT_SIGNATURE_HEIGHT {
+        let y = ((row * frame.height as usize) / SHOT_SIGNATURE_HEIGHT)
+            .min(frame.height.saturating_sub(1) as usize);
+        for column in 0..SHOT_SIGNATURE_WIDTH {
+            let x = ((column * frame.width as usize) / SHOT_SIGNATURE_WIDTH)
+                .min(frame.width.saturating_sub(1) as usize);
+            let offset = (y * frame.width as usize + x) * 3;
+            let red = u16::from(frame.data[offset]);
+            let green = u16::from(frame.data[offset + 1]);
+            let blue = u16::from(frame.data[offset + 2]);
+            signature[row * SHOT_SIGNATURE_WIDTH + column] =
+                ((red * 77 + green * 150 + blue * 29) / 256) as u8;
+        }
+    }
+    Some(signature)
+}
+
+fn signature_difference(
+    left: [u8; SHOT_SIGNATURE_WIDTH * SHOT_SIGNATURE_HEIGHT],
+    right: [u8; SHOT_SIGNATURE_WIDTH * SHOT_SIGNATURE_HEIGHT],
+) -> f32 {
+    let total = left
+        .into_iter()
+        .zip(right)
+        .map(|(left, right)| u16::from(left.abs_diff(right)))
+        .sum::<u16>();
+    f32::from(total) / (SHOT_SIGNATURE_WIDTH * SHOT_SIGNATURE_HEIGHT) as f32 / f32::from(u8::MAX)
+}
+
 /// Progress updates emitted while building offline prepass tracklets.
 #[derive(Debug, Clone, Copy)]
 pub struct OfflinePrepassProgress {
@@ -51,6 +135,14 @@ pub struct OfflinePrepassProgress {
     pub decoded_frames: u64,
     /// Number of sampled frames actually processed for identity cues.
     pub sampled_frames: u64,
+}
+
+fn metadata_with_decoded_frame_count(
+    mut metadata: crate::plan::VideoMetadata,
+    decoded_frames: u64,
+) -> crate::plan::VideoMetadata {
+    metadata.frame_count = decoded_frames;
+    metadata
 }
 
 /// Analyzes video frames to detect and identify the target person.
@@ -232,6 +324,19 @@ impl Analyzer {
         self.offline_frame_index = 0;
     }
 
+    /// Enable offline rendering from a validated crop plan, including manual
+    /// keyframe corrections.
+    pub fn enable_offline_from_plan(&mut self, plan: &CropPlanV1) {
+        let path = plan.camera_path();
+        if path.is_empty() {
+            self.offline_cursor = None;
+            self.offline_frame_index = 0;
+            return;
+        }
+        self.offline_cursor = Some(CameraCursor::from_path(path));
+        self.offline_frame_index = 0;
+    }
+
     /// Disable offline mode and return to online tracking.
     pub fn disable_offline_mode(&mut self) {
         self.offline_cursor = None;
@@ -337,9 +442,29 @@ impl Analyzer {
     pub fn build_tracklets_from_video_with_hooks<P, F, C>(
         &mut self,
         video_path: P,
+        on_progress: F,
+        should_cancel: C,
+    ) -> Result<Vec<Tracklet>>
+    where
+        P: AsRef<Path>,
+        F: FnMut(OfflinePrepassProgress),
+        C: FnMut() -> bool,
+    {
+        self.build_tracklets_from_video_with_hooks_and_shots(video_path, on_progress, should_cancel)
+            .map(|(tracklets, _)| tracklets)
+    }
+
+    /// Pass-1 helper that also records privacy-safe shot boundaries.
+    ///
+    /// Shot detection uses a tiny luma signature and never stores source
+    /// frames. The existing tracklet behavior and sampling cadence are kept
+    /// unchanged.
+    pub fn build_tracklets_from_video_with_hooks_and_shots<P, F, C>(
+        &mut self,
+        video_path: P,
         mut on_progress: F,
         mut should_cancel: C,
-    ) -> Result<Vec<Tracklet>>
+    ) -> Result<(Vec<Tracklet>, Vec<ShotBoundary>)>
     where
         P: AsRef<Path>,
         F: FnMut(OfflinePrepassProgress),
@@ -349,11 +474,14 @@ impl Analyzer {
         let mut tracklets = Vec::<Tracklet>::new();
         let mut sampled_frames = 0u64;
         let sample_stride = self.offline_sample_stride().max(1);
+        let mut shot_detector = ShotDetector::default();
 
         video::for_each_rgb_frame(video_path, |frame_index, frame| {
             if should_cancel() {
                 anyhow::bail!("offline prepass cancelled");
             }
+
+            shot_detector.observe(frame_index, frame);
 
             if sample_stride > 1 && !frame_index.is_multiple_of(sample_stride) {
                 on_progress(OfflinePrepassProgress {
@@ -432,10 +560,13 @@ impl Analyzer {
             Ok(false)
         })?;
 
-        Ok(tracklets
-            .into_iter()
-            .filter(|tracklet| tracklet.len() > 1 || tracklet.best_composite_score() >= 0.66)
-            .collect())
+        Ok((
+            tracklets
+                .into_iter()
+                .filter(|tracklet| tracklet.len() > 1 || tracklet.best_composite_score() >= 0.66)
+                .collect(),
+            shot_detector.finish(),
+        ))
     }
 
     const fn offline_sample_stride(&self) -> u64 {
@@ -889,5 +1020,92 @@ impl Pipeline {
         let solved = self.analyzer.solve_tracklets(&tracklets);
         self.analyzer.enable_offline_from_solver_result(solved);
         Ok((self.analyzer, self.renderer))
+    }
+
+    /// Solve an offline camera path, return its privacy-safe plan, and consume
+    /// the pipeline into render components.
+    pub fn into_parts_with_offline_solution_and_plan_with_hooks<P, F, C>(
+        mut self,
+        video_path: P,
+        mut on_progress: F,
+        should_cancel: C,
+    ) -> Result<(Analyzer, Renderer, CropPlanV1)>
+    where
+        P: AsRef<Path>,
+        F: FnMut(OfflinePrepassProgress),
+        C: FnMut() -> bool,
+    {
+        let metadata = video::probe_video_metadata(&video_path)?;
+        let mut decoded_frames = 0;
+        let (tracklets, shots) = self
+            .analyzer
+            .build_tracklets_from_video_with_hooks_and_shots(
+                &video_path,
+                |progress| {
+                    decoded_frames = progress.decoded_frames;
+                    on_progress(progress);
+                },
+                should_cancel,
+            )?;
+        let metadata = metadata_with_decoded_frame_count(metadata, decoded_frames);
+        let source_fingerprint = video::fingerprint_video(&video_path, &metadata)?;
+        let solved = self.analyzer.solve_tracklets(&tracklets);
+        let plan = CropPlanV1::from_offline_solution(
+            metadata,
+            source_fingerprint,
+            &tracklets,
+            &solved,
+            shots,
+        );
+        self.analyzer.enable_offline_from_solver_result(solved);
+        Ok((self.analyzer, self.renderer, plan))
+    }
+
+    /// Solve an offline camera path and return its privacy-safe plan.
+    pub fn into_parts_with_offline_solution_and_plan<P: AsRef<Path>>(
+        self,
+        video_path: P,
+    ) -> Result<(Analyzer, Renderer, CropPlanV1)> {
+        self.into_parts_with_offline_solution_and_plan_with_hooks(video_path, |_| {}, || false)
+    }
+}
+
+#[cfg(test)]
+mod crop_plan_metadata_tests {
+    use super::metadata_with_decoded_frame_count;
+    use crate::plan::VideoMetadata;
+
+    #[test]
+    fn decoded_prepass_count_replaces_container_estimate() {
+        let metadata = metadata_with_decoded_frame_count(
+            VideoMetadata {
+                width: 1920,
+                height: 1080,
+                frame_count: 120,
+                frame_rate_num: 30,
+                frame_rate_den: 1,
+                duration_ms: Some(4_000),
+            },
+            117,
+        );
+
+        assert_eq!(metadata.frame_count, 117);
+    }
+
+    #[test]
+    fn empty_prepass_does_not_preserve_a_nonzero_estimate() {
+        let metadata = metadata_with_decoded_frame_count(
+            VideoMetadata {
+                width: 1920,
+                height: 1080,
+                frame_count: 120,
+                frame_rate_num: 30,
+                frame_rate_den: 1,
+                duration_ms: Some(4_000),
+            },
+            0,
+        );
+
+        assert_eq!(metadata.frame_count, 0);
     }
 }

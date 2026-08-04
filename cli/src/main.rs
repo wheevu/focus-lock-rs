@@ -29,6 +29,7 @@ use fancam_core::{
     detection::{Detector, FaceIdentifier, draw_boxes},
     mode::ProcessingMode,
     pipeline::Pipeline,
+    plan::CropPlanV1,
     runtime::OrtConfig,
     video::{
         RgbFrame, for_each_rgb_frame, total_frames, transcode,
@@ -145,6 +146,15 @@ enum Commands {
         /// Processing mode: fast, balanced, or quality
         #[arg(long, value_name = "fast|balanced|quality", default_value = "balanced", value_parser = parse_processing_mode)]
         mode: ProcessingMode,
+
+        /// Optional JSON sidecar path for the generated crop plan.
+        #[arg(long)]
+        plan_output: Option<PathBuf>,
+
+        /// Optional existing crop plan whose manual keyframes should override
+        /// the newly generated camera path.
+        #[arg(long)]
+        plan_input: Option<PathBuf>,
     },
 }
 
@@ -201,6 +211,8 @@ fn main() -> Result<()> {
             identity_model,
             threshold,
             mode,
+            plan_output,
+            plan_input,
         } => cmd_fancam(FancamOptions {
             video,
             bias,
@@ -210,6 +222,8 @@ fn main() -> Result<()> {
             identity_model,
             threshold,
             mode,
+            plan_output,
+            plan_input,
         }),
     }
 }
@@ -261,6 +275,58 @@ fn validate_fancam_inputs(
         }
     }
 
+    Ok(())
+}
+
+fn validate_plan_paths(
+    video: &Path,
+    bias: &Path,
+    output: &Path,
+    yolo_model: &Path,
+    face_model: &Path,
+    identity_model: Option<&Path>,
+    plan_input: Option<&Path>,
+    plan_output: Option<&Path>,
+) -> Result<()> {
+    let output_canonical = canonical_output_file(output)?;
+    let sources = [
+        ("video", video),
+        ("bias image", bias),
+        ("YOLO model", yolo_model),
+        ("identity model", identity_model.unwrap_or(face_model)),
+    ];
+    let canonical_sources = sources
+        .into_iter()
+        .map(|(label, path)| canonical_input_file(label, path))
+        .collect::<Result<Vec<_>>>()?;
+
+    let input_canonical = plan_input
+        .map(|path| canonical_input_file("plan input", path))
+        .transpose()?;
+    if let Some(input_canonical) = input_canonical.as_ref()
+        && input_canonical == &output_canonical
+    {
+        bail!("plan input must be different from the video output");
+    }
+
+    let plan_output_canonical = plan_output.map(canonical_output_file).transpose()?;
+    if let Some(plan_output_canonical) = plan_output_canonical.as_ref() {
+        if plan_output_canonical == &output_canonical {
+            bail!("plan output must be different from the video output");
+        }
+        if input_canonical
+            .as_ref()
+            .is_some_and(|input| input == plan_output_canonical)
+        {
+            bail!("plan input and plan output must be different files");
+        }
+        if canonical_sources
+            .iter()
+            .any(|source| source == plan_output_canonical)
+        {
+            bail!("plan output collides with an input or model file");
+        }
+    }
     Ok(())
 }
 
@@ -359,6 +425,8 @@ struct FancamOptions {
     identity_model: Option<PathBuf>,
     threshold: f32,
     mode: ProcessingMode,
+    plan_output: Option<PathBuf>,
+    plan_input: Option<PathBuf>,
 }
 
 fn cmd_fancam(options: FancamOptions) -> Result<()> {
@@ -371,6 +439,8 @@ fn cmd_fancam(options: FancamOptions) -> Result<()> {
         identity_model,
         threshold,
         mode,
+        plan_output,
+        plan_input,
     } = options;
     validate_fancam_inputs(
         &video,
@@ -381,6 +451,27 @@ fn cmd_fancam(options: FancamOptions) -> Result<()> {
         identity_model.as_deref(),
         threshold,
     )?;
+    validate_plan_paths(
+        &video,
+        &bias,
+        &output,
+        &yolo_model,
+        &face_model,
+        identity_model.as_deref(),
+        plan_input.as_deref(),
+        plan_output.as_deref(),
+    )?;
+
+    let input_plan = plan_input
+        .as_ref()
+        .map(CropPlanV1::read_from_path)
+        .transpose()
+        .with_context(|| {
+            plan_input.as_ref().map_or_else(
+                || "failed to read crop plan".to_string(),
+                |path| format!("failed to read crop plan {}", path.display()),
+            )
+        })?;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     install_cancellation_handler(&cancel_flag)?;
@@ -407,26 +498,49 @@ fn cmd_fancam(options: FancamOptions) -> Result<()> {
     let prepass_pb = frame_progress(total, "Prepass");
     let prepass_pb_for_hook = prepass_pb.clone();
     let cancel_prepass = Arc::clone(&cancel_flag);
-    let offline_parts = pipeline
-        .into_parts_with_offline_solution_with_hooks(
-            &video,
-            move |progress| {
-                if total > 0 {
-                    prepass_pb_for_hook.set_position(progress.decoded_frames.min(total));
-                    prepass_pb_for_hook
-                        .set_message(format!("Prepass: {} sampled", progress.sampled_frames));
-                } else {
-                    prepass_pb_for_hook.set_message(format!(
-                        "Prepass: {} decoded, {} sampled",
-                        progress.decoded_frames, progress.sampled_frames
-                    ));
-                }
-                prepass_pb_for_hook.tick();
-            },
-            move || cancel_prepass.load(Ordering::Relaxed),
-        )
-        .context("failed to build offline tracklet/camera solution");
-    let (mut analyzer, mut renderer) = match offline_parts {
+    let needs_plan = plan_output.is_some() || input_plan.is_some();
+    let offline_parts = if needs_plan {
+        pipeline
+            .into_parts_with_offline_solution_and_plan_with_hooks(
+                &video,
+                move |progress| {
+                    if total > 0 {
+                        prepass_pb_for_hook.set_position(progress.decoded_frames.min(total));
+                        prepass_pb_for_hook
+                            .set_message(format!("Prepass: {} sampled", progress.sampled_frames));
+                    } else {
+                        prepass_pb_for_hook.set_message(format!(
+                            "Prepass: {} decoded, {} sampled",
+                            progress.decoded_frames, progress.sampled_frames
+                        ));
+                    }
+                    prepass_pb_for_hook.tick();
+                },
+                move || cancel_prepass.load(Ordering::Relaxed),
+            )
+            .map(|(analyzer, renderer, plan)| (analyzer, renderer, Some(plan)))
+    } else {
+        pipeline
+            .into_parts_with_offline_solution_with_hooks(
+                &video,
+                move |progress| {
+                    if total > 0 {
+                        prepass_pb_for_hook.set_position(progress.decoded_frames.min(total));
+                        prepass_pb_for_hook
+                            .set_message(format!("Prepass: {} sampled", progress.sampled_frames));
+                    } else {
+                        prepass_pb_for_hook.set_message(format!(
+                            "Prepass: {} decoded, {} sampled",
+                            progress.decoded_frames, progress.sampled_frames
+                        ));
+                    }
+                    prepass_pb_for_hook.tick();
+                },
+                move || cancel_prepass.load(Ordering::Relaxed),
+            )
+            .map(|(analyzer, renderer)| (analyzer, renderer, None))
+    };
+    let (mut analyzer, mut renderer, generated_plan) = match offline_parts {
         Ok(parts) => {
             prepass_pb.finish_with_message("Prepass complete.");
             parts
@@ -440,6 +554,21 @@ fn cmd_fancam(options: FancamOptions) -> Result<()> {
             return Err(error);
         }
     };
+
+    if let Some(mut plan) = generated_plan {
+        if let Some(input_plan) = input_plan {
+            plan.ensure_source_fingerprint_matches(&input_plan.source_fingerprint)
+                .context("crop plan input belongs to a different source video")?;
+            plan.manual_keyframes = input_plan.manual_keyframes;
+            plan.validate()
+                .context("manual keyframes made crop plan invalid")?;
+            analyzer.enable_offline_from_plan(&plan);
+        }
+        if let Some(plan_output) = plan_output {
+            plan.write_to_path(&plan_output)
+                .with_context(|| format!("failed to write crop plan {}", plan_output.display()))?;
+        }
+    }
 
     let render_pb = frame_progress(total, "Render");
     let render_pb_for_progress = render_pb.clone();
@@ -1216,6 +1345,34 @@ mod tests {
     }
 
     #[test]
+    fn fancam_accepts_optional_plan_paths() {
+        let cli = Cli::try_parse_from([
+            "focus-lock",
+            "fancam",
+            "--video",
+            "video.mp4",
+            "--bias",
+            "bias.jpg",
+            "--plan-output",
+            "crop-plan.json",
+            "--plan-input",
+            "reviewed-plan.json",
+        ])
+        .expect("parse optional crop plan arguments");
+
+        let Commands::Fancam {
+            plan_output,
+            plan_input,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Fancam command");
+        };
+        assert_eq!(plan_output, Some(PathBuf::from("crop-plan.json")));
+        assert_eq!(plan_input, Some(PathBuf::from("reviewed-plan.json")));
+    }
+
+    #[test]
     fn inspect_identity_rejects_zero_sample_every() {
         let error = Cli::try_parse_from([
             "focus-lock",
@@ -1316,6 +1473,53 @@ mod tests {
 
         validate_fancam_inputs(&video, &bias, &output, &yolo_model, &face_model, None, 0.6)
             .expect("distinct output should be valid");
+    }
+
+    #[test]
+    fn plan_preflight_rejects_collisions_and_allows_distinct_sidecars() {
+        let (dir, video, bias, yolo_model, face_model) = fixture();
+        let plan_input = dir.path().join("reviewed-plan.json");
+        fs::write(&plan_input, b"{}").expect("write plan input");
+        let plan_output = dir.path().join("crop-plan.json");
+
+        validate_plan_paths(
+            &video,
+            &bias,
+            &dir.path().join("fancam.mp4"),
+            &yolo_model,
+            &face_model,
+            None,
+            Some(&plan_input),
+            Some(&plan_output),
+        )
+        .expect("distinct plan paths should be valid");
+
+        assert!(
+            validate_plan_paths(
+                &video,
+                &bias,
+                &dir.path().join("fancam.mp4"),
+                &yolo_model,
+                &face_model,
+                None,
+                Some(&plan_input),
+                Some(&dir.path().join("fancam.mp4")),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_plan_paths(
+                &video,
+                &bias,
+                &dir.path().join("fancam.mp4"),
+                &yolo_model,
+                &face_model,
+                None,
+                Some(&plan_input),
+                Some(&plan_input),
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

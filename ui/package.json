@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --port 1420 --strictPort",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "node --experimental-strip-types --test --test-timeout=5000 src/lib/*.test.ts",
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "cd .. && npx --prefix ui tauri --config src-tauri/tauri.conf.json",

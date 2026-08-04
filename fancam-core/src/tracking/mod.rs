@@ -45,6 +45,8 @@ const BODY_SIMILARITY_WEIGHT: f32 = 0.12;
 pub enum CameraSource {
     /// Camera derived from a confirmed identity observation in this frame.
     Observed,
+    /// Camera position explicitly corrected by a user-authored plan keyframe.
+    Manual,
     /// Camera derived from short-term motion prediction.
     Predicted,
     /// Camera held at the last confirmed lock to avoid drift while uncertain.

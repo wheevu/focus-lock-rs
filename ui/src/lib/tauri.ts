@@ -1,7 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { CropPlanV1, ManualKeyframe } from './cropPlan';
 
 export type CommandName =
   | 'model_dir'
+  | 'read_crop_plan'
+  | 'write_crop_plan'
+  | 'update_crop_plan_keyframe'
   | 'probe_video'
   | 'read_thumbnail'
   | 'scan_identities'
@@ -44,4 +48,32 @@ export async function invokeCommand<T>(command: CommandName, args?: InvokeArgs):
     }
     throw new Error(typeof error === 'string' ? error : JSON.stringify(error));
   }
+}
+
+export type CropPlanWriteResult = {
+  path: string;
+  bytes: number;
+};
+
+/** Load and source-check a crop sidecar through the Tauri boundary. */
+export async function readCropPlan(path: string, video: string): Promise<CropPlanV1> {
+  return invokeCommand<CropPlanV1>('read_crop_plan', { args: { path, video } });
+}
+
+/** Persist a validated crop sidecar through the Tauri boundary. */
+export async function writeCropPlan(
+  path: string,
+  plan: CropPlanV1,
+): Promise<CropPlanWriteResult> {
+  return invokeCommand<CropPlanWriteResult>('write_crop_plan', { args: { path, plan } });
+}
+
+/** Atomically apply one manual correction to an existing sidecar. */
+export async function updateCropPlanKeyframe(
+  path: string,
+  keyframe: ManualKeyframe,
+): Promise<CropPlanV1> {
+  return invokeCommand<CropPlanV1>('update_crop_plan_keyframe', {
+    args: { path, keyframe },
+  });
 }

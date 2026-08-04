@@ -230,7 +230,7 @@ fn compare_camera_state(a: &CameraState, b: &CameraState) -> Ordering {
 
 fn camera_source_rank(source: CameraSource) -> u8 {
     match source {
-        CameraSource::Observed => 0,
+        CameraSource::Observed | CameraSource::Manual => 0,
         CameraSource::Predicted => 1,
         CameraSource::Held => 2,
     }

@@ -177,6 +177,9 @@ pub fn run() {
         .manage(StorageWorkerStore::default())
         .invoke_handler(tauri::generate_handler![
             commands::model_dir,
+            commands::read_crop_plan,
+            commands::write_crop_plan,
+            commands::update_crop_plan_keyframe,
             commands::probe_video,
             commands::read_thumbnail,
             commands::scan_identities,

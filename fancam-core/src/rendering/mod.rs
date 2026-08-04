@@ -121,7 +121,10 @@ impl FrameRenderer {
 
         // During uncertain tracking periods, avoid compounding drift by falling
         // back to a stable full-frame letterbox after an extended miss window.
-        if state.source != CameraSource::Observed && state.miss_count > 16 {
+        if state.source != CameraSource::Observed
+            && state.source != CameraSource::Manual
+            && state.miss_count > 16
+        {
             return self.letterbox_passthrough_inplace(frame);
         }
 

@@ -11,14 +11,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use fancam_core::{
     detection::DEFAULT_IDENTITY_MARGIN_THRESHOLD,
     discovery::{DiscoveryConfig, DiscoveryEngine},
     mode::ProcessingMode,
     pipeline::{OfflinePrepassProgress, Pipeline},
+    plan::{
+        CropPlanV1, ManualKeyframe, read_crop_plan as read_crop_plan_file,
+        write_crop_plan as write_crop_plan_file,
+    },
     runtime::OrtConfig,
-    video::{total_frames, transcode_with_progress_staged_mode_fallible},
+    video::{
+        fingerprint_video, probe_video_metadata, total_frames,
+        transcode_with_progress_staged_mode_fallible,
+    },
 };
 use image::ImageReader;
 use serde::{Deserialize, Serialize};
@@ -35,6 +43,7 @@ static RUN_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 const MAX_PREVIEW_DIMENSION: u32 = 4096;
 const MAX_PREVIEW_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_PREVIEW_ALLOC: u64 = 64 * 1024 * 1024;
+const MAX_CROP_PLAN_BYTES: u64 = 4 * 1024 * 1024;
 
 // ─── DTO types ───────────────────────────────────────────────────────────────
 
@@ -76,6 +85,10 @@ pub struct FancamArgs {
     pub pending_split_ids: Vec<usize>,
     #[serde(default)]
     pub client_run_id: Option<String>,
+    #[serde(default)]
+    pub plan_input: Option<String>,
+    #[serde(default)]
+    pub plan_output: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +103,31 @@ pub struct IdentityScanArgs {
     pub expected_member_count: Option<u32>,
     pub processing_mode: Option<String>,
     pub client_run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CropPlanPathArgs {
+    pub path: String,
+    #[serde(default)]
+    pub video: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CropPlanWriteArgs {
+    pub path: String,
+    pub plan: CropPlanV1,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateCropPlanKeyframeArgs {
+    pub path: String,
+    pub keyframe: ManualKeyframe,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CropPlanWriteResult {
+    pub path: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -507,6 +545,131 @@ pub fn model_dir() -> String {
     std::env::current_dir()
         .map(|d| d.join("models").to_string_lossy().into_owned())
         .unwrap_or_else(|_| "models".to_string())
+}
+
+fn validate_crop_plan_path(path: &str, for_write: bool) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("crop plan path is empty".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if for_write {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if !parent.is_dir() {
+            return Err(format!(
+                "crop plan parent is not a directory: {}",
+                parent.display()
+            ));
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() {
+                return Err("crop plan path must not be a symlink".to_string());
+            }
+            if !metadata.is_file() {
+                return Err("crop plan path is not a regular file".to_string());
+            }
+        }
+        return Ok(path);
+    }
+
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("failed to inspect crop plan {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err("crop plan path must not be a symlink".to_string());
+    }
+    if !metadata.is_file() {
+        return Err("crop plan path is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_CROP_PLAN_BYTES {
+        return Err(format!(
+            "crop plan is larger than the {} byte limit",
+            MAX_CROP_PLAN_BYTES
+        ));
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+pub fn read_crop_plan(args: CropPlanPathArgs) -> Result<CropPlanV1, String> {
+    let path = validate_crop_plan_path(&args.path, false)?;
+    let plan = read_crop_plan_file(&path).map_err(|error| error.to_string())?;
+    let video = args
+        .video
+        .as_deref()
+        .map(str::trim)
+        .filter(|video| !video.is_empty())
+        .ok_or_else(|| "a source video is required to load a crop plan".to_string())?;
+    ensure_crop_plan_matches_video(&plan, video)?;
+    Ok(plan)
+}
+
+fn ensure_crop_plan_matches_video(plan: &CropPlanV1, video: &str) -> Result<(), String> {
+    let probed = probe_video_metadata(video).map_err(|error| error.to_string())?;
+    ensure_crop_plan_metadata_matches(plan, &probed)?;
+
+    // Container frame totals may be estimates. The plan's count came from the
+    // decoded prepass, so use it when rebuilding the fingerprint contract.
+    let mut fingerprint_metadata = probed;
+    fingerprint_metadata.frame_count = plan.video.frame_count;
+    let fingerprint =
+        fingerprint_video(video, &fingerprint_metadata).map_err(|error| error.to_string())?;
+    plan.ensure_source_fingerprint_matches(&fingerprint)
+        .map_err(|error| error.to_string())
+}
+
+fn ensure_crop_plan_metadata_matches(
+    plan: &CropPlanV1,
+    probed: &fancam_core::plan::VideoMetadata,
+) -> Result<(), String> {
+    if plan.video.width != probed.width
+        || plan.video.height != probed.height
+        || plan.video.frame_rate_num != probed.frame_rate_num
+        || plan.video.frame_rate_den != probed.frame_rate_den
+        || plan.video.duration_ms != probed.duration_ms
+    {
+        return Err("crop plan video metadata does not match the selected video".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn write_crop_plan(args: CropPlanWriteArgs) -> Result<CropPlanWriteResult, String> {
+    let path = validate_crop_plan_path(&args.path, true)?;
+    let serialized = serde_json::to_vec(&args.plan).map_err(|error| error.to_string())?;
+    if serialized.len() as u64 > MAX_CROP_PLAN_BYTES {
+        return Err(format!(
+            "crop plan is larger than the {} byte limit",
+            MAX_CROP_PLAN_BYTES
+        ));
+    }
+    write_crop_plan_file(&path, &args.plan).map_err(|error| error.to_string())?;
+    let bytes = fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .len();
+    Ok(CropPlanWriteResult {
+        path: path.to_string_lossy().into_owned(),
+        bytes,
+    })
+}
+
+#[tauri::command]
+pub fn update_crop_plan_keyframe(args: UpdateCropPlanKeyframeArgs) -> Result<CropPlanV1, String> {
+    let path = validate_crop_plan_path(&args.path, false)?;
+    let mut plan = read_crop_plan_file(&path).map_err(|error| error.to_string())?;
+    plan.upsert_manual_keyframe(args.keyframe)
+        .map_err(|error| error.to_string())?;
+    let serialized = serde_json::to_vec(&plan).map_err(|error| error.to_string())?;
+    if serialized.len() as u64 > MAX_CROP_PLAN_BYTES {
+        return Err(format!(
+            "crop plan is larger than the {} byte limit",
+            MAX_CROP_PLAN_BYTES
+        ));
+    }
+    write_crop_plan_file(&path, &plan).map_err(|error| error.to_string())?;
+    Ok(plan)
 }
 
 #[tauri::command]
@@ -3637,6 +3800,57 @@ fn validate_fancam_paths(args: &FancamArgs) -> Result<(), String> {
         ));
     }
 
+    validate_optional_plan_paths(args)?;
+
+    Ok(())
+}
+
+fn validate_optional_plan_paths(args: &FancamArgs) -> Result<(), String> {
+    let video = PathBuf::from(args.video.trim());
+    let bias = PathBuf::from(args.bias.trim());
+    let output = PathBuf::from(args.output.trim());
+    let yolo = PathBuf::from(args.yolo_model.trim());
+    let face = PathBuf::from(effective_identity_model(
+        &args.face_model,
+        args.identity_model.as_deref(),
+    ));
+    let source_paths = [&video, &bias, &output, &yolo, &face];
+
+    let plan_input = args
+        .plan_input
+        .as_deref()
+        .map(|path| validate_crop_plan_path(path, false))
+        .transpose()?;
+    let plan_output = args
+        .plan_output
+        .as_deref()
+        .map(|path| validate_crop_plan_path(path, true))
+        .transpose()?;
+
+    if let Some(plan_input) = plan_input.as_ref() {
+        let plan_input_cmp = canonical_for_compare(plan_input);
+        if source_paths
+            .iter()
+            .any(|source| canonical_for_compare(source) == plan_input_cmp)
+        {
+            return Err("plan input must not replace a video, output, or model file".to_string());
+        }
+    }
+    if let Some(plan_output) = plan_output.as_ref() {
+        let plan_output_cmp = canonical_for_compare(plan_output);
+        if source_paths
+            .iter()
+            .any(|source| canonical_for_compare(source) == plan_output_cmp)
+        {
+            return Err("plan output must not replace a video, output, or model file".to_string());
+        }
+        if plan_input
+            .as_ref()
+            .is_some_and(|input| canonical_for_compare(input) == plan_output_cmp)
+        {
+            return Err("plan input and plan output must be different files".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -3751,6 +3965,13 @@ fn run_pipeline(
         })
         .unwrap_or_default();
 
+    let input_plan = args
+        .plan_input
+        .as_deref()
+        .map(read_crop_plan_file)
+        .transpose()
+        .context("failed to read crop plan input")?;
+
     let pipeline = if !target_gallery.is_empty() {
         Pipeline::load_with_hint_galleries(
             &args.yolo_model,
@@ -3788,31 +4009,80 @@ fn run_pipeline(
     let mut prepass_last_emit = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
-    let (mut analyzer, mut renderer) = pipeline.into_parts_with_offline_solution_with_hooks(
-        &video_path,
-        |progress: OfflinePrepassProgress| {
-            let now = Instant::now();
-            let should_emit = progress.decoded_frames <= 1
-                || now.duration_since(prepass_last_emit) >= Duration::from_millis(180);
-            if !should_emit {
-                return;
-            }
-            prepass_last_emit = now;
+    let needs_plan = args.plan_input.is_some() || args.plan_output.is_some();
+    let offline_parts = if needs_plan {
+        pipeline
+            .into_parts_with_offline_solution_and_plan_with_hooks(
+                &video_path,
+                |progress: OfflinePrepassProgress| {
+                    let now = Instant::now();
+                    let should_emit = progress.decoded_frames <= 1
+                        || now.duration_since(prepass_last_emit) >= Duration::from_millis(180);
+                    if !should_emit {
+                        return;
+                    }
+                    prepass_last_emit = now;
 
-            let decoded = progress.decoded_frames.min(total_for_prepass);
-            let fraction = 0.5 * (decoded as f64 / total_for_prepass as f64);
-            let _ = app.emit(
-                "fancam://progress",
-                ProgressPayload {
-                    run_id: prepass_run_id.clone(),
-                    current: decoded,
-                    total: total_for_prepass,
-                    fraction,
+                    let decoded = progress.decoded_frames.min(total_for_prepass);
+                    let fraction = 0.5 * (decoded as f64 / total_for_prepass as f64);
+                    let _ = app.emit(
+                        "fancam://progress",
+                        ProgressPayload {
+                            run_id: prepass_run_id.clone(),
+                            current: decoded,
+                            total: total_for_prepass,
+                            fraction,
+                        },
+                    );
                 },
-            );
-        },
-        || cancel.load(Ordering::Relaxed),
-    )?;
+                || cancel.load(Ordering::Relaxed),
+            )
+            .map(|(analyzer, renderer, plan)| (analyzer, renderer, Some(plan)))
+    } else {
+        pipeline
+            .into_parts_with_offline_solution_with_hooks(
+                &video_path,
+                |progress: OfflinePrepassProgress| {
+                    let now = Instant::now();
+                    let should_emit = progress.decoded_frames <= 1
+                        || now.duration_since(prepass_last_emit) >= Duration::from_millis(180);
+                    if !should_emit {
+                        return;
+                    }
+                    prepass_last_emit = now;
+
+                    let decoded = progress.decoded_frames.min(total_for_prepass);
+                    let fraction = 0.5 * (decoded as f64 / total_for_prepass as f64);
+                    let _ = app.emit(
+                        "fancam://progress",
+                        ProgressPayload {
+                            run_id: prepass_run_id.clone(),
+                            current: decoded,
+                            total: total_for_prepass,
+                            fraction,
+                        },
+                    );
+                },
+                || cancel.load(Ordering::Relaxed),
+            )
+            .map(|(analyzer, renderer)| (analyzer, renderer, None))
+    }?;
+    let (mut analyzer, mut renderer, generated_plan) = offline_parts;
+
+    if let Some(mut plan) = generated_plan {
+        if let Some(input_plan) = input_plan {
+            plan.ensure_source_fingerprint_matches(&input_plan.source_fingerprint)
+                .context("crop plan input belongs to a different source video")?;
+            plan.manual_keyframes = input_plan.manual_keyframes;
+            plan.validate()
+                .context("manual keyframes made crop plan invalid")?;
+            analyzer.enable_offline_from_plan(&plan);
+        }
+        if let Some(plan_output) = args.plan_output.as_deref() {
+            write_crop_plan_file(plan_output, &plan)
+                .with_context(|| format!("failed to write crop plan {plan_output}"))?;
+        }
+    }
 
     let cancel_analyze = Arc::clone(&cancel);
     let cancel_render = Arc::clone(&cancel);
@@ -3887,10 +4157,18 @@ mod tests {
     };
 
     use super::{
-        FancamArgs, QueryIdentityScansArgs, QueryScanEventsArgs, RenderJobGuard, RenderJobStore,
-        ScanJobGuard, ScanJobStore, query_identity_scans, query_scan_events, validate_fancam_paths,
+        CropPlanPathArgs, CropPlanWriteArgs, FancamArgs, QueryIdentityScansArgs,
+        QueryScanEventsArgs, RenderJobGuard, RenderJobStore, ScanJobGuard, ScanJobStore,
+        UpdateCropPlanKeyframeArgs, ensure_crop_plan_metadata_matches, query_identity_scans,
+        query_scan_events, read_crop_plan, update_crop_plan_keyframe, validate_fancam_paths,
+        write_crop_plan,
     };
     use crate::storage;
+    use fancam_core::plan::{
+        CROP_PLAN_SCHEMA, CROP_PLAN_VERSION, CropOutput, CropPlanV1, PlanKeyframe,
+        PlanKeyframeSource, PlanQualityMetrics, SOURCE_FINGERPRINT_ALGORITHM,
+        SOURCE_FINGERPRINT_VERSION, SourceVideoFingerprint, VideoMetadata,
+    };
 
     fn diagnostics_test_mutex() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4238,6 +4516,8 @@ mod tests {
                 resolved_duplicates: Vec::new(),
                 pending_split_ids: Vec::new(),
                 client_run_id: None,
+                plan_input: None,
+                plan_output: None,
                 scan_id: None,
                 selected_identity_id: None,
                 target_anchor_x: None,
@@ -4282,6 +4562,8 @@ mod tests {
                 resolved_duplicates: Vec::new(),
                 pending_split_ids: Vec::new(),
                 client_run_id: None,
+                plan_input: None,
+                plan_output: None,
                 scan_id: None,
                 selected_identity_id: None,
                 target_anchor_x: None,
@@ -4290,6 +4572,149 @@ mod tests {
             let result = validate_fancam_paths(&args);
             assert!(result.is_ok());
         });
+    }
+
+    #[test]
+    fn crop_plan_commands_round_trip_and_update_only_manual_geometry() {
+        with_temp_workspace(|dir| {
+            let path = dir.join("crop-plan.json");
+            let plan = CropPlanV1 {
+                schema: CROP_PLAN_SCHEMA.to_string(),
+                version: CROP_PLAN_VERSION,
+                source_fingerprint: SourceVideoFingerprint {
+                    version: SOURCE_FINGERPRINT_VERSION,
+                    algorithm: SOURCE_FINGERPRINT_ALGORITHM.to_string(),
+                    digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                    file_size: 128,
+                    sampled_bytes: 128,
+                },
+                video: VideoMetadata {
+                    width: 1920,
+                    height: 1080,
+                    frame_count: 10,
+                    frame_rate_num: 30,
+                    frame_rate_den: 1,
+                    duration_ms: Some(333),
+                },
+                output: CropOutput {
+                    width: 1080,
+                    height: 1920,
+                },
+                shots: Vec::new(),
+                tracks: Vec::new(),
+                keyframes: vec![PlanKeyframe {
+                    frame_index: 1,
+                    cx: 800.0,
+                    cy: 540.0,
+                    half_size: 40.0,
+                    confidence: 0.8,
+                    source: PlanKeyframeSource::Observed,
+                }],
+                manual_keyframes: Vec::new(),
+                quality: PlanQualityMetrics {
+                    observed_keyframes: 1,
+                    predicted_keyframes: 0,
+                    held_keyframes: 0,
+                    mean_confidence: 0.8,
+                    min_confidence: 0.8,
+                    path_coverage: 0.1,
+                    max_gap_frames: 0,
+                    shot_boundary_count: 0,
+                },
+            };
+
+            let written = write_crop_plan(CropPlanWriteArgs {
+                path: path.to_string_lossy().into_owned(),
+                plan,
+            })
+            .expect("write crop plan");
+            assert!(written.bytes > 0);
+
+            let json = std::fs::read_to_string(&path).expect("read crop plan bytes");
+            assert!(!json.contains("embedding"));
+            assert!(!json.contains("thumbnail"));
+
+            let error = read_crop_plan(CropPlanPathArgs {
+                path: path.to_string_lossy().into_owned(),
+                video: None,
+            })
+            .expect_err("source binding is required");
+            assert!(error.contains("source video is required"));
+            let loaded = fancam_core::plan::read_crop_plan(&path).expect("read crop plan file");
+            assert!(loaded.manual_keyframes.is_empty());
+
+            let updated = update_crop_plan_keyframe(UpdateCropPlanKeyframeArgs {
+                path: path.to_string_lossy().into_owned(),
+                keyframe: fancam_core::plan::ManualKeyframe {
+                    frame_index: 1,
+                    cx: 900.0,
+                    cy: 540.0,
+                    half_size: 44.0,
+                },
+            })
+            .expect("update manual keyframe");
+            assert_eq!(updated.manual_keyframes.len(), 1);
+            assert_eq!(updated.manual_keyframes[0].cx, 900.0);
+
+            let invalid = dir.join("invalid.json");
+            std::fs::write(&invalid, b"{\"schema\":\"wrong\"}").expect("write invalid plan");
+            assert!(
+                read_crop_plan(CropPlanPathArgs {
+                    path: invalid.to_string_lossy().into_owned(),
+                    video: None,
+                })
+                .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn crop_plan_source_check_ignores_only_the_probed_frame_estimate() {
+        let plan = CropPlanV1 {
+            schema: CROP_PLAN_SCHEMA.to_string(),
+            version: CROP_PLAN_VERSION,
+            source_fingerprint: SourceVideoFingerprint {
+                version: SOURCE_FINGERPRINT_VERSION,
+                algorithm: SOURCE_FINGERPRINT_ALGORITHM.to_string(),
+                digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                file_size: 128,
+                sampled_bytes: 128,
+            },
+            video: VideoMetadata {
+                width: 1920,
+                height: 1080,
+                frame_count: 117,
+                frame_rate_num: 30,
+                frame_rate_den: 1,
+                duration_ms: Some(4_000),
+            },
+            output: CropOutput {
+                width: 1080,
+                height: 1920,
+            },
+            shots: Vec::new(),
+            tracks: Vec::new(),
+            keyframes: Vec::new(),
+            manual_keyframes: Vec::new(),
+            quality: PlanQualityMetrics {
+                observed_keyframes: 0,
+                predicted_keyframes: 0,
+                held_keyframes: 0,
+                mean_confidence: 0.0,
+                min_confidence: 0.0,
+                path_coverage: 0.0,
+                max_gap_frames: 0,
+                shot_boundary_count: 0,
+            },
+        };
+        let mut probe = plan.video.clone();
+        probe.frame_count = 120;
+
+        assert!(ensure_crop_plan_metadata_matches(&plan, &probe).is_ok());
+        probe.width = 1280;
+        assert!(ensure_crop_plan_metadata_matches(&plan, &probe).is_err());
     }
 
     #[test]
