@@ -58,10 +58,13 @@ This project is organized as a Cargo workspace:
 
 ## Prerequisites
 
-- **Rust** stable toolchain
-- **Node.js** for the desktop UI
-- **FFmpeg 8.1** native libraries installed on your system
+- **macOS** with CoreML support
+- **Rust 1.88+**
+- **Node.js 22** for the desktop UI
+- **FFmpeg 8.1** native libraries and `pkg-config`
 - ONNX models for **YOLOv8 Nano** and **ArcFace / MobileFaceNet**
+
+With Homebrew, install the native dependencies with `brew install ffmpeg pkg-config`.
 
 ## Setup
 
@@ -77,13 +80,15 @@ Create a `models/` directory in the project root and add:
 
 Runtime note: the current ONNX Runtime setup requires a CoreML-capable `libonnxruntime.dylib`, so the supported development target is macOS. Place it at `models/onnxruntime/lib/` or set `ORT_DYLIB_PATH`.
 
-The optional OSNet body re-identification model improves recovery in crowded footage, but face identity scoring works without it. The explicit `--body-reid-model`/GUI model path is validated when supplied; an absent default model is not an error.
+The optional OSNet body re-identification model improves recovery in crowded footage.
+Face identity scoring works without it.
+The GUI accepts an explicit model path, while the current CLI does not expose a `--body-reid-model` flag; a missing default model is allowed.
 
 ## Desktop Application (GUI)
 
 ```bash
 cd ui
-npm install
+npm ci
 npm run tauri:dev
 ```
 For a production build:
@@ -108,6 +113,17 @@ Note: render runs a mandatory offline prepass (tracklet build + clustering)
 before final encode, so startup may be slower on long videos.
 
 The desktop app stores scan sessions, exported diagnostics, and durable queue state in Tauri's platform app-data directory. On first launch it copies valid data from the old project-local `.focus-lock/` directory and leaves the originals untouched. Queue messages recover after an app restart; failed messages can be retried or replayed from the dead-letter queue.
+
+## Development checks
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo run -p fancam-core --example solver_eval --locked
+(cd ui && npm run check && npm test && npm run build)
+```
 
 ## License
 MIT
