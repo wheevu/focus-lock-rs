@@ -306,3 +306,116 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(width: u32, height: u32) -> RgbFrame {
+        RgbFrame {
+            data: vec![0u8; (width * height * 3) as usize],
+            width,
+            height,
+            pts: 0,
+        }
+    }
+
+    #[test]
+    fn l2_normalize_empty_input_stays_empty() {
+        assert!(l2_normalize(&[]).is_empty());
+    }
+
+    #[test]
+    fn l2_normalize_all_zero_keeps_zeros_via_floor() {
+        assert_eq!(l2_normalize(&[0.0, 0.0]), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn l2_normalize_unit_vector_scales_to_length_one() {
+        let out = l2_normalize(&[3.0, 4.0]);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 0.6).abs() < 1e-6);
+        assert!((out[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_normalize_propagates_nan_without_empty_guard() {
+        let out = l2_normalize(&[f32::NAN, 1.0]);
+        assert!(out[0].is_nan());
+        assert!(((out[1] / 1e10) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_is_raw_zip_dot_product_truncated_to_shorter() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[3.0]), 3.0);
+    }
+
+    #[test]
+    fn cosine_similarity_matching_dimensions_is_dot_product() {
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_ignores_extra_dims_in_longer_vector() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0, 0.0, 0.0]), 1.0);
+    }
+
+    #[test]
+    fn cosine_with_gallery_filters_dimension_mismatches_and_returns_max() {
+        let embedding = vec![1.0, 0.0];
+        let gallery = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0, 0.0],
+        ];
+        assert_eq!(cosine_with_gallery(&embedding, &gallery), Some(1.0));
+    }
+
+    #[test]
+    fn cosine_with_gallery_empty_gallery_returns_none() {
+        let embedding = vec![1.0, 0.0];
+        assert_eq!(cosine_with_gallery(&embedding, &[]), None);
+    }
+
+    #[test]
+    fn cosine_with_gallery_all_rows_filtered_returns_none() {
+        let embedding = vec![1.0, 0.0];
+        let gallery = vec![vec![1.0, 0.0, 0.0], vec![0.5, 0.5, 0.5]];
+        assert_eq!(cosine_with_gallery(&embedding, &gallery), None);
+    }
+
+    #[test]
+    fn cosine_with_gallery_zero_dim_embedding_returns_none() {
+        let gallery = vec![vec![1.0, 0.0]];
+        assert_eq!(cosine_with_gallery(&[], &gallery), None);
+    }
+
+    #[test]
+    fn body_crop_region_clamps_to_frame_bounds() {
+        let frame = frame(1920, 1080);
+        let bbox = BBox {
+            x1: 1900.0,
+            y1: 100.0,
+            x2: 2000.0,
+            y2: 1200.0,
+            confidence: 0.8,
+        };
+        let (x, y, w, h) = body_crop_region(&frame, bbox);
+        assert!(w > 0 && h > 0);
+        assert!(x + w <= frame.width);
+        assert!(y + h <= frame.height);
+    }
+
+    #[test]
+    fn body_crop_region_near_right_edge_matches_scout_verified_values() {
+        let frame = frame(1920, 1080);
+        let bbox = BBox {
+            x1: 1810.0,
+            y1: 2.0,
+            x2: 1918.0,
+            y2: 620.0,
+            confidence: 0.88,
+        };
+        assert_eq!(body_crop_region(&frame, bbox), (1810, 63, 108, 557));
+    }
+}
