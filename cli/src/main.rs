@@ -1129,7 +1129,9 @@ fn validate_reference_image(path: &Path) -> Option<String> {
         .sum::<f32>()
         / n as f32;
     let variance = pixels
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| {
             let dr = f32::from(c[0]) - mean_r;
             let dg = f32::from(c[1]) - mean_g;
