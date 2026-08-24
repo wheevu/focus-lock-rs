@@ -363,11 +363,7 @@ mod tests {
     #[test]
     fn cosine_with_gallery_filters_dimension_mismatches_and_returns_max() {
         let embedding = vec![1.0, 0.0];
-        let gallery = vec![
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-            vec![1.0, 0.0, 0.0],
-        ];
+        let gallery = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0, 0.0]];
         assert_eq!(cosine_with_gallery(&embedding, &gallery), Some(1.0));
     }
 

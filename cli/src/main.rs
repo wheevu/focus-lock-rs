@@ -642,8 +642,7 @@ fn render_with_progress(
                 pb_for_progress.set_position(current.min(total));
                 pb_for_progress.set_message(format!("Render: {current}/{total} frames"));
             } else if reported_total > 0 {
-                pb_for_progress
-                    .set_message(format!("Render: {current}/{reported_total} frames"));
+                pb_for_progress.set_message(format!("Render: {current}/{reported_total} frames"));
             } else {
                 pb_for_progress.set_message(format!("Render: {current} frames"));
             }
@@ -745,8 +744,7 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
     // Load identity model and embed reference
     // If face detector is available, first find a face in the reference image
     print!("Loading ArcFace model and embedding reference...");
-    let identifier =
-        embed_reference_identity(&mut face_detector, &face_model, &bias, threshold)?;
+    let identifier = embed_reference_identity(&mut face_detector, &face_model, &bias, threshold)?;
     println!(
         "  ✓ Reference embedded (threshold={:.2})\n",
         identifier.similarity_threshold()
@@ -754,9 +752,7 @@ fn cmd_inspect_identity(options: IdentityInspectOptions) -> Result<()> {
 
     // Sample frames and score identity candidates
     println!("Scanning video: {}", video.display());
-    println!(
-        "  Sample every {sample_every} frame(s), max {max_frames} frames\n"
-    );
+    println!("  Sample every {sample_every} frame(s), max {max_frames} frames\n");
 
     let mut summary = initial_inspect_summary(
         identifier.similarity_threshold(),
@@ -1036,7 +1032,11 @@ fn load_reference_as_rgb_frame(path: &Path) -> Result<RgbFrame> {
 ///
 /// All float coordinates are clamped to the valid pixel range before the `u32`
 /// conversion, so the casts cannot truncate or lose the sign.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn crop_face_from_frame(
     frame: &RgbFrame,
     face_box: &fancam_core::face::FaceBox,
@@ -1113,12 +1113,7 @@ fn validate_reference_image(path: &Path) -> Option<String> {
     if n == 0 {
         return Some("reference image has no pixels".to_string());
     }
-    let mean_r = pixels
-        .iter()
-        .step_by(3)
-        .map(|&v| f32::from(v))
-        .sum::<f32>()
-        / n as f32;
+    let mean_r = pixels.iter().step_by(3).map(|&v| f32::from(v)).sum::<f32>() / n as f32;
     let mean_g = pixels
         .iter()
         .skip(1)
