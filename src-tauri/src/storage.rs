@@ -642,11 +642,10 @@ pub fn query_scan_summaries(
     if let Some(status_filter) = status {
         if has_cursor {
             let sql = format!(
-                "{} WHERE s.status = ?1
+                "{base} WHERE s.status = ?1
                    AND (s.updated_at_ms < ?2 OR (s.updated_at_ms = ?2 AND s.scan_id < ?3))
                    ORDER BY s.updated_at_ms DESC, s.scan_id DESC
                    LIMIT ?4 OFFSET ?5",
-                base
             );
             let mut stmt = conn
                 .prepare(&sql)
@@ -680,8 +679,7 @@ pub fn query_scan_summaries(
             return Ok(out);
         }
         let sql = format!(
-            "{} WHERE s.status = ?1 ORDER BY s.updated_at_ms DESC, s.scan_id DESC LIMIT ?2 OFFSET ?3",
-            base
+            "{base} WHERE s.status = ?1 ORDER BY s.updated_at_ms DESC, s.scan_id DESC LIMIT ?2 OFFSET ?3",
         );
         let mut stmt = conn
             .prepare(&sql)
@@ -706,10 +704,9 @@ pub fn query_scan_summaries(
     } else {
         if has_cursor {
             let sql = format!(
-                "{} WHERE (s.updated_at_ms < ?1 OR (s.updated_at_ms = ?1 AND s.scan_id < ?2))
+                "{base} WHERE (s.updated_at_ms < ?1 OR (s.updated_at_ms = ?1 AND s.scan_id < ?2))
                    ORDER BY s.updated_at_ms DESC, s.scan_id DESC
                    LIMIT ?3 OFFSET ?4",
-                base
             );
             let mut stmt = conn
                 .prepare(&sql)
@@ -741,10 +738,8 @@ pub fn query_scan_summaries(
             }
             return Ok(out);
         }
-        let sql = format!(
-            "{} ORDER BY s.updated_at_ms DESC, s.scan_id DESC LIMIT ?1 OFFSET ?2",
-            base
-        );
+        let sql =
+            format!("{base} ORDER BY s.updated_at_ms DESC, s.scan_id DESC LIMIT ?1 OFFSET ?2",);
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("failed to prepare scan summaries query: {e}"))?;
@@ -775,7 +770,7 @@ pub fn query_scan_events(
 ) -> Result<Vec<ScanEventQueryRow>, String> {
     let conn = open_db(db_path)?;
     migrate(&conn)?;
-    let action_pattern = query.action_contains.map(|s| format!("%{}%", s));
+    let action_pattern = query.action_contains.map(|s| format!("%{s}%"));
     let mut stmt = conn
         .prepare(
             "SELECT id, at_ms, action, details
@@ -1064,8 +1059,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("failed to re-read sqlite user_version: {e}"))?;
     if final_version != SCHEMA_VERSION {
         return Err(format!(
-            "unexpected schema version: expected {}, got {}",
-            SCHEMA_VERSION, final_version
+            "unexpected schema version: expected {SCHEMA_VERSION}, got {final_version}",
         ));
     }
     Ok(())

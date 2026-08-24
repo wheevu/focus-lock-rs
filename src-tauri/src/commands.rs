@@ -585,8 +585,7 @@ fn validate_crop_plan_path(path: &str, for_write: bool) -> Result<PathBuf, Strin
     }
     if metadata.len() > MAX_CROP_PLAN_BYTES {
         return Err(format!(
-            "crop plan is larger than the {} byte limit",
-            MAX_CROP_PLAN_BYTES
+            "crop plan is larger than the {MAX_CROP_PLAN_BYTES} byte limit",
         ));
     }
     Ok(path)
@@ -641,8 +640,7 @@ pub fn write_crop_plan(args: CropPlanWriteArgs) -> Result<CropPlanWriteResult, S
     let serialized = serde_json::to_vec(&args.plan).map_err(|error| error.to_string())?;
     if serialized.len() as u64 > MAX_CROP_PLAN_BYTES {
         return Err(format!(
-            "crop plan is larger than the {} byte limit",
-            MAX_CROP_PLAN_BYTES
+            "crop plan is larger than the {MAX_CROP_PLAN_BYTES} byte limit",
         ));
     }
     write_crop_plan_file(&path, &args.plan).map_err(|error| error.to_string())?;
@@ -664,8 +662,7 @@ pub fn update_crop_plan_keyframe(args: UpdateCropPlanKeyframeArgs) -> Result<Cro
     let serialized = serde_json::to_vec(&plan).map_err(|error| error.to_string())?;
     if serialized.len() as u64 > MAX_CROP_PLAN_BYTES {
         return Err(format!(
-            "crop plan is larger than the {} byte limit",
-            MAX_CROP_PLAN_BYTES
+            "crop plan is larger than the {MAX_CROP_PLAN_BYTES} byte limit",
         ));
     }
     write_crop_plan_file(&path, &plan).map_err(|error| error.to_string())?;
@@ -1248,8 +1245,7 @@ fn validate_preview_dimensions(width: u32, height: u32) -> Result<(), String> {
     }
     if width > MAX_PREVIEW_DIMENSION || height > MAX_PREVIEW_DIMENSION {
         return Err(format!(
-            "preview input exceeds the {}px dimension limit",
-            MAX_PREVIEW_DIMENSION
+            "preview input exceeds the {MAX_PREVIEW_DIMENSION}px dimension limit",
         ));
     }
     let pixels = u64::from(width).saturating_mul(u64::from(height));
