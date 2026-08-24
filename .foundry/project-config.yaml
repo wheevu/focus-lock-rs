@@ -1,0 +1,10 @@
+repository: /Users/nguyenhuyvu/projects/focus-lock-rs
+base_branch: main
+
+verification:
+  quick:
+    - "cargo test --workspace --locked"
+
+  full:
+    - "cargo test --workspace --locked"
+    - {command: "node --experimental-strip-types --test src/lib/*.test.ts", cwd: "ui", timeout_seconds: 300}
